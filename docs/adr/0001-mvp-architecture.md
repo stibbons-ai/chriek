@@ -4,7 +4,7 @@ status: accepted
 
 # MVP architecture: async job API, two deployment modes, push dispatch
 
-chriek is a self-hostable FLUX 3 Image Klein server, extracted from the fabula-mia PoC runtime. Its first consumers are fabula-mia (character reference sheets and story panels) and Ikonograf (profile pictures from reference photos). Full spec: #1. Decisions and rationale below were made with Daniel in the design session of 2026-11-11 (source design: fabula-mia branch `docs/chriek-design`, `docs/superpowers/specs/2026-11-11-chriek-design.md`).
+chriek is a self-hostable FLUX 3 Image Klein server, extracted from the fabula-mia PoC runtime. Its first consumers are fabula-mia (character reference sheets and story panels) and Ikonograf (profile pictures from reference photos). Full spec: #1. Decisions and rationale below were made with Daniel in the design session of 2026-11-11 (source design: [docs/superpowers/specs/2026-11-11-chriek-design.md](../superpowers/specs/2026-11-11-chriek-design.md)).
 
 ## Decisions
 
@@ -25,7 +25,3 @@ chriek is a self-hostable FLUX 3 Image Klein server, extracted from the fabula-m
 - The first job after an idle period pays a cold model load (about 20 GB of weights). That is accepted.
 - CI has no GPU. Tests go through the HTTP API with a fake image backend, and the real backends are verified with a smoke-test command on real hardware.
 - License risk, not blocking: the FLUX Kommunity License bans "biometric processing", and Ikonograf may conflict with that. It needs a license review before Ikonograf goes live.
-
-## Links
-
-- Design document (moved from fabula-mia): [docs/superpowers/specs/2026-11-11-chriek-design.md](../superpowers/specs/2026-11-11-chriek-design.md)
