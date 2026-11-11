@@ -37,7 +37,9 @@ class FakeBackend:
         seed: int,
         references: Sequence[Image.Image] = (),
     ) -> Image.Image:
-        hasher = hashlib.sha256(f"{prompt}\n{seed}\n{width}x{height}\n{len(references)}".encode())
+        hasher = hashlib.sha256(f"{prompt}\n{seed}\n{width}x{height}".encode())
+        if references:
+            hasher.update(f"\n{len(references)}".encode())
         for index, reference in enumerate(references):
             rgb = reference if reference.mode == "RGB" else reference.convert("RGB")
             hasher.update(f"\nref:{index}:{rgb.width}x{rgb.height}:".encode())

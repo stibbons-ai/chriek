@@ -9,7 +9,6 @@ import struct
 import threading
 import uuid
 import zlib
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -33,6 +32,7 @@ from sqlalchemy.exc import OperationalError
 
 import chriek.api
 from chriek.api import create_app
+from chriek.backend import FakeBackend
 from chriek.config import Settings
 from chriek.signing import UrlSigner
 from chriek.store import JobStore
@@ -124,6 +124,40 @@ def asgi_post_jobs(
     return status_code, json.loads(raw_body), consumed
 
 
+class RecordingBackend(FakeBackend):
+    """Fake backend recording the (size, top-left pixel) of every reference per render."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[tuple[tuple[int, int], tuple[int, ...]]]] = []
+
+    def render(self, prompt, width, height, seed, references=()):
+        self.calls.append([(ref.size, ref.getpixel((0, 0))) for ref in references])
+        return super().render(prompt, width, height, seed, references)
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+
+def _palette_png_without_plte() -> bytes:
+    """Invalid PNG: colour type 3 (palette) with a one-byte tRNS but no PLTE chunk."""
+    ihdr = struct.pack(">IIBBBBB", 16, 16, 8, 3, 0, 0, 0)
+    idat = zlib.compress(b"\x00" * 17 * 16)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"tRNS", b"\x00")
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _png_bytes(image: Image.Image, **save_args) -> bytes:
+    buf = io.BytesIO()
+    image.save(buf, format="PNG", **save_args)
+    return buf.getvalue()
+
+
 def test_multipart_without_references_matches_json_text_to_image(client):
     json_job = wait_for(
         client,
@@ -172,6 +206,9 @@ def test_references_change_fake_backend_output_deterministically_and_preserve_or
     red = make_image_bytes((220, 20, 20), (24, 16), fmt="PNG")
     blue = make_image_bytes((20, 40, 220), (16, 24), fmt="JPEG")
     green = make_image_bytes((20, 200, 40), (16, 16), fmt="WEBP")
+    # Same size, different colour: only the reference pixels tell these apart.
+    red_square = make_image_bytes((220, 20, 20), (16, 16))
+    blue_square = make_image_bytes((20, 40, 220), (16, 16))
     form = {"prompt": "character panel", "seed": "12", "width": "32", "height": "32"}
 
     text_only = wait_for(client, submit_multipart(client, data=form)["id"])
@@ -215,6 +252,15 @@ def test_references_change_fake_backend_output_deterministically_and_preserve_or
             ],
         )["id"],
     )
+    red_square_job, blue_square_job = (
+        wait_for(
+            client,
+            submit_multipart(
+                client, data=form, files=[("references", ("square.png", square, "image/png"))]
+            )["id"],
+        )
+        for square in (red_square, blue_square)
+    )
 
     pixels_text = download_pixels(client, text_only)
     pixels_one = download_pixels(client, one_ref)
@@ -222,11 +268,32 @@ def test_references_change_fake_backend_output_deterministically_and_preserve_or
     pixels_other = download_pixels(client, other_pixel_ref)
     pixels_rb = download_pixels(client, red_then_blue)
     pixels_br = download_pixels(client, blue_then_red)
+    pixels_red_square = download_pixels(client, red_square_job)
+    pixels_blue_square = download_pixels(client, blue_square_job)
 
     assert pixels_one == pixels_one_again, (
         "same references must render identically regardless of filename"
     )
     assert len({pixels_text, pixels_one, pixels_other, pixels_rb, pixels_br}) == 5
+    assert pixels_red_square != pixels_blue_square
+
+
+def test_every_render_receives_references_in_upload_order(tmp_path):
+    uploads = [((220, 20, 20), (16, 16)), ((20, 40, 220), (24, 16)), ((20, 200, 40), (16, 24))]
+    backend = RecordingBackend()
+    with running(tmp_path, backend=backend) as client:
+        job = submit_multipart(
+            client,
+            data={"prompt": "ordered", "image_count": "3", "width": "16", "height": "16"},
+            files=[
+                ("references", (f"{i}.png", make_image_bytes(color, size), "image/png"))
+                for i, (color, size) in enumerate(uploads)
+            ],
+        )
+        assert wait_for(client, job["id"])["status"] == "succeeded"
+
+    expected = [(size, color) for color, size in uploads]
+    assert backend.calls == [expected, expected, expected]
 
 
 def test_reference_count_reported_across_all_job_statuses(tmp_path):
@@ -510,6 +577,14 @@ def test_reference_count_and_upload_byte_limits_are_configurable_and_enforced(tm
         assert over.json()["detail"][0]["loc"] == ["body"]
         assert "maximum size" in over.json()["detail"][0]["msg"]
 
+        json_headers = ALICE | {"Content-Type": "application/json", "Content-Length": "10"}
+        json_ok = client.post("/jobs", headers=json_headers, content=json_exact)
+        assert json_ok.status_code == 202, json_ok.text
+        json_over_cl = client.post("/jobs", headers=json_headers, content=json_over)
+        assert json_over_cl.status_code == 422
+        assert json_over_cl.json()["detail"][0]["loc"] == ["body"]
+        assert "maximum size" in json_over_cl.json()["detail"][0]["msg"]
+
         # Missing Content-Length header over chunked ASGI stream (multipart and JSON).
         mp_no_cl_status, mp_no_cl_body, _ = asgi_post_jobs(
             client,
@@ -605,8 +680,8 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
         assert finished["status"] == "succeeded"
         assert finished["params"]["reference_count"] == 1
 
-        # Over-limit multipart (with no files) aborts at chunk 6 (6 * 400 = 2400 > 2048)
-        # without consuming the remaining 14 chunks, and reports whole-body loc ["body"].
+        # Over-limit multipart (with no files) aborts at chunk 6 (58-byte part header +
+        # 5 * 400 = 2058 > 2048), leaving 16 of 22 chunks unread; whole-body loc ["body"].
         mp_header = b'--bound\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n'
         mp_chunks = [mp_header] + [b"a" * 400 for _ in range(20)] + [b"\r\n--bound--\r\n"]
         mp_status, mp_err, mp_consumed = asgi_post_jobs(
@@ -741,6 +816,44 @@ def test_malformed_raw_multipart_returns_422(tmp_path, content_type, body):
         assert backend.renders == 0
 
 
+TRUNCATION_REFS = [
+    make_image_bytes((200, 30, 30), (16, 16)),
+    make_image_bytes((30, 30, 200), (24, 16)),
+]
+
+
+@pytest.mark.parametrize(
+    "cut", ["after-boundary-with-crlf", "after-boundary-without-crlf", "mid-second-reference"]
+)
+def test_multipart_truncated_after_complete_parts_returns_422(tmp_path, cut):
+    ct_header, body = encode_multipart(
+        {"prompt": "truncated", "width": "16", "height": "16"},
+        files=[
+            ("references", (f"{i}.png", ref, "image/png")) for i, ref in enumerate(TRUNCATION_REFS)
+        ],
+        boundary="bound",
+    )
+    first_ref_end = body.index(TRUNCATION_REFS[0]) + len(TRUNCATION_REFS[0])
+    cut_at = {
+        "after-boundary-with-crlf": first_ref_end + len(b"\r\n--bound\r\n"),
+        "after-boundary-without-crlf": first_ref_end + len(b"\r\n--bound"),
+        "mid-second-reference": body.index(TRUNCATION_REFS[1]) + len(TRUNCATION_REFS[1]) // 2,
+    }[cut]
+
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        truncated = client.post("/jobs", headers=ALICE | ct_header, content=body[:cut_at])
+        assert truncated.status_code == 422, truncated.text
+        assert not any((tmp_path / "images").iterdir())
+
+        complete = client.post("/jobs", headers=ALICE | ct_header, content=body)
+        assert complete.status_code == 202, complete.text
+        finished = wait_for(client, complete.json()["id"])
+        assert finished["status"] == "succeeded"
+        assert finished["params"]["reference_count"] == 2
+        assert backend.renders == 1
+
+
 def test_unauthenticated_multipart_upload_returns_401_before_parsing_or_reading_stream(tmp_path):
     chunks_read = 0
 
@@ -812,8 +925,9 @@ def test_reference_format_allowlist_corrupt_metadata_and_bomb_headers(tmp_path, 
     gif_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="GIF")
     bmp_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="BMP")
     tiff_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="TIFF")
-    blp_corrupt = b"BLP2" + struct.pack("<I4B", 1, 0, 8, 0, 0) + b"\x00" * 128
-    dds_corrupt = b"DDS " + struct.pack("<7I", 124, 0x1007, 16, 16, 64, 0, 0) + b"\x00" * 100
+    blp_buf = io.BytesIO()
+    Image.new("P", (16, 16)).save(blp_buf, format="BLP")
+    dds_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="DDS")
 
     with running(tmp_path) as client:
         for name, payload in (
@@ -821,8 +935,8 @@ def test_reference_format_allowlist_corrupt_metadata_and_bomb_headers(tmp_path, 
             ("anim.gif", gif_bytes),
             ("bitmap.bmp", bmp_bytes),
             ("scan.tiff", tiff_bytes),
-            ("texture.blp", blp_corrupt),
-            ("surface.dds", dds_corrupt),
+            ("texture.blp", blp_buf.getvalue()),
+            ("surface.dds", dds_bytes),
             ("bad-exif.jpg", _corrupt_exif_image("JPEG")),
             ("bad-exif.webp", _corrupt_exif_image("WEBP")),
             ("trunc.png", make_image_bytes(fmt="PNG")[:45]),
@@ -851,7 +965,7 @@ def test_reference_format_allowlist_corrupt_metadata_and_bomb_headers(tmp_path, 
 
         # Valid EXIF orientation on an allowed format (JPEG) is transposed and normalized.
         exif = Image.Exif()
-        exif[0x0112] = 6  # Rotate 270 CW: 24x16 becomes 16x24
+        exif[0x0112] = 6  # Rotate 90 degrees clockwise: 24x16 becomes 16x24
         oriented_buf = io.BytesIO()
         Image.new("RGB", (24, 16), (120, 40, 80)).save(
             oriented_buf, format="JPEG", exif=exif.tobytes()
@@ -866,6 +980,62 @@ def test_reference_format_allowlist_corrupt_metadata_and_bomb_headers(tmp_path, 
             assert stored_ref.format == "PNG"
             assert stored_ref.mode == "RGB"
             assert stored_ref.size == (16, 24)
+
+
+def test_non_rgb_and_transparent_references_are_stored_as_plain_rgb(tmp_path):
+    backend = CountingBackend()
+    form = {"prompt": "normalize", "width": "16", "height": "16"}
+    with running(tmp_path, backend=backend) as client:
+        invalid = post_multipart(
+            client,
+            data=form,
+            files=[("references", ("no-plte.png", _palette_png_without_plte(), "image/png"))],
+        )
+        assert invalid.status_code == 422, invalid.text
+        assert invalid.json()["detail"][0]["loc"] == ["body", "references", 0]
+        assert "not a valid image" in invalid.json()["detail"][0]["msg"]
+        assert not any((tmp_path / "images").iterdir())
+        with sqlite3.connect(tmp_path / "db" / "chriek.db") as conn:
+            assert conn.execute("SELECT count(*) FROM jobs").fetchone() == (0,)
+
+        for name, upload in (
+            ("1-bit-trns", _png_bytes(Image.new("1", (16, 16), 1), transparency=0)),
+            ("16-bit-gray-trns", _png_bytes(Image.new("I;16", (16, 16), 1), transparency=300)),
+            (
+                "rgb-colour-key",
+                _png_bytes(Image.new("RGB", (16, 16), (1, 2, 3)), transparency=(1, 2, 3)),
+            ),
+            ("palette-trns", _png_bytes(Image.new("P", (16, 16), 0), transparency=0)),
+            ("rgba-alpha", _png_bytes(Image.new("RGBA", (16, 16), (10, 20, 30, 0)))),
+        ):
+            job = submit_multipart(
+                client, data=form, files=[("references", (f"{name}.png", upload, "image/png"))]
+            )
+            assert wait_for(client, job["id"])["status"] == "succeeded", name
+            with Image.open(reference_path(tmp_path / "images", job["id"], 0)) as stored:
+                assert stored.format == "PNG", name
+                assert stored.mode == "RGB", name
+                assert "transparency" not in stored.info, name
+        assert backend.renders == 5
+
+
+def test_reference_pixel_limit_includes_exact_boundary(tmp_path):
+    form = {"prompt": "boundary", "width": "16", "height": "16"}
+    with running(tmp_path, CHRIEK_MAX_PIXELS="1024") as client:
+        exact = submit_multipart(
+            client,
+            data=form,
+            files=[("references", ("exact.png", make_image_bytes(size=(32, 32)), "image/png"))],
+        )
+        assert wait_for(client, exact["id"])["status"] == "succeeded"
+
+        over = post_multipart(
+            client,
+            data=form,
+            files=[("references", ("over.png", make_image_bytes(size=(32, 33)), "image/png"))],
+        )
+        assert over.status_code == 422
+        assert over.json()["detail"][0]["msg"] == "reference image 0 exceeds maximum of 1024 pixels"
 
 
 def test_mid_publish_failure_cleans_already_moved_outputs_and_keeps_references(
@@ -904,7 +1074,7 @@ def test_mid_publish_failure_cleans_already_moved_outputs_and_keeps_references(
 
 
 def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_up(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
     ref_a = make_image_bytes((15, 85, 195), (16, 16))
     ref_b = make_image_bytes((195, 85, 15), (24, 16))
@@ -955,35 +1125,71 @@ def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_u
         assert resp.status_code == 500
         assert list((fail_dir / "images").iterdir()) == []
 
+    # Double fault: cleanup cannot remove the written reference. The client still sees the
+    # original store failure, and the leftover file is logged.
+    stuck_dir = tmp_path / "stuck_case"
 
-def test_submit_offloads_decode_and_persistence_so_health_stays_responsive(tmp_path, monkeypatch):
-    entered = threading.Event()
-    release = threading.Event()
-    original_write = chriek.api.write_references
+    def failing_create_with_stuck_files(self: JobStore, *args, job_id: str, **kwargs):
+        (stuck_dir / "images" / job_id / "references").chmod(0o500)
+        raise OperationalError("INSERT", {}, RuntimeError("database is full"))
 
-    def blocking_write_references(storage_dir: Path, job_id: str, references: list[bytes]) -> None:
-        original_write(storage_dir, job_id, references)
-        entered.set()
-        assert release.wait(5), "health check did not complete while submit was in flight"
-
-    monkeypatch.setattr(chriek.api, "write_references", blocking_write_references)
-
-    with running(tmp_path) as client, ThreadPoolExecutor(1) as pool:
-        future = pool.submit(
-            post_multipart,
-            client,
-            ALICE,
-            {"prompt": "concurrent submit", "width": "16", "height": "16"},
-            [("references", ("ref.png", make_image_bytes(), "image/png"))],
+    monkeypatch.setattr(JobStore, "create", failing_create_with_stuck_files)
+    app = create_app(Settings.from_env(base_env(stuck_dir)))
+    try:
+        with (
+            TestClient(app) as stuck_client,
+            caplog.at_level(logging.ERROR, "chriek.api"),
+            pytest.raises(OperationalError, match="database is full"),
+        ):
+            post_multipart(
+                stuck_client,
+                data={"prompt": "db failure", "width": "16", "height": "16"},
+                files=[("references", ("a.png", ref_a, "image/png"))],
+            )
+        (job_dir,) = (stuck_dir / "images").iterdir()
+        assert (job_dir / "references" / "0.png").is_file()
+        assert any(
+            "could not remove" in record.getMessage() and record.name == "chriek.api"
+            for record in caplog.records
         )
-        assert entered.wait(5)
-        health = client.get("/health")
-        assert health.status_code == 200
-        assert health.json() == {"status": "ok"}
-        release.set()
-        submit_resp = future.result(timeout=5)
-        assert submit_resp.status_code == 202
-        assert wait_for(client, submit_resp.json()["id"])["status"] == "succeeded"
+    finally:
+        for path in (stuck_dir / "images").glob("*/references"):
+            path.chmod(0o700)
+
+
+def test_submit_decodes_and_persists_off_the_event_loop(tmp_path, monkeypatch):
+    threads: dict[str, int] = {}
+    original_decode = chriek.api._decode_reference_png
+    original_write = chriek.api.write_references
+    original_create = JobStore.create
+
+    def recording_decode(*args):
+        threads["decode"] = threading.get_ident()
+        return original_decode(*args)
+
+    def recording_write(*args):
+        threads["write"] = threading.get_ident()
+        return original_write(*args)
+
+    def recording_create(self: JobStore, *args, **kwargs):
+        threads["create"] = threading.get_ident()
+        return original_create(self, *args, **kwargs)
+
+    monkeypatch.setattr(chriek.api, "_decode_reference_png", recording_decode)
+    monkeypatch.setattr(chriek.api, "write_references", recording_write)
+    monkeypatch.setattr(JobStore, "create", recording_create)
+
+    with running(tmp_path) as client:
+        loop_thread = client.portal.call(threading.get_ident)
+        job = submit_multipart(
+            client,
+            data={"prompt": "offloaded submit", "width": "16", "height": "16"},
+            files=[("references", ("ref.png", make_image_bytes(), "image/png"))],
+        )
+        assert wait_for(client, job["id"])["status"] == "succeeded"
+
+    assert set(threads) == {"decode", "write", "create"}
+    assert loop_thread not in threads.values()
 
 
 def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_worker(

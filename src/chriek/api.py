@@ -2,6 +2,7 @@
 
 import io
 import json
+import logging
 import math
 import re
 import secrets
@@ -9,7 +10,6 @@ import shutil
 import struct
 import time
 import uuid
-import warnings
 import zlib
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -36,6 +36,7 @@ from chriek.signing import UrlSigner
 from chriek.store import SUCCEEDED, Job, JobStore
 from chriek.worker import Worker, image_path, write_references
 
+log = logging.getLogger(__name__)
 MAX_SEED = 2**32 - 1
 WORKER_STOP_TIMEOUT_SECONDS = 30.0
 INDEX_PATTERN = re.compile(r"[0-9]{1,6}")
@@ -49,8 +50,10 @@ MAX_SCALAR_FIELD_BYTES = 1024 * 1024
 MAX_FORM_FIELDS = 32
 INTEGER_PATTERN = re.compile(r"[+-]?[0-9]{1,20}")
 ALLOWED_REFERENCE_FORMATS = ("PNG", "JPEG", "WEBP")
+# Pillow raises these for corrupt input; AssertionError covers e.g. a palette PNG without PLTE.
 _DECODER_ERRORS = (
     UnidentifiedImageError,
+    AssertionError,
     OSError,
     ValueError,
     SyntaxError,
@@ -90,6 +93,12 @@ _JOBS_POST_OPENAPI: dict[str, Any] = {
                     "title": "Body_submit_job_jobs_post",
                     "properties": {
                         **_JOB_REQUEST_SCHEMA["properties"],
+                        # A form field cannot be null: omit `seed` or send it empty for a
+                        # random seed.
+                        "seed": {
+                            "anyOf": [{"type": "integer"}, {"type": "string", "maxLength": 0}],
+                            "title": "Seed",
+                        },
                         "references": {
                             "type": "array",
                             "items": {"type": "string", "format": "binary"},
@@ -225,7 +234,7 @@ def create_app(
                     now=clock(),
                 )
             except BaseException:
-                shutil.rmtree(storage_dir / job_id, ignore_errors=True)
+                shutil.rmtree(storage_dir / job_id, onexc=_log_cleanup_error)
                 raise
             worker.notify()
             return job
@@ -266,10 +275,10 @@ def create_app(
 
 
 def _authenticated_route(authenticate: ApiKeyAuth) -> type[APIRoute]:
-    """Route class that authenticates before FastAPI reads the body or resolves parameters.
+    """Route class that authenticates before the handler runs.
 
-    FastAPI parses the request body before running dependencies, so a key check as a
-    dependency would answer malformed bodies with 400/422 instead of 401.
+    `/jobs` streams and parses its body itself, so authenticating first means an
+    unauthenticated client gets 401 without chriek reading, parsing or storing any upload.
     """
 
     class AuthenticatedRoute(APIRoute):
@@ -616,16 +625,18 @@ def _decode_reference_png(
             "input": None,
         }
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(data), formats=ALLOWED_REFERENCE_FORMATS) as image:
-                width, height = image.size
-                if width <= 0 or height <= 0 or width * height > limits.max_pixels:
-                    raise Image.DecompressionBombError
-                image.load()
-                ImageOps.exif_transpose(image, in_place=True)
-                rgb = image if image.mode == "RGB" else image.convert("RGB")
-    except Image.DecompressionBombError, Image.DecompressionBombWarning:
+        with Image.open(io.BytesIO(data), formats=ALLOWED_REFERENCE_FORMATS) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > limits.max_pixels:
+                raise Image.DecompressionBombError
+            image.load()
+            ImageOps.exif_transpose(image, in_place=True)
+            rgb = image if image.mode == "RGB" else image.convert("RGB")
+            # A tRNS colour key survives convert(); RGB references carry no transparency.
+            rgb.info.pop("transparency", None)
+            buf = io.BytesIO()
+            rgb.save(buf, format="PNG")
+    except Image.DecompressionBombError:
         return None, {
             "type": "value_error",
             "loc": loc,
@@ -641,9 +652,12 @@ def _decode_reference_png(
             ),
             "input": None,
         }
-    buf = io.BytesIO()
-    rgb.save(buf, format="PNG")
     return buf.getvalue(), None
+
+
+def _log_cleanup_error(_function: Callable[..., Any], path: str, exc: BaseException) -> None:
+    if not isinstance(exc, FileNotFoundError):
+        log.error("could not remove %s after a failed submission", path, exc_info=exc)
 
 
 def _validation_error(

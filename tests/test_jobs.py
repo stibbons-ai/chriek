@@ -233,9 +233,9 @@ def test_json_bom_and_utf16_encodings_are_accepted(client, payload, expected_pro
         (b"not json", 422),
         (b"\xff\xfe", 422),
         (b"", 422),
-        # Python's JSON parser refuses integers this long; FastAPI answers 400.
+        # Python's JSON parser refuses integers this long; chriek answers 400.
         (b'{"prompt": "x", "seed": 1' + b"0" * 5000 + b"}", 400),
-        # JSON bodies must be valid UTF-8; FastAPI answers 400 before validation.
+        # Invalid UTF-8 in a UTF-8 body (UTF-16 bodies are accepted, above); chriek answers 400.
         (b'{"prompt": "a light\xffhouse"}', 400),
     ],
     ids=["not-json", "empty-utf16-bom", "empty-body", "5000-digit-seed", "invalid-utf8"],
