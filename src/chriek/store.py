@@ -15,11 +15,13 @@ from sqlalchemy import (
     select,
     update,
 )
-from sqlalchemy.engine import URL
+from sqlalchemy.engine import URL, Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
+_MEMORY = ":memory:"  # SQLite's sentinel for an ephemeral database
 
 
 class Base(DeclarativeBase):
@@ -62,9 +64,7 @@ class Image(Base):
 
 class JobStore:
     def __init__(self, db_path: Path) -> None:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        # URL.create keeps the filename literal; an f-string URL would parse '?' and '%xx'.
-        self._engine = create_engine(URL.create("sqlite", database=str(db_path)))
+        self._engine = _create_engine(db_path)
         event.listen(self._engine, "connect", _configure_sqlite)
         Base.metadata.create_all(self._engine)
         self._session = sessionmaker(self._engine, expire_on_commit=False)
@@ -158,6 +158,23 @@ class JobStore:
             .values(status=status, error=error, run_record=run_record, finished_at=now)
             .returning(Job)
         ).one_or_none()
+
+
+def _create_engine(db_path: Path) -> Engine:
+    if str(db_path) == _MEMORY:  # Path("./:memory:") normalizes to ":memory:" too
+        # An in-memory database exists only inside its one connection. A single-slot pool
+        # keeps that connection for the store's lifetime and lends it to one session at a
+        # time, so HTTP and worker threads share the data without interleaving transactions.
+        return create_engine(
+            URL.create("sqlite", database=_MEMORY),
+            poolclass=QueuePool,
+            pool_size=1,
+            max_overflow=0,
+            connect_args={"check_same_thread": False},
+        )
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # URL.create keeps the filename literal; an f-string URL would parse '?' and '%xx'.
+    return create_engine(URL.create("sqlite", database=str(db_path)))
 
 
 def _configure_sqlite(dbapi_connection, _record) -> None:

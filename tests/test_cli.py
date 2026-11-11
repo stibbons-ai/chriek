@@ -6,11 +6,13 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx2
 import pytest
-from conftest import ALICE, ALICE_KEY, SIGNING_SECRET, base_env
+from conftest import ALICE, ALICE_KEY, SIGNING_SECRET, base_env, submit, wait_for
 from PIL import Image
 
 CHRIEK = Path(sys.executable).parent / "chriek"
@@ -80,44 +82,60 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
-def test_chriek_serve_round_trip(tmp_path):
+def wait_healthy(process: subprocess.Popen, base: str) -> None:
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            if httpx2.get(f"{base}/health").json() == {"status": "ok"}:
+                return
+        except httpx2.TransportError:
+            pass
+        assert process.poll() is None, process.stdout.read()
+        assert time.monotonic() < deadline, "chriek serve never became healthy"
+        time.sleep(0.1)
+
+
+@contextmanager
+def served(env: dict[str, str], **kwargs) -> Iterator[httpx2.Client]:
     port = free_port()
-    env = base_env(tmp_path) | {"CHRIEK_PORT": str(port)}
-    process = serve(env)
+    process = serve(env | {"CHRIEK_PORT": str(port)}, **kwargs)
     base = f"http://127.0.0.1:{port}"
     try:
-        deadline = time.monotonic() + 30
-        while True:
-            try:
-                if httpx2.get(f"{base}/health").json() == {"status": "ok"}:
-                    break
-            except httpx2.TransportError:
-                pass
-            assert process.poll() is None, process.stdout.read()
-            assert time.monotonic() < deadline, "chriek serve never became healthy"
-            time.sleep(0.1)
-
-        job = httpx2.post(
-            f"{base}/jobs", headers=ALICE, json={"prompt": "otter", "image_count": 2, "seed": 1}
-        ).json()
-        deadline = time.monotonic() + 30
-        while (body := httpx2.get(f"{base}/jobs/{job['id']}", headers=ALICE).json())[
-            "status"
-        ] not in {"succeeded", "failed"}:
-            assert time.monotonic() < deadline, f"job never finished: {body}"
-            time.sleep(0.05)
-
-        assert body["status"] == "succeeded", body
-        for image in body["images"]:
-            assert image["url"].startswith(f"{base}/images/{job['id']}/")
-            png = Image.open(io.BytesIO(httpx2.get(image["url"]).content))
-            assert png.size == (1024, 1024)
-            assert png.text["Seed"] == str(image["seed"])
-        assert (tmp_path / "db" / "chriek.db").is_file()
-        assert sorted(p.name for p in (tmp_path / "images" / job["id"]).iterdir()) == [
-            "0.png",
-            "1.png",
-        ]
+        wait_healthy(process, base)
+        with httpx2.Client(base_url=base) as client:
+            yield client
     finally:
         process.terminate()
         process.wait(timeout=30)
+
+
+def test_chriek_serve_round_trip(tmp_path):
+    with served(base_env(tmp_path)) as client:
+        body = wait_for(client, submit(client, prompt="otter", image_count=2, seed=1)["id"])
+
+        assert body["status"] == "succeeded", body
+        for image in body["images"]:
+            assert image["url"].startswith(f"{client.base_url}/images/{body['id']}/")
+            png = Image.open(io.BytesIO(client.get(image["url"]).content))
+            assert png.size == (1024, 1024)
+            assert png.text["Seed"] == str(image["seed"])
+        assert (tmp_path / "db" / "chriek.db").is_file()
+        assert sorted(p.name for p in (tmp_path / "images" / body["id"]).iterdir()) == [
+            "0.png",
+            "1.png",
+        ]
+
+
+def test_chriek_serve_memory_database_runs_jobs_and_resets_on_restart(tmp_path):
+    env = base_env(tmp_path) | {"CHRIEK_DB_PATH": ":memory:"}
+    with served(env, cwd=tmp_path) as client:
+        body = wait_for(client, submit(client, seed=3, width=16, height=16)["id"])
+        assert body["status"] == "succeeded", body
+        download = client.get(body["images"][0]["url"])
+        assert download.status_code == 200
+        assert Image.open(io.BytesIO(download.content)).text["Seed"] == "3"
+
+    with served(env, cwd=tmp_path) as client:
+        assert client.get(f"/jobs/{body['id']}", headers=ALICE).status_code == 404
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["images"]

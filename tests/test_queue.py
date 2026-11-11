@@ -1,7 +1,9 @@
 """Property 4: one job at a time in persisted FIFO order; restarts fail running jobs only."""
 
+import io
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from conftest import (
@@ -14,6 +16,7 @@ from conftest import (
     submit,
     wait_for,
 )
+from PIL import Image
 from sqlalchemy.exc import OperationalError
 
 from chriek.store import JobStore
@@ -110,6 +113,58 @@ def test_database_path_is_used_literally_across_restart(tmp_path, filename):
         assert again["params"] == body["params"]
 
     assert sorted(path.name for path in db_dir.iterdir() if path.is_file()) == [filename]
+
+
+@pytest.mark.parametrize("sentinel", [":memory:", "./:memory:"])
+def test_memory_database_serves_one_lifetime_and_resets_on_restart(tmp_path, monkeypatch, sentinel):
+    monkeypatch.chdir(tmp_path)
+    with running(tmp_path, CHRIEK_DB_PATH=sentinel) as before:
+        body = wait_for(before, submit(before, image_count=2, seed=4, width=16, height=16)["id"])
+        assert body["status"] == "succeeded"
+        assert [image["seed"] for image in body["images"]] == [4, 5]
+        download = before.get(body["images"][1]["url"])
+        assert download.status_code == 200
+        assert Image.open(io.BytesIO(download.content)).text["Seed"] == "5"
+        assert before.get(f"/jobs/{body['id']}", headers=BOB).status_code == 404
+
+    with running(tmp_path, CHRIEK_DB_PATH=sentinel) as after:
+        assert after.get(f"/jobs/{body['id']}", headers=ALICE).status_code == 404
+        assert after.get(body["images"][1]["url"]).status_code == 404
+        assert wait_for(after, submit(after, width=16, height=16)["id"])["status"] == "succeeded"
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["images"]
+
+
+def test_memory_database_keeps_every_write_under_concurrent_polling(tmp_path):
+    backend = GatedBackend()
+    with running(tmp_path, backend=backend, CHRIEK_DB_PATH=":memory:") as client:
+        first = submit(client, prompt="first", width=16, height=16)
+        assert backend.rendering.wait(5)
+
+        def submit_and_poll(owner: str, headers: dict[str, str]) -> list[str]:
+            ids = []
+            for n in range(5):
+                job = submit(client, headers=headers, prompt=f"{owner}-{n}", width=16, height=16)
+                ids.append(job["id"])
+                for job_id in ids:
+                    assert client.get(f"/jobs/{job_id}", headers=headers).status_code == 200
+            return ids
+
+        # Submissions and polls from two threads overlap the worker's claim/finish writes.
+        with ThreadPoolExecutor(2) as pool:
+            alice = pool.submit(submit_and_poll, "alice", ALICE)
+            bob = pool.submit(submit_and_poll, "bob", BOB)
+            backend.release()
+            ids = {"alice": alice.result(timeout=30), "bob": bob.result(timeout=30)}
+
+        bodies = [wait_for(client, first["id"])]
+        bodies += [wait_for(client, job_id) for job_id in ids["alice"]]
+        bodies += [wait_for(client, job_id, headers=BOB) for job_id in ids["bob"]]
+
+    assert [body["status"] for body in bodies] == ["succeeded"] * 11
+    assert all(len(body["images"]) == 1 for body in bodies)
+    assert sorted(backend.prompts) == sorted(body["params"]["prompt"] for body in bodies)
+    assert backend.max_active == 1
 
 
 @pytest.mark.parametrize(
