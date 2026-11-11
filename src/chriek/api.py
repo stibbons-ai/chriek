@@ -1,4 +1,4 @@
-"""HTTP API: job submission and polling (API key required), signed image downloads (no key)."""
+"""HTTP API: job submission and polling (authenticated), signed image downloads (no key)."""
 
 import math
 import re
@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
-from chriek.auth import ApiKeyAuth
+from chriek.auth import Authenticate, authenticator
 from chriek.backend import FakeBackend, ImageBackend
 from chriek.config import Limits, Settings
 from chriek.signing import UrlSigner
@@ -56,7 +56,9 @@ def create_app(
     store = JobStore(settings.db_path)
     worker = Worker(store, backend or FakeBackend(), storage_dir, clock)
     signer = UrlSigner(settings.signing_secret)
-    jobs = APIRouter(route_class=_authenticated_route(ApiKeyAuth(settings.api_keys)))
+    jobs = APIRouter(
+        route_class=_authenticated_route(authenticator(settings.auth_mode, settings.api_keys))
+    )
     Owner = Annotated[str, Depends(_owner)]
 
     @asynccontextmanager
@@ -142,7 +144,14 @@ def create_app(
             height=body.height,
             seed=seed,
             now=clock(),
+            max_queued=settings.limits.max_queued_jobs,
         )
+        if job is None:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                f"queue full: at most {settings.limits.max_queued_jobs} queued jobs per owner; "
+                "retry after some of them have started",
+            )
         worker.notify()
         response.headers["Location"] = f"/jobs/{job.id}"
         return job_body(job, request)
@@ -178,7 +187,7 @@ def create_app(
     return app
 
 
-def _authenticated_route(authenticate: ApiKeyAuth) -> type[APIRoute]:
+def _authenticated_route(authenticate: Authenticate) -> type[APIRoute]:
     """Route class that authenticates before FastAPI reads the body or resolves parameters.
 
     FastAPI parses the request body before running dependencies, so a key check as a

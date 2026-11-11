@@ -2,9 +2,18 @@
 
 import io
 import xml.etree.ElementTree as ET
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-from conftest import ALICE, BOB, SIGNING_SECRET, FakeClock, running, submit, wait_for
+from conftest import (
+    ALICE,
+    BOB,
+    SIGNING_SECRET,
+    FakeClock,
+    running,
+    submit,
+    wait_for,
+    with_query,
+)
 from PIL import Image
 
 TRAINED_ALGORITHMIC_MEDIA = "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
@@ -15,12 +24,6 @@ def finished_job(client, **fields):
     body = wait_for(client, submit(client, **{"width": 32, "height": 16} | fields)["id"])
     assert body["status"] == "succeeded", body
     return body
-
-
-def with_query(url, **changes):
-    parts = urlsplit(url)
-    query = {key: values[0] for key, values in parse_qs(parts.query).items()} | changes
-    return parts._replace(query=urlencode(query)).geturl()
 
 
 def test_download_needs_no_api_key_and_returns_the_png(client):

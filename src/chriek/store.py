@@ -12,6 +12,9 @@ from sqlalchemy import (
     Text,
     create_engine,
     event,
+    func,
+    insert,
+    literal,
     select,
     update,
 )
@@ -82,22 +85,41 @@ class JobStore:
         height: int,
         seed: int,
         now: float,
-    ) -> Job:
-        job = Job(
-            id=str(uuid.uuid7()),
-            owner=owner,
-            status=QUEUED,
-            prompt=prompt,
-            image_count=image_count,
-            width=width,
-            height=height,
-            seed=seed,
-            created_at=now,
-            images=[],
+        max_queued: int,
+    ) -> Job | None:
+        """Queue a job unless `owner` already has `max_queued` queued jobs; None if full.
+
+        Count and insert are one INSERT ... SELECT statement. SQLite takes the write lock
+        before that statement reads, so concurrent submissions, even through other
+        connections or processes, see each other's inserts and can't overshoot the cap.
+        """
+        values = {
+            "id": str(uuid.uuid7()),
+            "owner": owner,
+            "status": QUEUED,
+            "prompt": prompt,
+            "image_count": image_count,
+            "width": width,
+            "height": height,
+            "seed": seed,
+            "created_at": now,
+        }
+        jobs = Job.__table__
+        queued = (
+            select(func.count())
+            .select_from(jobs)
+            .where(jobs.c.owner == owner, jobs.c.status == QUEUED)
+            .correlate(None)
+            .scalar_subquery()
         )
+        row = select(*(literal(value, jobs.c[name].type) for name, value in values.items()))
         with self._session.begin() as session:
-            session.add(job)
-        return job
+            seq = session.scalar(
+                insert(jobs)
+                .from_select(list(values), row.where(queued < max_queued))
+                .returning(jobs.c.seq)
+            )
+        return None if seq is None else Job(**values, images=[])
 
     def get(self, owner: str, job_id: str) -> Job | None:
         with self._session() as session:
