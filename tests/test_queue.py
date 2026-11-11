@@ -1,6 +1,22 @@
 """Property 4: one job at a time in persisted FIFO order; restarts fail running jobs only."""
 
-from conftest import ALICE, BOB, GatedBackend, running, submit, wait_for
+import logging
+import time
+
+import pytest
+from conftest import (
+    ALICE,
+    BOB,
+    CountingBackend,
+    FailingBackend,
+    GatedBackend,
+    running,
+    submit,
+    wait_for,
+)
+from sqlalchemy.exc import OperationalError
+
+from chriek.store import JobStore
 
 
 def status(client, job_id, headers=ALICE):
@@ -78,3 +94,59 @@ def test_jobs_and_downloads_survive_a_clean_restart(tmp_path):
         assert again["status"] == "succeeded"
         assert again["params"] == body["params"]
         assert after.get(again["images"][0]["url"]).status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("store_method", "first_render_fails"),
+    [("succeed", False), ("fail", True)],
+    ids=["success-write-fails", "failure-write-fails"],
+)
+def test_unsaved_job_result_stops_the_worker_until_restart(
+    tmp_path, monkeypatch, caplog, store_method, first_render_fails
+):
+    # Arrange: the first final-state write raises, as if SQLite were locked or the disk full.
+    original = getattr(JobStore, store_method)
+    calls = []
+
+    def broken_once(self, *args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise OperationalError("COMMIT", {}, RuntimeError("database is locked"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(JobStore, store_method, broken_once)
+    backend = FailingBackend(fail_index=0) if first_render_fails else CountingBackend()
+
+    with running(tmp_path, backend=backend) as before:
+        first = submit(before, prompt="first", width=16, height=16)
+        second = submit(before, prompt="second", width=16, height=16)
+
+        deadline = time.monotonic() + 10
+        while (health := before.get("/health")).status_code != 503:
+            assert time.monotonic() < deadline, "worker never reported its failure"
+            time.sleep(0.01)
+        assert health.json() == {
+            "status": "error",
+            "detail": "worker stopped: a job result could not be saved; restart chriek",
+        }
+        stuck = before.get(f"/jobs/{first['id']}", headers=ALICE).json()
+        assert (stuck["status"], stuck["images"], stuck["error"]) == ("running", [], None)
+        assert status(before, second["id"]) == "queued"
+        third = submit(before, prompt="third", width=16, height=16)
+        assert status(before, third["id"]) == "queued"
+        assert backend.renders == 1, "no job may run after an unsaved result"
+
+    assert any(
+        isinstance(record.exc_info[1], OperationalError)
+        for record in caplog.records
+        if record.levelno == logging.ERROR and record.exc_info
+    ), "the original database error must be logged"
+
+    with running(tmp_path) as after:
+        assert after.get("/health").json() == {"status": "ok"}
+        interrupted = after.get(f"/jobs/{first['id']}", headers=ALICE).json()
+        assert interrupted["status"] == "failed"
+        assert interrupted["error"] == "interrupted: the server stopped while this job was running"
+        assert (interrupted["images"], interrupted["run"]) == ([], None)
+        assert wait_for(after, second["id"])["status"] == "succeeded"
+        assert wait_for(after, third["id"])["status"] == "succeeded"

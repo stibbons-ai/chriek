@@ -27,6 +27,7 @@ MAX_SEED = 2**32 - 1
 WORKER_STOP_TIMEOUT_SECONDS = 30.0
 INDEX_PATTERN = re.compile(r"[0-9]{1,6}")
 EXPIRES_PATTERN = re.compile(r"[0-9]{1,12}")  # bounded: int() of huge digit strings raises
+WORKER_STOPPED = "worker stopped: a job result could not be saved; restart chriek"
 
 
 class JobRequest(BaseModel):
@@ -67,10 +68,12 @@ def create_app(
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
         # FastAPI's default handler echoes rejected input verbatim; JSON can't encode
-        # nonfinite numbers (NaN, 1e999) or lone surrogates, which would turn a 422 into a 500.
+        # nonfinite numbers (NaN, 1e999), lone surrogates or non-UTF-8 bytes (a raw
+        # non-JSON body), which would turn a 422 into a 500.
+        errors = jsonable_encoder(exc.errors(), custom_encoder={bytes: _decode_lossless})
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+            content={"detail": _json_safe(errors)},
         )
 
     def job_body(job: Job, request: Request) -> dict[str, Any]:
@@ -108,7 +111,10 @@ def create_app(
         }
 
     @app.get("/health")
-    def health() -> dict[str, str]:
+    def health(response: Response) -> dict[str, str]:
+        if worker.stopped_on_error:
+            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            return {"status": "error", "detail": WORKER_STOPPED}
         return {"status": "ok"}
 
     @app.post("/jobs", status_code=status.HTTP_202_ACCEPTED)
@@ -205,6 +211,10 @@ def _is_utf8(text: str) -> bool:
     except UnicodeEncodeError:
         return False
     return True
+
+
+def _decode_lossless(data: bytes) -> str:
+    return data.decode("utf-8", "backslashreplace")
 
 
 def _json_safe(value: Any) -> Any:

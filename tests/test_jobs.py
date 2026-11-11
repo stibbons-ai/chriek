@@ -183,14 +183,40 @@ def test_valid_unicode_prompt_is_persisted_and_rendered(client, prompt_json, pro
         (b"not json", 422),
         # Python's JSON parser refuses integers this long; FastAPI answers 400.
         (b'{"prompt": "x", "seed": 1' + b"0" * 5000 + b"}", 400),
+        # JSON bodies must be valid UTF-8; FastAPI answers 400 before validation.
+        (b'{"prompt": "a light\xffhouse"}', 400),
     ],
-    ids=["not-json", "5000-digit-seed"],
+    ids=["not-json", "5000-digit-seed", "invalid-utf8"],
 )
 def test_unparseable_body_is_rejected(client, content, expected):
     response = client.post(
         "/jobs", headers=ALICE | {"Content-Type": "application/json"}, content=content
     )
     assert response.status_code == expected
+
+
+@pytest.mark.parametrize(
+    ("content_type", "content"),
+    [
+        ("text/plain", b"\xff"),
+        ("application/octet-stream", b"\xff"),
+        ("application/octet-stream", b'{"prompt": "a light\xc3house"}'),
+        ("text/plain", b"hello"),
+    ],
+    ids=["text-ff", "octet-ff", "octet-truncated-utf8", "text-ascii"],
+)
+def test_undecodable_body_bytes_are_422_and_never_execute(tmp_path, content_type, content):
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        response = client.post(
+            "/jobs", headers=ALICE | {"Content-Type": content_type}, content=content
+        )
+
+        assert response.status_code == 422, response.text
+        assert isinstance(response.json()["detail"], list)
+        valid = submit(client, width=16, height=16)
+        assert wait_for(client, valid["id"])["status"] == "succeeded"
+        assert backend.renders == 1
 
 
 def test_limits_come_from_configuration(tmp_path):
@@ -235,3 +261,4 @@ def test_failed_job_does_not_stop_the_queue(tmp_path):
         assert wait_for(client, failed["id"])["status"] == "failed"
         succeeded = submit(client, width=16, height=16)
         assert wait_for(client, succeeded["id"])["status"] == "succeeded"
+        assert client.get("/health").json() == {"status": "ok"}

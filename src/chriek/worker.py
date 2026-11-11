@@ -33,6 +33,7 @@ class Worker:
         self._clock = clock
         self._wake = threading.Event()
         self._stopping = False
+        self.stopped_on_error = False
         self._thread = threading.Thread(target=self._loop, name="chriek-worker", daemon=True)
 
     def start(self) -> None:
@@ -52,13 +53,21 @@ class Worker:
             self._wake.clear()
             try:
                 job = self._store.claim_next(self._clock())
-                if job is None:
-                    self._wake.wait(IDLE_RECHECK_SECONDS)
-                else:
-                    self._run(job)
             except Exception:
-                log.exception("worker iteration failed")
+                log.exception("claiming the next job failed")
                 self._wake.wait(IDLE_RECHECK_SECONDS)
+                continue
+            if job is None:
+                self._wake.wait(IDLE_RECHECK_SECONDS)
+                continue
+            try:
+                self._run(job)
+            except Exception:
+                # Only the final state write can raise here. Fail closed: the job stays
+                # `running` until a restart fails it, and no later job may run alongside it.
+                log.exception("could not record the result of job %s; worker stopped", job.id)
+                self.stopped_on_error = True
+                return
 
     def _run(self, job: Job) -> None:
         started = self._clock()

@@ -87,7 +87,7 @@ curl -s http://127.0.0.1:8000/jobs/$JOB_ID -H "Authorization: Bearer $KEY"
 ```
 
 - `status` is `queued`, `running`, `succeeded` or `failed`.
-- `run` is the run record, set once the job finishes: which backend, model and revision rendered it and how long rendering took. The fake backend reports no hardware or memory figures because it measures none.
+- `run` is the run record, set once the worker finishes the job: which backend, model and revision rendered it and how long rendering took. The fake backend reports no hardware or memory figures because it measures none. A job failed by restart recovery (see [Job behaviour](#job-behaviour)) has `run: null`, because no render finished.
 - `images` is filled only when `succeeded`. Every poll mints fresh URLs that expire `CHRIEK_URL_TTL_SECONDS` later.
 - `error` explains a `failed` job, for example `image 2 of 3 failed: …`.
 
@@ -101,13 +101,14 @@ curl -s -o image0.png "$URL"
 
 ### `GET /health`
 
-Returns `{"status": "ok"}`.
+Returns `200 {"status": "ok"}`. If the worker could not save a job's result (succeeded or failed) to the database, it stops and this returns `503 {"status": "error", "detail": "worker stopped: a job result could not be saved; restart chriek"}`; see [Job behaviour](#job-behaviour).
 
 ## Job behaviour
 
 - **Queue.** Jobs are stored in SQLite and run one at a time, oldest first, by a single worker thread in the `chriek serve` process.
 - **All or nothing.** If any image of a job fails, the job fails and the images it already rendered are discarded. A job is never partly successful.
 - **Restarts.** Queued jobs survive a restart and run afterwards. A job that was `running` when the process stopped is marked `failed` on the next start (`interrupted: the server stopped while this job was running`) and isn't retried.
+- **Unsaved results stop the worker.** If saving a finished job's result to the database fails, the worker logs the error and stops instead of moving on: that job stays `running`, no later job runs, new submissions stay `queued`, and `GET /health` returns `503`. Fix the database or disk problem and restart `chriek serve`; restart recovery then fails the stuck job as interrupted and the queue resumes.
 - **AI disclosure in every PNG**, always on: PNG text chunks `AI-Generated: true`, `Model`, `Model-Revision`, `Seed` and `Description`, plus XMP (`XML:com.adobe.xmp`) with IPTC `Iptc4xmpExt:DigitalSourceType` = `http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia`. With the fake backend, `Model` is `chriek-fake-backend` and `Model-Revision` is `fake-v1`.
 - No retention: generated files stay in `CHRIEK_STORAGE_DIR` until you delete them.
 

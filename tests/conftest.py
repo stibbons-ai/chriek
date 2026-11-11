@@ -70,7 +70,8 @@ class GatedBackend(FakeBackend):
 
 
 class FailingBackend(FakeBackend):
-    """Fake backend that fails one image index of every job; counts renders."""
+    """Fake backend that fails only render number `fail_index` (0-based, counted across all
+    jobs, never reset); counts renders. Jobs rendered after that one failure succeed."""
 
     def __init__(self, fail_index: int) -> None:
         self.fail_index = fail_index
