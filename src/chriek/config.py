@@ -83,10 +83,12 @@ def _api_keys(raw: str) -> dict[str, str]:
                 f"CHRIEK_API_KEYS entry {position} must be name:key with a name of "
                 "1-64 characters from A-Z a-z 0-9 _ . -"
             )
-        if len(key) < MIN_SECRET_LENGTH or any(c.isspace() for c in key):
+        # Starlette decodes headers as Latin-1, and clients differ in how they encode
+        # anything beyond ASCII: only printable ASCII keys reliably authenticate.
+        if len(key) < MIN_SECRET_LENGTH or not all("!" <= c <= "~" for c in key):
             raise ConfigError(
                 f"CHRIEK_API_KEYS key for {name!r} must be at least "
-                f"{MIN_SECRET_LENGTH} characters without whitespace"
+                f"{MIN_SECRET_LENGTH} printable ASCII characters without whitespace"
             )
         if name in keys:
             raise ConfigError(f"CHRIEK_API_KEYS names {name!r} more than once")

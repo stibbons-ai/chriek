@@ -28,7 +28,7 @@ All configuration comes from environment variables.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CHRIEK_API_KEYS` | required | Named static API keys, `name:key,name:key`. The name is the owner of the jobs created with that key. Names: 1–64 characters from `A-Z a-z 0-9 _ . -`, unique. Keys: at least 32 characters, no whitespace or commas, unique. |
+| `CHRIEK_API_KEYS` | required | Named static API keys, `name:key,name:key`. The name is the owner of the jobs created with that key. Names: 1–64 characters from `A-Z a-z 0-9 _ . -`, unique. Keys: at least 32 printable ASCII characters (`!` to `~`; no spaces, control or non-ASCII characters, no commas), unique. Keys travel in an HTTP header, so other characters are rejected at startup. |
 | `CHRIEK_SIGNING_SECRET` | required | HMAC secret for download URLs, at least 32 characters. Changing it invalidates every issued URL (polling the job again mints new ones). |
 | `CHRIEK_URL_TTL_SECONDS` | `900` | Lifetime of a download URL, 1–604800 seconds. |
 | `CHRIEK_DB_PATH` | `chriek-data/chriek.db` | SQLite database file; parent directories are created. Put it on a volume to keep jobs across restarts. |
@@ -44,7 +44,7 @@ Relative paths resolve against the working directory. The database schema is cre
 
 ## API
 
-Every `/jobs` request needs `Authorization: Bearer <key>`. A missing or invalid key returns `401`. A job created with another key returns `404`, exactly like a job that doesn't exist. `GET /health` and image downloads need no key.
+Every `/jobs` request needs `Authorization: Bearer <key>`. A missing or invalid key returns `401` before the request body is read, so even a malformed body gets `401`. A job created with another key returns `404`, exactly like a job that doesn't exist. `GET /health` and image downloads need no key.
 
 ### `POST /jobs`
 
@@ -61,7 +61,7 @@ curl -s -X POST http://127.0.0.1:8000/jobs \
 | `seed` | integer or null | random | `0 ≤ seed` and `seed + image_count - 1 ≤ 4294967295` |
 | `width`, `height` | integer | `1024` | multiples of 16, 16 to `CHRIEK_MAX_DIMENSION`, `width * height ≤ CHRIEK_MAX_PIXELS` |
 
-Types are strict (`"1024"` or `1024.0` is not an integer) and unknown fields are rejected. Nonfinite numbers (`NaN`, `Infinity`, `1e999`) and prompts with unpaired UTF-16 surrogates (`"\ud800"`) are rejected too; error entries echo such input as text (`"inf"`, `"\\ud800"`). Invalid requests return `422` with FastAPI's `{"detail": [...]}` error list and never enter the queue. A valid request returns `202`, a `Location: /jobs/<id>` header and the job (below) in status `queued`. Job IDs are UUIDv7. When `seed` is omitted, chriek picks one at random and reports it in `params.seed`; image `i` uses seed `seed + i`.
+Types are strict (`"1024"` or `1024.0` is not an integer) and unknown fields are rejected. Nonfinite numbers (`NaN`, `Infinity`, `1e999`) and prompts with unpaired UTF-16 surrogates (`"\ud800"`) are rejected too; error entries echo such input as text (`"inf"`, `"\\ud800"`). Requests that fail validation return `422` with FastAPI's `{"detail": [...]}` error list. A JSON body the parser can't read at all, such as invalid UTF-8 or an integer literal thousands of digits long, returns `400 {"detail": "There was an error parsing the body"}` instead. Neither kind of rejected request enters the queue. A valid request returns `202`, a `Location: /jobs/<id>` header and the job (below) in status `queued`. Job IDs are UUIDv7. When `seed` is omitted, chriek picks one at random and reports it in `params.seed`; image `i` uses seed `seed + i`.
 
 ### `GET /jobs/{id}`
 
@@ -87,7 +87,7 @@ curl -s http://127.0.0.1:8000/jobs/$JOB_ID -H "Authorization: Bearer $KEY"
 ```
 
 - `status` is `queued`, `running`, `succeeded` or `failed`.
-- `run` is the run record, set once the worker finishes the job: which backend, model and revision rendered it and how long rendering took. The fake backend reports no hardware or memory figures because it measures none. A job failed by restart recovery (see [Job behaviour](#job-behaviour)) has `run: null`, because no render finished.
+- `run` is the run record, set once the worker finishes the job: which backend, model and revision rendered it and how long rendering took. The fake backend reports no hardware or memory figures because it measures none. A job failed by restart recovery (see [Job behaviour](#job-behaviour)) has `run: null`, because no run record was persisted.
 - `images` is filled only when `succeeded`. Every poll mints fresh URLs that expire `CHRIEK_URL_TTL_SECONDS` later.
 - `error` explains a `failed` job, for example `image 2 of 3 failed: …`.
 

@@ -3,7 +3,7 @@
 import uuid
 
 import pytest
-from conftest import ALICE, ALICE_KEY, BOB, submit, wait_for
+from conftest import ALICE, ALICE_KEY, BOB, CountingBackend, running, submit, wait_for
 
 VALID_JOB = {"prompt": "a lighthouse"}
 
@@ -57,6 +57,36 @@ def test_bearer_scheme_is_case_insensitive(client):
 
 def test_invalid_body_without_key_is_401_not_422(client):
     assert client.post("/jobs", json={"width": "nope"}).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "headers", [{}, {"Authorization": "Bearer invalid"}], ids=["missing", "invalid"]
+)
+@pytest.mark.parametrize(
+    "content", [b"{", b'{"prompt": "bad\xff"}'], ids=["malformed-json", "invalid-utf8"]
+)
+def test_unparseable_body_without_valid_key_is_401_and_never_executes(tmp_path, headers, content):
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        response = client.post(
+            "/jobs", headers=headers | {"Content-Type": "application/json"}, content=content
+        )
+
+        assert response.status_code == 401
+        assert response.headers["www-authenticate"] == "Bearer"
+        assert response.json() == {"detail": "missing or invalid API key"}
+        valid = submit(client, width=16, height=16)
+        assert wait_for(client, valid["id"])["status"] == "succeeded"
+        assert backend.renders == 1
+
+
+def test_any_printable_ascii_key_authenticates(tmp_path):
+    # Every printable ASCII character except the entry separator ",".
+    key = "".join(chr(code) for code in range(ord("!"), ord("~") + 1) if chr(code) != ",")
+    carol = {"Authorization": f"Bearer {key}"}
+    with running(tmp_path, CHRIEK_API_KEYS=f"carol:{key}") as client:
+        job = submit(client, headers=carol)
+        assert client.get(f"/jobs/{job['id']}", headers=carol).status_code == 200
 
 
 def test_other_owners_job_is_indistinguishable_from_a_missing_job(client):

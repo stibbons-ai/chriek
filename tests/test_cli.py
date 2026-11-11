@@ -27,11 +27,19 @@ def serve(env: dict[str, str], **kwargs) -> subprocess.Popen:
     )
 
 
+EMOJI_KEY = "\N{OTTER}" * 32
+LATIN1_KEY = "\N{LATIN SMALL LETTER E WITH ACUTE}" * 32
+CONTROL_KEY = ALICE_KEY + "\x07"
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
         ({"CHRIEK_API_KEYS": ""}, "CHRIEK_API_KEYS must name at least one key"),
-        ({"CHRIEK_API_KEYS": "alice:short-secret-key"}, "at least 32 characters"),
+        ({"CHRIEK_API_KEYS": "alice:short-secret-key"}, "at least 32 printable ASCII"),
+        ({"CHRIEK_API_KEYS": f"alice:{EMOJI_KEY}"}, "at least 32 printable ASCII"),
+        ({"CHRIEK_API_KEYS": f"alice:{LATIN1_KEY}"}, "at least 32 printable ASCII"),
+        ({"CHRIEK_API_KEYS": f"alice:{CONTROL_KEY}"}, "at least 32 printable ASCII"),
         ({"CHRIEK_API_KEYS": ALICE_KEY}, "must be name:key"),
         ({"CHRIEK_API_KEYS": f"bad name:{ALICE_KEY}"}, "must be name:key"),
         (
@@ -61,6 +69,8 @@ def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrid
     assert message in output
     for secret in (ALICE_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
         assert secret not in output
+    for secret in (EMOJI_KEY, LATIN1_KEY):
+        assert secret[:2] not in output
     assert not (tmp_path / "db").exists(), "nothing may start on invalid configuration"
 
 
@@ -90,9 +100,11 @@ def test_chriek_serve_round_trip(tmp_path):
         job = httpx2.post(
             f"{base}/jobs", headers=ALICE, json={"prompt": "otter", "image_count": 2, "seed": 1}
         ).json()
+        deadline = time.monotonic() + 30
         while (body := httpx2.get(f"{base}/jobs/{job['id']}", headers=ALICE).json())[
             "status"
         ] not in {"succeeded", "failed"}:
+            assert time.monotonic() < deadline, f"job never finished: {body}"
             time.sleep(0.05)
 
         assert body["status"] == "succeeded", body

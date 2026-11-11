@@ -17,7 +17,7 @@ class ApiKeyAuth:
         self._owners = [(name, _digest(key)) for name, key in api_keys.items()]
 
     def __call__(self, request: Request) -> str:
-        """FastAPI dependency returning the owner name; 401 on missing or invalid key."""
+        """Return the owner name of the presented key; 401 on missing or invalid key."""
         scheme, _, presented = request.headers.get("authorization", "").partition(" ")
         candidate = _digest(presented.strip())
         owner = None

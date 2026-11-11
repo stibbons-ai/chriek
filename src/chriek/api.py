@@ -10,10 +10,11 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 
 from chriek.auth import ApiKeyAuth
@@ -51,8 +52,8 @@ def create_app(
     store = JobStore(settings.db_path)
     worker = Worker(store, backend or FakeBackend(), storage_dir, clock)
     signer = UrlSigner(settings.signing_secret)
-    authenticate = ApiKeyAuth(settings.api_keys)
-    Owner = Annotated[str, Depends(authenticate)]
+    jobs = APIRouter(route_class=_authenticated_route(ApiKeyAuth(settings.api_keys)))
+    Owner = Annotated[str, Depends(_owner)]
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -117,7 +118,7 @@ def create_app(
             return {"status": "error", "detail": WORKER_STOPPED}
         return {"status": "ok"}
 
-    @app.post("/jobs", status_code=status.HTTP_202_ACCEPTED)
+    @jobs.post("/jobs", status_code=status.HTTP_202_ACCEPTED)
     def submit_job(
         body: JobRequest, owner: Owner, request: Request, response: Response
     ) -> dict[str, Any]:
@@ -140,7 +141,7 @@ def create_app(
         response.headers["Location"] = f"/jobs/{job.id}"
         return job_body(job, request)
 
-    @app.get("/jobs/{job_id}")
+    @jobs.get("/jobs/{job_id}")
     def get_job(job_id: str, owner: Owner, request: Request) -> dict[str, Any]:
         # Malformed IDs, missing jobs and other owners' jobs all get the same 404.
         job_uuid = _parse_uuid(job_id)
@@ -167,7 +168,33 @@ def create_app(
             raise HTTPException(status.HTTP_404_NOT_FOUND, "image not found")
         return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
+    app.include_router(jobs)
     return app
+
+
+def _authenticated_route(authenticate: ApiKeyAuth) -> type[APIRoute]:
+    """Route class that authenticates before FastAPI reads the body or resolves parameters.
+
+    FastAPI parses the request body before running dependencies, so a key check as a
+    dependency would answer malformed bodies with 400/422 instead of 401.
+    """
+
+    class AuthenticatedRoute(APIRoute):
+        def get_route_handler(self) -> Callable[[Request], Any]:
+            handler = super().get_route_handler()
+
+            async def authenticated(request: Request) -> Response:
+                request.state.owner = authenticate(request)
+                return await handler(request)
+
+            return authenticated
+
+    return AuthenticatedRoute
+
+
+def _owner(request: Request) -> str:
+    """Owner name set by the authenticated route before this dependency runs."""
+    return request.state.owner
 
 
 def _limit_errors(body: JobRequest, limits: Limits) -> list[dict[str, Any]]:
