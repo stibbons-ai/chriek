@@ -4,7 +4,7 @@ import ipaddress
 import os
 import re
 import ssl
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -159,7 +159,34 @@ def _database(env: Mapping[str, str]) -> Path | URL:
         raise ConfigError(
             "CHRIEK_DATABASE_URL must start with postgresql:// or postgresql+psycopg://"
         )
+    # An unencoded `@` in the password puts the rest of it into the host, which drivers echo.
+    if url.host and "@" in url.host:
+        raise ConfigError(
+            "CHRIEK_DATABASE_URL must percent-encode @ in the user name and password as %40"
+        )
+    if not all(_is_conninfo_text(text) for text in _url_texts(url)):
+        raise ConfigError(
+            "CHRIEK_DATABASE_URL must be UTF-8 text without NUL characters, also after "
+            "percent-decoding"
+        )
     return url
+
+
+def _url_texts(url: URL) -> Iterator[str]:
+    """Every decoded value the driver receives; repeated query keys hold tuples."""
+    yield from (text for text in (url.username, url.password, url.host, url.database) if text)
+    for key, value in url.query.items():
+        yield key
+        yield from (value,) if isinstance(value, str) else value
+
+
+def _is_conninfo_text(text: str) -> bool:
+    """libpq takes NUL-terminated UTF-8 strings: a NUL truncates the connection settings."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return "\x00" not in text
 
 
 def _int(env: Mapping[str, str], name: str, default: int, low: int, high: int) -> int:

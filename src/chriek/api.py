@@ -268,6 +268,9 @@ def _limit_errors(body: JobRequest, limits: Limits) -> list[dict[str, Any]]:
 
     if not _is_utf8(body.prompt):
         reject("prompt", "prompt must be valid Unicode text (no unpaired surrogates)")
+    elif "\x00" in body.prompt:
+        # Postgres text can't hold U+0000; rejecting it keeps both databases equivalent.
+        reject("prompt", "prompt must not contain NUL characters (U+0000)")
     elif not body.prompt.strip():
         reject("prompt", "prompt must not be blank")
     elif len(body.prompt) > limits.max_prompt_chars:

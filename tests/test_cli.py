@@ -70,6 +70,7 @@ CONTROL_KEY = ALICE_KEY + "\x07"
 MARKER = "public-url-secret-marker"
 URL_FORM = "CHRIEK_PUBLIC_URL must be an absolute http or https URL"
 PRINTABLE = "CHRIEK_PUBLIC_URL must contain only printable ASCII"
+UNENCODED_AT_PASSWORD = ("S3cr", "tTail-9999")  # written as S3cr@tTail-9999
 
 
 def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str) -> str:
@@ -86,11 +87,13 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
         "short-secret-key",
         "short-signing-secret",
         DB_PASSWORD,
+        *UNENCODED_AT_PASSWORD,
     ):
         assert secret not in output
     for secret in (EMOJI_KEY, LATIN1_KEY):
         assert secret[:2] not in output
     assert "PRIVATE KEY" not in output
+    assert "Traceback" not in output
     assert not (tmp_path / "db").exists(), "nothing may start on invalid configuration"
     return output
 
@@ -254,6 +257,22 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
             {"CHRIEK_DATABASE_URL": f"mysql://chriek:{DB_PASSWORD}@db/chriek"},
             "CHRIEK_DATABASE_URL must start with postgresql:// or postgresql+psycopg://",
         ),
+        (
+            {
+                "CHRIEK_DATABASE_URL": "postgresql://chriek:{}@{}@db.invalid/chriek".format(
+                    *UNENCODED_AT_PASSWORD
+                )
+            },
+            "CHRIEK_DATABASE_URL must percent-encode @ in the user name and password as %40",
+        ),
+        # %00 would truncate libpq's connection settings; \udcff is an undecodable 0xff byte.
+        *(
+            (
+                {"CHRIEK_DATABASE_URL": f"postgresql://chriek:{password}@127.0.0.1:1/chriek"},
+                "CHRIEK_DATABASE_URL must be UTF-8 text without NUL characters",
+            )
+            for password in (f"{DB_PASSWORD}%00", f"{DB_PASSWORD}\udcff")
+        ),
     ],
 )
 def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrides, message):
@@ -290,23 +309,27 @@ def test_missing_public_url_exits_2_without_fallback(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("host", "detail"),
+    ("password", "host", "detail"),
     [
-        ("127.0.0.1:1", "connection failed: "),
+        (DB_PASSWORD, "127.0.0.1:1", "connection failed: "),
         # A driver message that echoes a password-bearing host name still hides the password.
-        (f"{DB_PASSWORD}.invalid", "'***.invalid'"),
+        (DB_PASSWORD, f"{DB_PASSWORD}.invalid", "'***.invalid'"),
+        # Percent-encoded reserved and non-ASCII characters are valid configuration.
+        ("db-%40%25-%C3%A9-0123456789", "127.0.0.1:1", "connection failed: "),
     ],
-    ids=["refused", "echoed"],
+    ids=["refused", "echoed", "encoded-unicode"],
 )
-def test_unreachable_postgres_exits_1_without_leaking_the_password(tmp_path, host, detail):
-    url = f"postgresql://chriek:{DB_PASSWORD}@{host}/chriek"
+def test_unreachable_postgres_exits_1_without_leaking_the_password(
+    tmp_path, password, host, detail
+):
+    url = f"postgresql://chriek:{password}@{host}/chriek"
     process = serve(base_env(tmp_path) | {"CHRIEK_DATABASE_URL": url})
     output, _ = process.communicate(timeout=60)
 
     assert process.returncode == 1, output
     assert output.startswith("chriek: database error: "), output
     assert detail in output
-    assert DB_PASSWORD not in output
+    assert "0123456789" not in output
     assert "Traceback" not in output
     assert not (tmp_path / "db").exists(), "CHRIEK_DATABASE_URL takes precedence over the path"
 
@@ -359,17 +382,22 @@ def served(env: dict[str, str], **kwargs) -> Iterator[httpx2.Client]:
 
 # A non-ASCII signing secret stays valid: only API keys travel in headers.
 @pytest.mark.parametrize("signing_secret", [SIGNING_SECRET, EMOJI_KEY])
-def test_chriek_serve_round_trip(tmp_path, signing_secret):
+def test_chriek_serve_walkthrough_across_restart(tmp_path, signing_secret):
+    """Operator starts, stops and restarts `chriek serve`; alice submits, polls and downloads;
+    bob can't see her job. Runs on SQLite, or on Postgres with CHRIEK_TEST_POSTGRES_URL."""
     env = base_env(tmp_path) | {"CHRIEK_HOST": "127.0.0.1", "CHRIEK_SIGNING_SECRET": signing_secret}
     with served(env) as client:
         body = wait_for(client, submit(client, prompt="otter", image_count=2, seed=1)["id"])
 
         assert body["status"] == "succeeded", body
+        downloads = []
         for image in body["images"]:
             assert image["url"].startswith(f"{client.base_url}/images/{body['id']}/")
-            png = Image.open(io.BytesIO(client.get(image["url"]).content))
+            downloads.append(client.get(image["url"]).content)
+            png = Image.open(io.BytesIO(downloads[-1]))
             assert png.size == (1024, 1024)
             assert png.text["Seed"] == str(image["seed"])
+        assert client.get(f"/jobs/{body['id']}", headers=BOB).status_code == 404
         job = body["id"]
         expected = {
             "images": 0o700,
@@ -386,6 +414,17 @@ def test_chriek_serve_round_trip(tmp_path, signing_secret):
                 "db/chriek.db-shm": 0o600,
             }
         assert modes(tmp_path) == expected
+
+    with served(env) as client:
+        again = client.get(f"/jobs/{body['id']}", headers=ALICE).json()
+
+        assert {key: again[key] for key in body if key != "images"} == {
+            key: body[key] for key in body if key != "images"
+        }
+        assert [(image["index"], image["seed"]) for image in again["images"]] == [(0, 1), (1, 2)]
+        assert [client.get(image["url"]).content for image in again["images"]] == downloads
+        # Bob gets the same 404 as for a missing job, so he never receives a download URL.
+        assert client.get(f"/jobs/{body['id']}", headers=BOB).status_code == 404
 
 
 def test_chriek_serve_shipped_defaults_keep_jobs_private_across_restart(tmp_path):

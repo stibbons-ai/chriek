@@ -206,7 +206,9 @@ class JobStore:
 
 def _create_engine(database: Path | URL) -> Engine:
     if isinstance(database, URL):
-        return create_engine(database.set(drivername="postgresql+psycopg"))
+        # The worker holds no connection while rendering; a server-side drop meanwhile (restart,
+        # failover, idle timeout) must not fail the result write that follows.
+        return create_engine(database.set(drivername="postgresql+psycopg"), pool_pre_ping=True)
     return _sqlite_engine(database)
 
 

@@ -60,7 +60,7 @@ def base_env(tmp_path: Path) -> dict[str, str]:
 
 
 def pytest_report_header() -> str:
-    return f"chriek test database: {'Postgres' if POSTGRES_URL else 'SQLite'}"
+    return f"chriek test database: {'SQLite' if POSTGRES_URL is None else 'Postgres'}"
 
 
 @pytest.fixture(scope="session")
@@ -71,10 +71,11 @@ def postgres_admin() -> Iterator[Engine]:
 
 
 @pytest.fixture(autouse=True)
-def database(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[None]:
+def database(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[str | None]:
+    """The name of this test's own Postgres database, or None on SQLite."""
     global _postgres_database_url
     if POSTGRES_URL is None or request.node.get_closest_marker("sqlite"):
-        yield
+        yield None
         return
 
     admin: Engine = request.getfixturevalue("postgres_admin")
@@ -82,7 +83,7 @@ def database(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[None]:
     with admin.connect() as connection:
         connection.execute(text(f'CREATE DATABASE "{name}"'))
     _postgres_database_url = admin.url.set(database=name).render_as_string(hide_password=False)
-    yield
+    yield name
     _postgres_database_url = None
     with admin.connect() as connection:
         connection.execute(text(f'DROP DATABASE "{name}" WITH (FORCE)'))
@@ -186,16 +187,18 @@ class PausingBackend(FakeBackend):
 
 class FailingBackend(FakeBackend):
     """Fake backend that fails only render number `fail_index` (0-based, counted across all
-    jobs, never reset); counts renders. Jobs rendered after that one failure succeed."""
+    jobs, never reset) with `message`; counts renders. Jobs rendered after that one failure
+    succeed."""
 
-    def __init__(self, fail_index: int) -> None:
+    def __init__(self, fail_index: int, message: str = BACKEND_SECRET) -> None:
         self.fail_index = fail_index
+        self.message = message
         self.renders = 0
 
     def render(self, prompt, width, height, seed):
         self.renders += 1
         if self.renders - 1 == self.fail_index:
-            raise RuntimeError(BACKEND_SECRET) from OSError(f"cause: {BACKEND_SECRET}")
+            raise RuntimeError(self.message) from OSError(f"cause: {self.message}")
         return super().render(prompt, width, height, seed)
 
 
