@@ -89,9 +89,11 @@ class JobStore:
     ) -> Job | None:
         """Queue a job unless `owner` already has `max_queued` queued jobs; None if full.
 
-        Count and insert are one INSERT ... SELECT statement. SQLite takes the write lock
-        before that statement reads, so concurrent submissions, even through other
-        connections or processes, see each other's inserts and can't overshoot the cap.
+        Count and insert are one INSERT ... SELECT statement, and it must stay the first
+        statement of its transaction: SQLite then takes the write lock before that statement
+        reads, so concurrent submissions, even through other connections or processes, see
+        each other's inserts and can't overshoot the cap. A read before it in the same
+        transaction would pin an older snapshot and turn contention into busy errors.
         """
         values = {
             "id": str(uuid.uuid7()),
@@ -119,7 +121,7 @@ class JobStore:
                 .from_select(list(values), row.where(queued < max_queued))
                 .returning(jobs.c.seq)
             )
-        return None if seq is None else Job(**values, images=[])
+        return None if seq is None else Job(**values, seq=seq, images=[])
 
     def get(self, owner: str, job_id: str) -> Job | None:
         with self._session() as session:

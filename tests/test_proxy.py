@@ -1,4 +1,4 @@
-"""Property 6: in proxy mode every client is one shared owner, whatever headers it sends."""
+"""In proxy mode every client is one shared owner, whatever headers it sends."""
 
 import uuid
 from urllib.parse import urlsplit

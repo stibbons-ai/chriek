@@ -102,7 +102,7 @@ def _auth_mode(raw: str) -> AuthMode:
 def _no_api_keys(raw: str) -> dict[str, str]:
     # Proxy mode never checks keys; refusing them keeps operators from relying on them.
     if raw.strip():
-        raise ConfigError("CHRIEK_API_KEYS must be unset when CHRIEK_AUTH_MODE is 'proxy'")
+        raise ConfigError("CHRIEK_API_KEYS must be unset or empty when CHRIEK_AUTH_MODE is 'proxy'")
     return {}
 
 

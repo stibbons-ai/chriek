@@ -1,4 +1,4 @@
-"""Property 5: admission never grows one owner's queued jobs beyond CHRIEK_MAX_QUEUED_JOBS."""
+"""Admission never grows one owner's queued jobs beyond CHRIEK_MAX_QUEUED_JOBS."""
 
 import sqlite3
 import threading
@@ -85,6 +85,36 @@ def test_capacity_returns_once_a_queued_job_starts_running(tmp_path):
         assert post(client, "after").status_code == 202
         backend.step()
     assert backend.prompts == ["first", "second", "third", "after"]
+
+
+class FailingStepBackend(StepBackend):
+    """StepBackend whose render of the prompt "fails" raises once stepped."""
+
+    def render(self, prompt, width, height, seed):
+        image = super().render(prompt, width, height, seed)
+        if prompt == "fails":
+            raise RuntimeError("injected backend failure")
+        return image
+
+
+def test_failed_jobs_do_not_take_queue_capacity(tmp_path):
+    backend = FailingStepBackend()
+    with running(tmp_path, backend=backend, CHRIEK_MAX_QUEUED_JOBS="1") as client:
+        failed = submit(client, prompt="fails", **SMALL)
+        backend.step()
+        assert wait_for(client, failed["id"])["status"] == "failed"
+        held = submit(client, prompt="running", **SMALL)
+        backend.wait_started(2)
+
+        queued = post(client, "queued")
+        assert queued.status_code == 202, "a failed job must not use the only queued slot"
+        over = post(client, "over")
+        assert (over.status_code, over.json()) == (429, queue_full(1))
+
+        backend.step(2)
+        for job in (held, queued.json()):
+            assert wait_for(client, job["id"])["status"] == "succeeded"
+    assert backend.prompts == ["fails", "running", "queued"]
 
 
 def test_concurrent_submissions_through_two_servers_never_exceed_the_cap(tmp_path):

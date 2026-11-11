@@ -34,7 +34,7 @@ export CHRIEK_TLS_KEYFILE=/etc/chriek/privkey.pem
 uv run chriek serve   # logs "Uvicorn running on https://127.0.0.1:8000"
 ```
 
-Set both variables or neither. With TLS configured, chriek never falls back to plain HTTP: if only one variable is set, either is set but empty, or the files can't be loaded as a matching certificate and key (missing, unreadable, not PEM, mismatched, or an encrypted key), startup stops with exit code 2. A plain-HTTP request to a TLS port gets no HTTP answer. chriek doesn't obtain or renew certificates (no ACME): renew them yourself and restart `chriek serve` to load the new files. Download URLs use the scheme and host the client connected with, so over TLS they are `https://` URLs.
+Set both variables or neither. With TLS configured, chriek never falls back to plain HTTP. Configuration validation loads the pair once: if only one variable is set, either is set but empty, or the files can't be loaded as a matching certificate and key (missing, unreadable, not PEM, mismatched, or an encrypted key), startup stops with exit code 2. The server then loads the files again when it starts; if they changed in between and no longer load, startup fails with an error and a nonzero exit code instead, and still never serves plain HTTP. A plain-HTTP request to a TLS port gets no HTTP answer. chriek doesn't obtain or renew certificates (no ACME): renew them yourself and restart `chriek serve` to load the new files. Download URLs are built from the request's scheme and `Host` header, so for clients connecting directly over TLS they are `https://` URLs. (The server trusts `X-Forwarded-Proto`/`X-Forwarded-For` only from loopback clients, so a proxy on the same host decides the scheme there.)
 
 ### Behind a reverse proxy (`CHRIEK_AUTH_MODE=proxy`)
 
@@ -188,5 +188,7 @@ The full check, also run by CI (`.github/workflows/ci.yml`):
 ```sh
 uv sync --locked && uv run --locked pre-commit run jscpd --all-files && uv run ruff check . && uv run ruff format --check . && uv run pytest
 ```
+
+The TLS tests generate throwaway certificates with the `openssl` command, so it must be on `PATH` (OpenSSL or LibreSSL).
 
 Tests drive chriek only through its HTTP API and the installed `chriek` command, with the fake backend.

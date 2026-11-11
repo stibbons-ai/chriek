@@ -75,7 +75,7 @@ CONTROL_KEY = ALICE_KEY + "\x07"
         ({"CHRIEK_PORT": "70000"}, "CHRIEK_PORT must be between"),
         ({"CHRIEK_AUTH_MODE": "Proxy"}, "CHRIEK_AUTH_MODE must be 'api-key' or 'proxy'"),
         ({"CHRIEK_AUTH_MODE": ""}, "CHRIEK_AUTH_MODE must be 'api-key' or 'proxy'"),
-        ({"CHRIEK_AUTH_MODE": "proxy"}, "CHRIEK_API_KEYS must be unset when"),
+        ({"CHRIEK_AUTH_MODE": "proxy"}, "CHRIEK_API_KEYS"),
         (
             {"CHRIEK_AUTH_MODE": "proxy", "CHRIEK_API_KEYS": "", "CHRIEK_SIGNING_SECRET": ""},
             "CHRIEK_SIGNING_SECRET must be at least 32",
