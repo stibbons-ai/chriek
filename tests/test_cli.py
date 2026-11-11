@@ -59,6 +59,11 @@ CONTROL_KEY = ALICE_KEY + "\x07"
         ({"CHRIEK_URL_TTL_SECONDS": "soon"}, "CHRIEK_URL_TTL_SECONDS must be an integer"),
         ({"CHRIEK_MAX_DIMENSION": "1000"}, "CHRIEK_MAX_DIMENSION must be a multiple of 16"),
         ({"CHRIEK_MAX_IMAGES": "0"}, "CHRIEK_MAX_IMAGES must be between"),
+        ({"CHRIEK_MAX_REFERENCES": "-1"}, "CHRIEK_MAX_REFERENCES must be between"),
+        ({"CHRIEK_MAX_REFERENCES": "17"}, "CHRIEK_MAX_REFERENCES must be between"),
+        ({"CHRIEK_MAX_REFERENCES": "many"}, "CHRIEK_MAX_REFERENCES must be an integer"),
+        ({"CHRIEK_MAX_UPLOAD_BYTES": "1023"}, "CHRIEK_MAX_UPLOAD_BYTES must be between"),
+        ({"CHRIEK_MAX_UPLOAD_BYTES": "huge"}, "CHRIEK_MAX_UPLOAD_BYTES must be an integer"),
         ({"CHRIEK_PORT": "70000"}, "CHRIEK_PORT must be between"),
     ],
 )

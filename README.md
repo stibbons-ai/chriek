@@ -2,7 +2,7 @@
 
 Self-hostable image generation server for FLUX 3 Image Klein, with an asynchronous job API: submit a job, poll it, download the PNGs through signed, expiring URLs. Architecture: [ADR-0001](docs/adr/0001-mvp-architecture.md).
 
-> **Status: walking skeleton.** Only **home mode** with a **fake image backend** exists. The fake backend draws deterministic placeholder PNGs (two coloured rectangles derived from prompt, size and seed). It does **not** run FLUX or any other model, needs no GPU and downloads no weights. The real MLX (Apple Silicon) and CUDA backends come later; the HTTP contract below stays the same.
+> **Status: walking skeleton.** Only **home mode** with a **fake image backend** exists. The fake backend draws deterministic placeholder PNGs (two coloured rectangles derived from prompt, size, seed and uploaded reference images). It does **not** run FLUX or any other model, needs no GPU and downloads no weights. The real MLX (Apple Silicon) and CUDA backends come later; the HTTP contract below stays the same.
 
 ## Install and run (uv)
 
@@ -34,13 +34,15 @@ All configuration comes from environment variables.
 | `CHRIEK_SIGNING_SECRET` | required | HMAC secret for download URLs, at least 32 characters. Changing it invalidates every issued URL (polling the job again mints new ones). |
 | `CHRIEK_URL_TTL_SECONDS` | `900` | Lifetime of a download URL, 1–604800 seconds. |
 | `CHRIEK_DB_PATH` | `chriek-data/chriek.db` | SQLite database file, used literally (`?` and `%20` are ordinary filename characters); parent directories are created. Put it on a volume to keep jobs across restarts. The exact value `:memory:` (or `./:memory:`) selects an ephemeral in-memory database instead; see [In-memory database](#in-memory-database). |
-| `CHRIEK_STORAGE_DIR` | `chriek-data/images` | Directory for generated PNGs, one subdirectory per job. |
+| `CHRIEK_STORAGE_DIR` | `chriek-data/images` | Directory for generated PNGs (`<id>/<index>.png`) and uploaded reference images (`<id>/references/<index>.png`), one subdirectory per job. |
 | `CHRIEK_HOST` | `127.0.0.1` | Listen address. |
 | `CHRIEK_PORT` | `8000` | Listen port. |
 | `CHRIEK_MAX_IMAGES` | `4` | Maximum `image_count` per job (configurable 1–64). |
 | `CHRIEK_MAX_DIMENSION` | `2048` | Maximum `width` and `height`; a multiple of 16 (16–8192). |
-| `CHRIEK_MAX_PIXELS` | `1048576` | Maximum `width * height` (256–67108864). |
+| `CHRIEK_MAX_PIXELS` | `1048576` | Maximum `width * height` for generated outputs and uploaded reference images (256–67108864). |
 | `CHRIEK_MAX_PROMPT_CHARS` | `2000` | Maximum prompt length in characters (1–100000). |
+| `CHRIEK_MAX_REFERENCES` | `4` | Maximum uploaded reference images per job (0–16; `0` disables edit jobs). |
+| `CHRIEK_MAX_UPLOAD_BYTES` | `20971520` | Maximum raw HTTP request body size in bytes across the entire `POST /jobs` request, enforced while streaming without trusting `Content-Length` (1024–536870912). |
 
 Relative paths resolve against the working directory. The database schema is created on first start; there are no migrations yet.
 
@@ -54,10 +56,20 @@ Every `/jobs` request needs `Authorization: Bearer <key>`. A missing or invalid 
 
 ### `POST /jobs`
 
+`POST /jobs` accepts either `application/json` (text-to-image) or `multipart/form-data` (zero or more uploaded `references` image files: zero selects text-to-image, one or more selects image-conditioned edit). The server never fetches reference URLs.
+
 ```sh
+# Text-to-image (JSON)
 curl -s -X POST http://127.0.0.1:8000/jobs \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"prompt": "a lighthouse at dusk", "image_count": 2, "seed": 41, "width": 1024, "height": 768}'
+
+# Edit job with reference images (multipart/form-data)
+curl -s -X POST http://127.0.0.1:8000/jobs \
+  -H "Authorization: Bearer $KEY" \
+  -F "prompt=keep both characters consistent in a stormy harbor" \
+  -F "image_count=2" -F "seed=41" -F "width=1024" -F "height=768" \
+  -F "references=@char1.png" -F "references=@char2.jpg"
 ```
 
 | Field | Type | Default | Rule |
@@ -66,8 +78,9 @@ curl -s -X POST http://127.0.0.1:8000/jobs \
 | `image_count` | integer | `1` | 1 to `CHRIEK_MAX_IMAGES` |
 | `seed` | integer or null | random | `0 ≤ seed` and `seed + image_count - 1 ≤ 4294967295` |
 | `width`, `height` | integer | `1024` | multiples of 16, 16 to `CHRIEK_MAX_DIMENSION`, `width * height ≤ CHRIEK_MAX_PIXELS` |
+| `references` | 0..N image files (multipart only) | none | at most `CHRIEK_MAX_REFERENCES` files; each decoded as an image with `width * height ≤ CHRIEK_MAX_PIXELS`; total raw request body at most `CHRIEK_MAX_UPLOAD_BYTES` |
 
-Types are strict (`"1024"` or `1024.0` is not an integer) and unknown fields are rejected. Nonfinite numbers (`NaN`, `Infinity`, `1e999`) and prompts with unpaired UTF-16 surrogates (`"\ud800"`) are rejected too; error entries echo such input as text (`"inf"`, `"\\ud800"`). Requests that fail validation, including malformed JSON syntax such as `{`, return `422` with FastAPI's `{"detail": [...]}` error list. Other body decoding failures, such as invalid UTF-8 or an integer literal thousands of digits long, return `400 {"detail": "There was an error parsing the body"}` instead. Neither kind of rejected request enters the queue. A valid request returns `202`, a `Location: /jobs/<id>` header and the job (below) in status `queued`. Job IDs are UUIDv7. When `seed` is omitted, chriek picks one at random and reports it in `params.seed`; image `i` uses seed `seed + i`.
+In JSON requests, types are strict (`"1024"` or `1024.0` is not an integer). In `multipart/form-data`, scalar fields use the same names with decimal integer strings (`seed=` empty string or omitted chooses a random seed), and reference images are uploaded as repeated `references` file parts in order; client filenames are ignored and stored as `references/<index>.png` inside the job's storage directory before the job enters the queue. Unknown fields, non-file `references` parts (such as URLs), unreadable images, and count or byte limit violations return `422` with FastAPI's `{"detail": [...]}` error list. Nonfinite numbers (`NaN`, `Infinity`, `1e999`) and prompts with unpaired UTF-16 surrogates (`"\ud800"`) are rejected too; error entries echo such input as text (`"inf"`, `"\\ud800"`). Other JSON body decoding failures, such as invalid UTF-8 or an integer literal thousands of digits long, return `400 {"detail": "There was an error parsing the body"}` instead. Neither kind of rejected request enters the queue. A valid request returns `202`, a `Location: /jobs/<id>` header and the job (below) in status `queued`. Job IDs are UUIDv7. When `seed` is omitted, chriek picks one at random and reports it in `params.seed`; image `i` uses seed `seed + i`.
 
 ### `GET /jobs/{id}`
 
@@ -79,7 +92,7 @@ curl -s http://127.0.0.1:8000/jobs/$JOB_ID -H "Authorization: Bearer $KEY"
 {
   "id": "019a7c1e-4b2a-7c3d-9e8f-0123456789ab",
   "status": "succeeded",
-  "params": {"prompt": "a lighthouse at dusk", "image_count": 2, "seed": 41, "width": 1024, "height": 768},
+  "params": {"prompt": "a lighthouse at dusk", "image_count": 2, "seed": 41, "width": 1024, "height": 768, "reference_count": 0},
   "created_at": "2026-11-11T12:00:00.000000+00:00",
   "started_at": "2026-11-11T12:00:00.010000+00:00",
   "finished_at": "2026-11-11T12:00:00.090000+00:00",

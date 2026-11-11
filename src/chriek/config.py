@@ -19,6 +19,8 @@ class Limits:
     max_dimension: int = 2048
     max_pixels: int = 1024 * 1024
     max_prompt_chars: int = 2000
+    max_references: int = 4
+    max_upload_bytes: int = 20 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,10 @@ class Settings:
             max_pixels=_int(env, "CHRIEK_MAX_PIXELS", Limits.max_pixels, 256, 8192 * 8192),
             max_prompt_chars=_int(
                 env, "CHRIEK_MAX_PROMPT_CHARS", Limits.max_prompt_chars, 1, 100_000
+            ),
+            max_references=_int(env, "CHRIEK_MAX_REFERENCES", Limits.max_references, 0, 16),
+            max_upload_bytes=_int(
+                env, "CHRIEK_MAX_UPLOAD_BYTES", Limits.max_upload_bytes, 1024, 512 * 1024 * 1024
             ),
         )
         if limits.max_dimension % 16:

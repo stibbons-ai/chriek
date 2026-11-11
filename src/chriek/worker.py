@@ -7,6 +7,8 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from PIL import Image
+
 from chriek.backend import ImageBackend
 from chriek.png import encode_png
 from chriek.store import Job, JobStore
@@ -15,8 +17,23 @@ log = logging.getLogger(__name__)
 IDLE_RECHECK_SECONDS = 5.0
 
 
-def image_path(storage_dir: Path, job_id: uuid.UUID, index: int) -> Path:
+def image_path(storage_dir: Path, job_id: uuid.UUID | str, index: int) -> Path:
     return storage_dir / str(job_id) / f"{index}.png"
+
+
+def reference_path(storage_dir: Path, job_id: str, index: int) -> Path:
+    return storage_dir / job_id / "references" / f"{index}.png"
+
+
+def write_references(storage_dir: Path, job_id: str, references: list[bytes]) -> None:
+    if not references:
+        return
+    reference_path(storage_dir, job_id, 0).parent.mkdir(parents=True, exist_ok=True)
+    for index, png_bytes in enumerate(references):
+        target = reference_path(storage_dir, job_id, index)
+        tmp = target.with_suffix(".png.partial")
+        tmp.write_bytes(png_bytes)
+        tmp.replace(target)
 
 
 class Worker:
@@ -74,27 +91,41 @@ class Worker:
         partial = self._storage_dir / f"{job.id}.partial"
         final = self._storage_dir / job.id
         index = 0
+        references: list[Image.Image] = []
         try:
             shutil.rmtree(partial, ignore_errors=True)
             partial.mkdir(parents=True)
+            for ref in job.references:
+                with Image.open(reference_path(self._storage_dir, job.id, ref.index)) as opened:
+                    references.append(opened.copy())
             for index in range(job.image_count):
                 seed = job.seed + index
-                image = self._backend.render(job.prompt, job.width, job.height, seed)
+                image = self._backend.render(job.prompt, job.width, job.height, seed, references)
                 png = encode_png(
                     image, model=self._backend.model, revision=self._backend.revision, seed=seed
                 )
                 (partial / f"{index}.png").write_bytes(png)
-            partial.rename(final)
+            final.mkdir(parents=True, exist_ok=True)
+            for index in range(job.image_count):
+                (partial / f"{index}.png").replace(image_path(self._storage_dir, job.id, index))
+            shutil.rmtree(partial, ignore_errors=True)
         except Exception as exc:
             # Any image failure fails the whole job; already rendered images are discarded.
             log.exception("job %s failed at image %d", job.id, index)
             shutil.rmtree(partial, ignore_errors=True)
+            self._remove_outputs(job.id, job.image_count)
             error = f"image {index + 1} of {job.image_count} failed: {exc}"[:500]
             self._store.fail(job.id, error, self._run_record(started), self._clock())
             return
         if not self._store.succeed(job.id, self._run_record(started), self._clock()):
             # The job is no longer running (failed by a restart recovery); never publish it.
-            shutil.rmtree(final, ignore_errors=True)
+            self._remove_outputs(job.id, job.image_count)
+            if not job.references:
+                shutil.rmtree(final, ignore_errors=True)
+
+    def _remove_outputs(self, job_id: str, image_count: int) -> None:
+        for i in range(image_count):
+            image_path(self._storage_dir, job_id, i).unlink(missing_ok=True)
 
     def _run_record(self, started: float) -> dict[str, object]:
         finished = self._clock()

@@ -26,6 +26,7 @@ def test_submit_returns_202_with_uuid7_and_effective_parameters(client):
         "seed": 41,
         "width": 512,
         "height": 256,
+        "reference_count": 0,
     }
     assert body["images"] == []
     assert body["error"] is None
