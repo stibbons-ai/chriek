@@ -6,6 +6,8 @@ import logging
 import os
 import sqlite3
 import struct
+import subprocess
+import sys
 import threading
 import uuid
 import zlib
@@ -28,7 +30,9 @@ from conftest import (
 )
 from fastapi.testclient import TestClient
 from PIL import Image
+from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
 import chriek.api
 from chriek.api import create_app
@@ -797,6 +801,14 @@ def test_invalid_multipart_requests_return_422_and_leave_no_files(
             b'--bound\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n'
             b"\xff\r\n--bound--\r\n",
         ),
+        (
+            "multipart/form-data; boundary=bound",
+            b"--bound\r\nContent-Disposition: form-data\r\n\r\na\r\n--bound--\r\n",
+        ),
+        (
+            "multipart/form-data; boundary=bound",
+            b'--bound\r\nContent-Disposition: form-data; name="\xff"\r\n\r\na\r\n--bound--\r\n',
+        ),
     ],
     ids=[
         "missing-boundary",
@@ -804,6 +816,8 @@ def test_invalid_multipart_requests_return_422_and_leave_no_files(
         "truncated-multipart",
         "duplicate-scalar-field",
         "invalid-utf8-scalar",
+        "part-without-name",
+        "invalid-utf8-field-name",
     ],
 )
 def test_malformed_raw_multipart_returns_422(tmp_path, content_type, body):
@@ -814,6 +828,34 @@ def test_malformed_raw_multipart_returns_422(tmp_path, content_type, body):
         )
         assert response.status_code == 422, response.text
         assert backend.renders == 0
+        assert not any((tmp_path / "images").iterdir())
+    with sqlite3.connect(tmp_path / "db" / "chriek.db") as conn:
+        assert conn.execute("SELECT count(*) FROM jobs").fetchone() == (0,)
+
+
+def test_form_field_count_and_scalar_size_are_rejected_during_receipt(tmp_path):
+    headers = ALICE | {"Content-Type": "multipart/form-data; boundary=bound"}
+    # One empty field per chunk; the 33rd part's headers exceed the 32-field bound.
+    field_chunks = [
+        f'--bound\r\nContent-Disposition: form-data; name="f{i}"\r\n\r\n\r\n'.encode()
+        for i in range(40)
+    ] + [b"--bound--\r\n"]
+    # A 3 MiB scalar in 128 KiB chunks crosses the 1 MiB field bound at its 9th data chunk.
+    scalar_chunks = (
+        [b'--bound\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n']
+        + [b"a" * (128 * 1024) for _ in range(24)]
+        + [b"\r\n--bound--\r\n"]
+    )
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        for chunks, expected_consumed in ((field_chunks, 33), (scalar_chunks, 10)):
+            status_code, error, consumed = asgi_post_jobs(client, headers, chunks)
+            assert status_code == 422, error
+            assert consumed == expected_consumed
+            assert len(error["detail"]) == 1
+            assert len(json.dumps(error)) < 1024
+        assert backend.renders == 0
+        assert not any((tmp_path / "images").iterdir())
 
 
 TRUNCATION_REFS = [
@@ -1038,6 +1080,110 @@ def test_reference_pixel_limit_includes_exact_boundary(tmp_path):
         assert over.json()["detail"][0]["msg"] == "reference image 0 exceeds maximum of 1024 pixels"
 
 
+def test_16_bit_greyscale_references_are_scaled_not_clipped(client, tmp_path):
+    form = {"prompt": "deep grey", "seed": "5", "width": "16", "height": "16"}
+
+    def grey16(value: int, **save_args) -> bytes:
+        return _png_bytes(Image.new("I;16", (16, 16), value), **save_args)
+
+    for value, expected, save_args in (
+        (0x0100, 1, {}),
+        (0x8000, 128, {"transparency": 300}),
+        (0xFFFF, 255, {}),
+    ):
+        upload = grey16(value, **save_args)
+        job = submit_multipart(
+            client, data=form, files=[("references", ("grey.png", upload, "image/png"))]
+        )
+        assert wait_for(client, job["id"])["status"] == "succeeded"
+        with Image.open(reference_path(tmp_path / "images", job["id"], 0)) as stored:
+            assert stored.mode == "RGB"
+            assert stored.getextrema() == ((expected, expected),) * 3, hex(value)
+
+    dark, light = (
+        wait_for(
+            client,
+            submit_multipart(
+                client, data=form, files=[("references", ("grey.png", grey16(value), "image/png"))]
+            )["id"],
+        )
+        for value in (0x4000, 0xC000)
+    )
+    assert download_pixels(client, dark) != download_pixels(client, light)
+
+
+@pytest.mark.parametrize("fmt", ["JPEG", "WEBP"])
+def test_reference_icc_profile_is_dropped_so_large_profiles_stay_loadable(client, tmp_path, fmt):
+    icc = bytes(range(256)) * 4097  # 1,048,832 bytes: above Pillow's 1 MiB PNG iCCP read limit
+    buf = io.BytesIO()
+    Image.new("RGB", (16, 16), (10, 20, 30)).save(buf, format=fmt, icc_profile=icc)
+    with Image.open(io.BytesIO(buf.getvalue())) as upload:
+        assert upload.info["icc_profile"] == icc
+
+    job = submit_multipart(
+        client,
+        data={"prompt": "print profile", "width": "16", "height": "16"},
+        files=[("references", (f"ref.{fmt.lower()}", buf.getvalue(), f"image/{fmt.lower()}"))],
+    )
+    assert wait_for(client, job["id"])["status"] == "succeeded"
+    with Image.open(reference_path(tmp_path / "images", job["id"], 0)) as stored:
+        assert stored.format == "PNG"
+        assert stored.mode == "RGB"
+        assert "icc_profile" not in stored.info
+
+
+_SUBMIT_FROM_STDIN = """
+import json, sys
+from fastapi.testclient import TestClient
+from chriek.api import create_app
+from chriek.config import Settings
+
+env, headers = json.loads(sys.argv[1]), json.loads(sys.argv[2])
+body = sys.stdin.buffer.read()
+with TestClient(create_app(Settings.from_env(env)), raise_server_exceptions=False) as client:
+    print(client.post("/jobs", headers=headers, content=body).status_code)
+"""
+
+
+@pytest.mark.parametrize(
+    ("reference", "python_args", "env"),
+    [
+        # Between Pillow's warning and error thresholds Image.open only warns; as an error
+        # the warning must still map to the pixel-limit 422.
+        (_bomb_header_png(10000, 10000), ["-W", "error::RuntimeWarning"], {}),
+        # `python -O` strips Pillow's palette assert; AttributeError follows instead.
+        (_palette_png_without_plte(), [], {"PYTHONOPTIMIZE": "1"}),
+    ],
+    ids=["bomb-warning-as-error", "palette-without-plte-optimized"],
+)
+def test_invalid_reference_returns_422_in_non_default_interpreter_modes(
+    tmp_path, reference, python_args, env
+):
+    """Runs the server in a subprocess so interpreter flags never leak into this suite."""
+    ct_header, body = encode_multipart(
+        {"prompt": "interpreter mode", "width": "16", "height": "16"},
+        files=[("references", ("ref.png", reference, "image/png"))],
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            *python_args,
+            "-c",
+            _SUBMIT_FROM_STDIN,
+            json.dumps(base_env(tmp_path)),
+            json.dumps(ALICE | ct_header),
+        ],
+        input=body,
+        capture_output=True,
+        check=True,
+        env=os.environ | env,
+    )
+    assert result.stdout.split()[-1] == b"422", result.stderr.decode()
+    assert not any((tmp_path / "images").iterdir())
+    with sqlite3.connect(tmp_path / "db" / "chriek.db") as conn:
+        assert conn.execute("SELECT count(*) FROM jobs").fetchone() == (0,)
+
+
 def test_mid_publish_failure_cleans_already_moved_outputs_and_keeps_references(
     tmp_path, monkeypatch
 ):
@@ -1079,35 +1225,61 @@ def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_u
     ref_a = make_image_bytes((15, 85, 195), (16, 16))
     ref_b = make_image_bytes((195, 85, 15), (24, 16))
     original_create = JobStore.create
-    claim_time_snapshots: list[list[tuple[str, tuple[int, int]]]] = []
+    storage_dir = tmp_path / "images"
+    creating_thread: int | None = None
+    claimed_at_first_commit: list[tuple[str, list[tuple[int, tuple[int, int] | None]]]] = []
 
-    def check_files_at_commit(self: JobStore, *args, **kwargs):
-        job = original_create(self, *args, **kwargs)
-        # At the exact instant `store.create` commits, the job is visible to `claim_next`;
-        # inspect the storage directory before `store.create` returns to `submit_job`.
-        storage_dir = tmp_path / "images"
-        snapshot: list[tuple[str, tuple[int, int]]] = []
-        for ref in job.references:
-            path = reference_path(storage_dir, job.id, ref.index)
-            assert path.is_file(), f"reference {ref.index} missing when job became claimable"
-            with Image.open(path) as img:
-                snapshot.append((img.format, img.size))
-        claim_time_snapshots.append(snapshot)
-        return job
+    def claim_on_first_commit(_session: Session) -> None:
+        # The worker's own claim, through an independent connection, at the instant the
+        # first transaction inside `store.create` commits.
+        nonlocal creating_thread
+        if threading.get_ident() != creating_thread:
+            return
+        creating_thread = None  # only the first commit; also stops recursion via claim_next
+        claimed = observer.claim_next(now=0.0)
+        assert claimed is not None
+        seen: list[tuple[int, tuple[int, int] | None]] = []
+        for ref in claimed.references:
+            path = reference_path(storage_dir, claimed.id, ref.index)
+            if path.is_file():
+                with Image.open(path) as img:
+                    seen.append((ref.index, img.size))
+            else:
+                seen.append((ref.index, None))
+        claimed_at_first_commit.append((claimed.id, seen))
 
-    monkeypatch.setattr(JobStore, "create", check_files_at_commit)
+    def observed_create(self: JobStore, *args, **kwargs):
+        nonlocal creating_thread
+        creating_thread = threading.get_ident()
+        try:
+            return original_create(self, *args, **kwargs)
+        finally:
+            creating_thread = None
 
-    with running(tmp_path) as client:
-        submitted = submit_multipart(
-            client,
-            data={"prompt": "claim-seam", "width": "16", "height": "16"},
-            files=[
-                ("references", ("a.png", ref_a, "image/png")),
-                ("references", ("b.png", ref_b, "image/png")),
-            ],
-        )
-        assert wait_for(client, submitted["id"])["status"] == "succeeded"
-        assert claim_time_snapshots == [[("PNG", (16, 16)), ("PNG", (24, 16))]]
+    gated = GatedBackend()
+    with running(tmp_path, backend=gated) as client:
+        # Keep the worker busy so only the observer can claim the next queued job.
+        blocker = submit(client, prompt="hold worker", width=16, height=16)
+        assert gated.rendering.wait(5)
+        observer = JobStore(tmp_path / "db" / "chriek.db")
+        monkeypatch.setattr(JobStore, "create", observed_create)
+        event.listen(Session, "after_commit", claim_on_first_commit)
+        try:
+            submitted = submit_multipart(
+                client,
+                data={"prompt": "claim-seam", "width": "16", "height": "16"},
+                files=[
+                    ("references", ("a.png", ref_a, "image/png")),
+                    ("references", ("b.png", ref_b, "image/png")),
+                ],
+            )
+        finally:
+            event.remove(Session, "after_commit", claim_on_first_commit)
+            monkeypatch.undo()
+            observer.close()
+            gated.release()
+        assert claimed_at_first_commit == [(submitted["id"], [(0, (16, 16)), (1, (24, 16))])]
+        assert wait_for(client, blocker["id"])["status"] == "succeeded"
 
     # Now force `store.create` to fail after `write_references` has written the files.
     def failing_create(self: JobStore, *args, **kwargs):
@@ -1244,8 +1416,9 @@ def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_w
 
         monkeypatch.undo()
 
-    # Next, verify missing reference file reports a reference-load error without leaking
-    # the absolute storage path, and subsequent jobs still succeed.
+    # Next, a missing reference file (OSError) and a corrupt one (ValueError: a PNG whose iCCP
+    # chunk exceeds the reader's limit) each fail only their job: the error does not leak the
+    # absolute storage path, and subsequent jobs still succeed.
     gated_next = GatedBackend()
     with running(tmp_path, backend=gated_next) as client:
         blocker = submit(client, prompt="hold worker", width=16, height=16)
@@ -1260,6 +1433,16 @@ def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_w
             ],
         )
         reference_path(tmp_path / "images", missing_ref_job["id"], 0).unlink()
+        corrupt_ref_job = submit_multipart(
+            client,
+            data={"prompt": "corrupt ref", "width": "16", "height": "16"},
+            files=[("references", ("r0.png", ref_bytes, "image/png"))],
+        )
+        Image.new("RGB", (16, 16)).save(
+            reference_path(tmp_path / "images", corrupt_ref_job["id"], 0),
+            format="PNG",
+            icc_profile=b"\x00" * (1024 * 1024 + 1),
+        )
         follow_up = submit(client, prompt="after missing ref", width=16, height=16)
 
         gated_next.release()
@@ -1270,5 +1453,6 @@ def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_w
             "reference 1 of 2 could not be loaded: No such file or directory"
         )
         assert str(tmp_path) not in failed_ref["error"]
+        assert wait_for(client, corrupt_ref_job["id"])["status"] == "failed"
         assert wait_for(client, follow_up["id"])["status"] == "succeeded"
         assert client.get("/health").status_code == 200

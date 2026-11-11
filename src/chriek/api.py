@@ -50,10 +50,12 @@ MAX_SCALAR_FIELD_BYTES = 1024 * 1024
 MAX_FORM_FIELDS = 32
 INTEGER_PATTERN = re.compile(r"[+-]?[0-9]{1,20}")
 ALLOWED_REFERENCE_FORMATS = ("PNG", "JPEG", "WEBP")
-# Pillow raises these for corrupt input; AssertionError covers e.g. a palette PNG without PLTE.
+# Pillow raises these for corrupt input. AssertionError: Image.convert() on a palette PNG
+# with tRNS but no PLTE; under `python -O` that assert is gone and AttributeError follows.
 _DECODER_ERRORS = (
     UnidentifiedImageError,
     AssertionError,
+    AttributeError,
     OSError,
     ValueError,
     SyntaxError,
@@ -631,12 +633,19 @@ def _decode_reference_png(
                 raise Image.DecompressionBombError
             image.load()
             ImageOps.exif_transpose(image, in_place=True)
+            if image.mode.startswith("I;16"):
+                # convert() clips 16-bit samples at 255; scale them to 8 bits first.
+                image = image.point(lambda value: value / 256).convert("L")
             rgb = image if image.mode == "RGB" else image.convert("RGB")
-            # A tRNS colour key survives convert(); RGB references carry no transparency.
+            # RGB references carry no transparency. Without the pop, an integer tRNS key
+            # kept from a 1-bit or 16-bit grey source makes the PNG writer raise.
             rgb.info.pop("transparency", None)
+            # Pixels are not colour-managed, so a profile would not describe them; the
+            # worker's PNG reader also refuses iCCP chunks above 1 MiB.
+            rgb.info.pop("icc_profile", None)
             buf = io.BytesIO()
             rgb.save(buf, format="PNG")
-    except Image.DecompressionBombError:
+    except Image.DecompressionBombError, Image.DecompressionBombWarning:
         return None, {
             "type": "value_error",
             "loc": loc,
