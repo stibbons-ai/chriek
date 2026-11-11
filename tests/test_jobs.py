@@ -115,6 +115,68 @@ def test_invalid_requests_are_422_and_never_execute(tmp_path, overrides):
         assert backend.renders == 1
 
 
+NUMERIC_FIELDS = ("image_count", "seed", "width", "height")
+NONFINITE = ("NaN", "Infinity", "-Infinity", "1e999", "-1e999")
+RAW_INVALID_BODIES = {
+    **{
+        f"{field}={constant}": (
+            f'{{"prompt": "a lighthouse", "width": 16, "height": 16, "{field}": {constant}}}',
+            ["body", field],
+        )
+        for field in NUMERIC_FIELDS
+        for constant in NONFINITE
+    },
+    "finite-float-control": ('{"prompt": "a lighthouse", "width": 16.5}', ["body", "width"]),
+    "nonfinite-unknown-field": ('{"prompt": "a lighthouse", "steps": NaN}', ["body", "steps"]),
+    "lone-high-surrogate": (r'{"prompt": "\ud800"}', ["body", "prompt"]),
+    "lone-low-surrogate": (r'{"prompt": "\udc00"}', ["body", "prompt"]),
+    "embedded-lone-surrogate": (r'{"prompt": "a light\ud83dhouse"}', ["body", "prompt"]),
+    "reversed-surrogate-pair": (r'{"prompt": "\ude00\ud83d"}', ["body", "prompt"]),
+    # Pydantic rejects the whole body when an object key holds a lone surrogate.
+    "surrogate-in-unknown-key": (r'{"prompt": "a lighthouse", "\ud800": 1}', ["body"]),
+    "surrogate-key-with-infinity": (r'{"\udfff": -Infinity}', ["body"]),
+}
+
+
+@pytest.mark.parametrize(
+    ("content", "loc"), RAW_INVALID_BODIES.values(), ids=RAW_INVALID_BODIES.keys()
+)
+def test_unencodable_input_is_422_and_never_executes(tmp_path, content, loc):
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        response = client.post(
+            "/jobs", headers=ALICE | {"Content-Type": "application/json"}, content=content
+        )
+
+        assert response.status_code == 422, response.text
+        assert loc in [error["loc"] for error in response.json()["detail"]]
+        valid = submit(client, width=16, height=16)
+        assert wait_for(client, valid["id"])["status"] == "succeeded"
+        assert backend.renders == 1
+
+
+@pytest.mark.parametrize(
+    ("prompt_json", "prompt"),
+    [
+        ('"Leuchtturm im Nebel, 灯台 ☀"', "Leuchtturm im Nebel, 灯台 ☀"),
+        (r'"a lighthouse \ud83d\ude00"', "a lighthouse \N{GRINNING FACE}"),
+    ],
+    ids=["literal-unicode", "escaped-surrogate-pair"],
+)
+def test_valid_unicode_prompt_is_persisted_and_rendered(client, prompt_json, prompt):
+    response = client.post(
+        "/jobs",
+        headers=ALICE | {"Content-Type": "application/json"},
+        content=f'{{"prompt": {prompt_json}, "width": 16, "height": 16}}'.encode(),
+    )
+
+    assert response.status_code == 202, response.text
+    body = wait_for(client, response.json()["id"])
+    assert body["status"] == "succeeded"
+    assert body["params"]["prompt"] == prompt
+    assert len(body["images"]) == 1
+
+
 @pytest.mark.parametrize(
     ("content", "expected"),
     [

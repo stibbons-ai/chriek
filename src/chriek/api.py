@@ -1,5 +1,6 @@
 """HTTP API: job submission and polling (API key required), signed image downloads (no key)."""
 
+import math
 import re
 import secrets
 import time
@@ -10,8 +11,9 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from chriek.auth import ApiKeyAuth
@@ -61,6 +63,15 @@ def create_app(
         store.close()
 
     app = FastAPI(title="chriek", lifespan=lifespan)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
+        # FastAPI's default handler echoes rejected input verbatim; JSON can't encode
+        # nonfinite numbers (NaN, 1e999) or lone surrogates, which would turn a 422 into a 500.
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+        )
 
     def job_body(job: Job, request: Request) -> dict[str, Any]:
         images = []
@@ -162,7 +173,9 @@ def _limit_errors(body: JobRequest, limits: Limits) -> list[dict[str, Any]]:
             {"type": "value_error", "loc": ("body", field), "msg": message, "input": value}
         )
 
-    if not body.prompt.strip():
+    if not _is_utf8(body.prompt):
+        reject("prompt", "prompt must be valid Unicode text (no unpaired surrogates)")
+    elif not body.prompt.strip():
         reject("prompt", "prompt must not be blank")
     elif len(body.prompt) > limits.max_prompt_chars:
         reject("prompt", f"prompt must be at most {limits.max_prompt_chars} characters")
@@ -184,6 +197,27 @@ def _parse_uuid(value: str) -> uuid.UUID | None:
         return uuid.UUID(value)
     except ValueError:
         return None
+
+
+def _is_utf8(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _json_safe(value: Any) -> Any:
+    """Make decoded request data strictly JSON-serializable without dropping it."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, str):
+        return value.encode("utf-8", "backslashreplace").decode("utf-8")
+    if isinstance(value, dict):
+        return {_json_safe(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _iso(timestamp: float | None) -> str | None:
