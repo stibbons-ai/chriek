@@ -25,3 +25,7 @@ chriek is a self-hostable FLUX 3 Image Klein server, extracted from the fabula-m
 - The first job after an idle period pays a cold model load (about 20 GB of weights). That is accepted.
 - CI has no GPU. Tests go through the HTTP API with a fake image backend, and the real backends are verified with a smoke-test command on real hardware.
 - License risk, not blocking: the FLUX Kommunity License bans "biometric processing", and Ikonograf may conflict with that. It needs a license review before Ikonograf goes live.
+
+## Links
+
+- Design document (moved from fabula-mia): [docs/superpowers/specs/2026-11-11-chriek-design.md](../superpowers/specs/2026-11-11-chriek-design.md)
