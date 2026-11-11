@@ -43,6 +43,16 @@ def serve(env: dict[str, str], **kwargs) -> subprocess.Popen:
     )
 
 
+def exit_output(process: subprocess.Popen) -> str:
+    """Wait for `chriek serve` to exit; kill, reap and fail if it keeps running."""
+    try:
+        return process.communicate(timeout=30)[0]
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output = process.communicate()[0]
+        pytest.fail(f"chriek serve kept running instead of exiting:\n{output}")
+
+
 EMOJI_KEY = "\N{OTTER}" * 32
 LATIN1_KEY = "\N{LATIN SMALL LETTER E WITH ACUTE}" * 32
 CONTROL_KEY = ALICE_KEY + "\x07"
@@ -98,7 +108,7 @@ CONTROL_KEY = ALICE_KEY + "\x07"
 def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrides, message):
     env = base_env(tmp_path) | overrides
     process = serve(env)
-    output, _ = process.communicate(timeout=30)
+    output = exit_output(process)
 
     assert process.returncode == 2
     assert output.startswith("chriek: configuration error: ")
@@ -250,7 +260,7 @@ def bad_tls_files(tmp_path: Path, kind: str) -> tuple[Path, Path]:
 def test_unusable_tls_files_stop_startup_instead_of_serving_plain_http(tmp_path, kind, message):
     cert, key = bad_tls_files(tmp_path, kind)
     process = serve(tls_env(tmp_path, cert, key), stdin=subprocess.DEVNULL)
-    output, _ = process.communicate(timeout=30)
+    output = exit_output(process)
 
     assert process.returncode == 2
     assert output.startswith("chriek: configuration error: ")

@@ -89,11 +89,13 @@ class JobStore:
     ) -> Job | None:
         """Queue a job unless `owner` already has `max_queued` queued jobs; None if full.
 
-        Count and insert are one INSERT ... SELECT statement, and it must stay the first
-        statement of its transaction: SQLite then takes the write lock before that statement
-        reads, so concurrent submissions, even through other connections or processes, see
-        each other's inserts and can't overshoot the cap. A read before it in the same
-        transaction would pin an older snapshot and turn contention into busy errors.
+        Count and insert are one INSERT ... SELECT statement, so the count always sees the
+        rows it races with: SQLite runs the statement under the write lock, and concurrent
+        submissions, even through other connections or processes, can't overshoot the cap.
+        Keep the count inside this statement; a separate count before the insert would let
+        two submissions both see room. (With an explicit BEGIN or non-legacy transaction
+        mode, a read earlier in the same transaction would also pin an older snapshot and
+        turn contention into busy errors.)
         """
         values = {
             "id": str(uuid.uuid7()),

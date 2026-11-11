@@ -83,6 +83,7 @@ def test_capacity_returns_once_a_queued_job_starts_running(tmp_path):
             assert wait_for(client, job["id"])["status"] == "succeeded"
         # Finished jobs don't count either.
         assert post(client, "after").status_code == 202
+        backend.wait_started(4)
         backend.step()
     assert backend.prompts == ["first", "second", "third", "after"]
 
