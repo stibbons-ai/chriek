@@ -4,7 +4,7 @@ import io
 import xml.etree.ElementTree as ET
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from conftest import ALICE, BOB, FakeClock, running, submit, wait_for
+from conftest import ALICE, BOB, SIGNING_SECRET, FakeClock, running, submit, wait_for
 from PIL import Image
 
 TRAINED_ALGORITHMIC_MEDIA = "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
@@ -132,6 +132,25 @@ def test_links_expire_and_polling_mints_fresh_ones(tmp_path):
         assert fresh["expires_at"] > old["expires_at"]
         assert client.get(fresh["url"]).status_code == 200
         assert client.get(old["url"]).status_code == 403
+
+
+def test_rotating_the_signing_secret_revokes_unexpired_urls(tmp_path):
+    clock = FakeClock()
+    with running(tmp_path, clock=clock) as client:
+        body = finished_job(client)
+        old = body["images"][0]["url"]
+        png = client.get(old).content
+
+    with running(
+        tmp_path, clock=clock, CHRIEK_SIGNING_SECRET="rotated-" + SIGNING_SECRET
+    ) as client:
+        rejected = client.get(old)
+        assert rejected.status_code == 403
+        assert rejected.json() == {"detail": "invalid signature"}
+        fresh = client.get(f"/jobs/{body['id']}", headers=ALICE).json()["images"][0]["url"]
+        download = client.get(fresh)
+        assert download.status_code == 200
+        assert download.content == png
 
 
 def test_download_url_works_for_anyone_holding_it_but_job_stays_private(client):

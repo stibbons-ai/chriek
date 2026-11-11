@@ -25,5 +25,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"chriek: configuration error: {error}", file=sys.stderr)
         return 2
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port)
+    # No access log: download URLs carry their signature, a bearer credential until expiry.
+    uvicorn.run(create_app(settings), host=settings.host, port=settings.port, access_log=False)
     return 0

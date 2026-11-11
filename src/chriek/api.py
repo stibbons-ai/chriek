@@ -29,6 +29,10 @@ WORKER_STOP_TIMEOUT_SECONDS = 30.0
 INDEX_PATTERN = re.compile(r"[0-9]{1,6}")
 EXPIRES_PATTERN = re.compile(r"[0-9]{1,12}")  # bounded: int() of huge digit strings raises
 WORKER_STOPPED = "worker stopped: a job result could not be saved; restart chriek"
+# Rejected input echoed in 422 errors is cut below this nesting depth: JSON encoders
+# recurse once per level, so a small, deeply nested body would otherwise overflow the stack.
+MAX_ECHO_DEPTH = 32
+TOO_DEEP = "<nested too deeply>"
 
 
 class JobRequest(BaseModel):
@@ -71,7 +75,9 @@ def create_app(
         # FastAPI's default handler echoes rejected input verbatim; JSON can't encode
         # nonfinite numbers (NaN, 1e999), lone surrogates or non-UTF-8 bytes (a raw
         # non-JSON body), which would turn a 422 into a 500.
-        errors = jsonable_encoder(exc.errors(), custom_encoder={bytes: _decode_lossless})
+        errors = jsonable_encoder(
+            _depth_limited(exc.errors(), MAX_ECHO_DEPTH), custom_encoder={bytes: _decode_lossless}
+        )
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             content={"detail": _json_safe(errors)},
@@ -242,6 +248,17 @@ def _is_utf8(text: str) -> bool:
 
 def _decode_lossless(data: bytes) -> str:
     return data.decode("utf-8", "backslashreplace")
+
+
+def _depth_limited(value: Any, depth: int) -> Any:
+    """Replace containers nested deeper than `depth` with a marker; recursion stops at `depth`."""
+    if not isinstance(value, dict | list | tuple):
+        return value
+    if depth == 0:
+        return TOO_DEEP
+    if isinstance(value, dict):
+        return {key: _depth_limited(item, depth - 1) for key, item in value.items()}
+    return [_depth_limited(item, depth - 1) for item in value]
 
 
 def _json_safe(value: Any) -> Any:

@@ -135,6 +135,19 @@ RAW_INVALID_BODIES = {
     # Pydantic rejects the whole body when an object key holds a lone surrogate.
     "surrogate-in-unknown-key": (r'{"prompt": "a lighthouse", "\ud800": 1}', ["body"]),
     "surrogate-key-with-infinity": (r'{"\udfff": -Infinity}', ["body"]),
+    # Small bodies nested ~1000 deep: echoing the rejected value must not overflow.
+    "deeply-nested-extra": (
+        f'{{"prompt": "a lighthouse", "extra": {"[" * 970}0{"]" * 970}}}',
+        ["body", "extra"],
+    ),
+    "deeply-nested-seed": (
+        f'{{"prompt": "a lighthouse", "seed": {"[" * 970}0{"]" * 970}}}',
+        ["body", "seed"],
+    ),
+    "deeply-nested-prompt": (
+        f'{{"prompt": {'{"a": ' * 970}0{"}" * 970}}}',
+        ["body", "prompt"],
+    ),
 }
 
 

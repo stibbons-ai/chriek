@@ -9,6 +9,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import httpx2
 import pytest
@@ -96,17 +97,25 @@ def wait_healthy(process: subprocess.Popen, base: str) -> None:
 
 
 @contextmanager
-def served(env: dict[str, str], **kwargs) -> Iterator[httpx2.Client]:
+def served_process(
+    env: dict[str, str], **kwargs
+) -> Iterator[tuple[subprocess.Popen, httpx2.Client]]:
     port = free_port()
     process = serve(env | {"CHRIEK_PORT": str(port)}, **kwargs)
     base = f"http://127.0.0.1:{port}"
     try:
         wait_healthy(process, base)
         with httpx2.Client(base_url=base) as client:
-            yield client
+            yield process, client
     finally:
         process.terminate()
         process.wait(timeout=30)
+
+
+@contextmanager
+def served(env: dict[str, str], **kwargs) -> Iterator[httpx2.Client]:
+    with served_process(env, **kwargs) as (_process, client):
+        yield client
 
 
 def test_chriek_serve_round_trip(tmp_path):
@@ -139,3 +148,15 @@ def test_chriek_serve_memory_database_runs_jobs_and_resets_on_restart(tmp_path):
         assert client.get(f"/jobs/{body['id']}", headers=ALICE).status_code == 404
 
     assert sorted(path.name for path in tmp_path.iterdir()) == ["images"]
+
+
+def test_chriek_serve_output_never_contains_download_signatures(tmp_path):
+    with served_process(base_env(tmp_path)) as (process, client):
+        url = wait_for(client, submit(client, width=16, height=16)["id"])["images"][0]["url"]
+        assert client.get(url).status_code == 200
+    output = process.stdout.read()
+
+    query = parse_qs(urlsplit(url).query)
+    assert "Uvicorn running on" in output, output
+    assert query["sig"][0] not in output
+    assert f"expires={query['expires'][0]}" not in output
