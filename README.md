@@ -13,7 +13,7 @@ git clone https://github.com/stibbons-ai/chriek.git
 cd chriek
 uv sync --locked
 
-export CHRIEK_API_KEYS="fabula:$(openssl rand -hex 32),ikonograf:$(openssl rand -hex 32)"
+export CHRIEK_API_KEYS="consumer:$(openssl rand -hex 32),ikonograf:$(openssl rand -hex 32)"
 export CHRIEK_SIGNING_SECRET="$(openssl rand -hex 32)"
 uv run chriek serve
 ```
