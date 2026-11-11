@@ -56,6 +56,13 @@ ALLOWED_REFERENCE_FORMATS = ("PNG", "JPEG", "WEBP")
 MAX_JPEG_SEGMENTS = 256
 MAX_JPEG_SCANS = 64
 MAX_JPEG_FILL_BYTES = 256
+# Pillow decodes EXIF into Python objects at several times its size, and its JPEG header
+# parser already does so for the resolution tags, so EXIF payloads are capped before open.
+MAX_EXIF_BYTES = 64 * 1024
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+# Text chunk keywords Pillow's PNG reader turns into EXIF (`getexif` decodes the second
+# from hex when no `exif` is present).
+_PNG_EXIF_TEXT_KEYWORDS = (b"exif", b"Raw profile type exif")
 # A marker outside entropy-coded data: optional 0xFF fill bytes, then the marker code.
 _JPEG_MARKER = re.compile(rb"\xff(\xff*+)([^\x00\xff])")
 # End of entropy-coded scan data: the next marker that is neither stuffing (FF00), fill
@@ -648,15 +655,15 @@ def _decode_reference_png(
             "input": None,
         }
     try:
-        if data.startswith(b"\xff\xd8\xff"):  # what Pillow's JPEG (and MPO) plugin accepts
-            _check_jpeg_structure(data)
+        _check_before_decoding(data)
         with Image.open(io.BytesIO(data), formats=ALLOWED_REFERENCE_FORMATS) as image:
             width, height = image.size
             if width <= 0 or height <= 0 or width * height > limits.max_pixels:
                 raise Image.DecompressionBombError
             image.load()
-            # Read only the orientation tag: ImageOps.exif_transpose re-serialises the
-            # whole EXIF block, which takes ~100x its size in memory for long SHORT arrays.
+            # getexif() decodes the EXIF capped above (falling back to an XMP
+            # tiff:Orientation when EXIF has none); only the orientation is applied.
+            # ImageOps.exif_transpose would also re-serialise the whole EXIF block.
             method = _ORIENTATION_TRANSPOSE.get(image.getexif().get(_EXIF_ORIENTATION))
             if method is not None:
                 image = image.transpose(method)
@@ -664,9 +671,9 @@ def _decode_reference_png(
                 # convert() clips 16-bit samples at 255; scale them to 8 bits first.
                 image = image.point(lambda value: value / 256).convert("L")
             rgb = image if image.mode == "RGB" else image.convert("RGB")
-            # Drop all source metadata; the PNG writer would re-emit `icc_profile`,
-            # `transparency` and `default_image` from `info`. EXIF (with its orientation,
-            # already applied above) and XMP are never written, so nothing rotates twice.
+            # Drop all source metadata; the PNG writer would re-emit `icc_profile` and
+            # `transparency` from `info`. EXIF (with its orientation, already applied
+            # above) and XMP are never written, so nothing rotates twice.
             # No colour management happens: pixel values pass through, and the profile that
             # described them is dropped (Pillow's PNG reader also refuses profiles whose
             # decompressed size exceeds 1 MiB). Without `transparency` no tRNS chunk is
@@ -682,7 +689,17 @@ def _decode_reference_png(
             "msg": (
                 f"reference image {index} has too complex a JPEG structure (at most "
                 f"{MAX_JPEG_SEGMENTS} marker segments, {MAX_JPEG_SCANS} scans and "
-                f"{MAX_JPEG_FILL_BYTES} fill bytes between segments)"
+                f"{MAX_JPEG_FILL_BYTES} fill bytes before markers outside scan data)"
+            ),
+            "input": None,
+        }
+    except _ExifTooLarge:
+        return None, {
+            "type": "value_error",
+            "loc": loc,
+            "msg": (
+                f"reference image {index} has too much EXIF metadata "
+                f"(at most {MAX_EXIF_BYTES} bytes)"
             ),
             "input": None,
         }
@@ -709,18 +726,39 @@ class _JpegTooComplex(Exception):
     pass
 
 
+class _ExifTooLarge(Exception):
+    pass
+
+
+def _check_before_decoding(data: bytes) -> None:
+    """Reject uploads whose structure or EXIF would be expensive, before Pillow opens them.
+
+    The signatures are the ones Pillow's PNG, JPEG (and MPO) and WebP plugins accept.
+    """
+    if data.startswith(b"\xff\xd8\xff"):
+        _check_jpeg_structure(data)
+    elif data.startswith(_PNG_SIGNATURE):
+        _check_png_exif(data)
+    elif data.startswith(b"RIFF") and data.startswith(b"WEBP", 8):
+        _check_webp_exif(data)
+
+
 def _check_jpeg_structure(data: bytes) -> None:
     """Walk JPEG markers up to the first EOI, without decoding anything.
 
-    Raises `_JpegTooComplex` above the segment, scan or fill-byte bounds and `SyntaxError`
-    for structure Pillow or libjpeg would have to skip or guess at: bytes other than a
-    marker between segments, a nested SOI, a length below 2, or a file that ends before
-    EOI. Entropy-coded data after each SOS is skipped with one regex search, so the walk
-    costs C-speed time linear in the upload plus at most `MAX_JPEG_SEGMENTS` iterations.
-    Data after the first EOI (further MPO pictures) is never decoded and not walked.
+    Raises `_JpegTooComplex` above the segment, scan or fill-byte bounds, `_ExifTooLarge`
+    when the APP1 `Exif` payloads (after their 6-byte `Exif\\0\\0` headers, which Pillow
+    concatenates) total more than `MAX_EXIF_BYTES`, and `SyntaxError` for structure Pillow
+    or libjpeg would have to skip or guess at: bytes other than a marker between segments,
+    a nested SOI, a length below 2, an EOI before the first SOS (Pillow's header parser
+    reads on past it), or a file that ends before EOI. Fill bytes count only before
+    markers found by the walk; those after scan data are skipped with it. Entropy-coded
+    data after each SOS is skipped with one regex search, so the walk costs C-speed time
+    linear in the upload plus at most `MAX_JPEG_SEGMENTS` iterations. Data after the first
+    EOI (further MPO pictures) is never decoded and not walked.
     """
     pos = 2  # after SOI
-    segments = scans = fill = 0
+    segments = scans = fill = exif = 0
     while True:
         marker = _JPEG_MARKER.match(data, pos)
         if marker is None:
@@ -731,6 +769,8 @@ def _check_jpeg_structure(data: bytes) -> None:
         code = marker.group(2)[0]
         pos = marker.end()
         if code == 0xD9:  # EOI
+            if scans == 0:
+                raise SyntaxError("JPEG EOI before the first scan")
             return
         if code == 0xD8:  # SOI
             raise SyntaxError("nested JPEG SOI")
@@ -742,6 +782,10 @@ def _check_jpeg_structure(data: bytes) -> None:
         length = int.from_bytes(data[pos : pos + 2])
         if length < 2 or pos + length > len(data):
             raise SyntaxError("truncated JPEG segment")
+        if code == 0xE1 and data.startswith(b"Exif\x00\x00", pos + 2, pos + length):
+            exif += length - 8
+            if exif > MAX_EXIF_BYTES:
+                raise _ExifTooLarge
         pos += length
         if code == 0xDA:  # SOS: entropy-coded data follows
             scans += 1
@@ -751,6 +795,79 @@ def _check_jpeg_structure(data: bytes) -> None:
             if scan_end is None:
                 raise SyntaxError("truncated JPEG scan")
             pos = scan_end.start()
+
+
+def _check_png_exif(data: bytes) -> None:
+    """Raise `_ExifTooLarge` when a PNG's EXIF payloads total more than `MAX_EXIF_BYTES`.
+
+    Counts the data of every `eXIf` chunk up to IEND (Pillow keeps only the last one) and
+    the text of every tEXt, zTXt or iTXt chunk with an EXIF keyword, decompressed for
+    zTXt and compressed iTXt. A chunk cut off by the end of the file counts what is
+    there; the walk stops at it.
+    """
+    pos, exif = len(_PNG_SIGNATURE), 0
+    while pos + 8 <= len(data):
+        start = pos + 8
+        end = min(start + int.from_bytes(data[pos : pos + 4]), len(data))
+        kind = data[pos + 4 : start]
+        if kind == b"eXIf":
+            exif += end - start
+        elif kind in (b"tEXt", b"zTXt", b"iTXt"):
+            exif += _png_exif_text_size(kind, data, start, end, MAX_EXIF_BYTES - exif)
+        if exif > MAX_EXIF_BYTES:
+            raise _ExifTooLarge
+        if kind == b"IEND":
+            return
+        pos = end + 4  # CRC
+
+
+def _png_exif_text_size(kind: bytes, data: bytes, start: int, end: int, budget: int) -> int:
+    """Size of a PNG text chunk's text if its keyword makes it EXIF, else 0.
+
+    Compressed text is inflated to at most `budget + 1` bytes, enough to tell it is over.
+    """
+    keyword_end = data.find(b"\x00", start, end)
+    if not any(
+        keyword_end - start == len(keyword) and data.startswith(keyword, start)
+        for keyword in _PNG_EXIF_TEXT_KEYWORDS
+    ):
+        return 0
+    text = keyword_end + 1
+    if kind == b"tEXt":
+        return end - text
+    if kind == b"zTXt":
+        compressed = True
+        text += 1  # compression method
+    else:  # iTXt: compression flag and method, language tag, translated keyword
+        compressed = data.startswith(b"\x01", text, end)
+        language_end = data.find(b"\x00", text + 2, end)
+        if language_end < 0:
+            return 0
+        translated_end = data.find(b"\x00", language_end + 1, end)
+        if translated_end < 0:
+            return 0
+        text = translated_end + 1
+    if not compressed:
+        return end - text
+    try:
+        return len(zlib.decompressobj().decompress(memoryview(data)[text:end], budget + 1))
+    except zlib.error:
+        return 0
+
+
+def _check_webp_exif(data: bytes) -> None:
+    """Raise `_ExifTooLarge` when a WebP's top-level `EXIF` chunks total more than the cap.
+
+    A chunk cut off by the end of the file counts what is there.
+    """
+    pos, exif = 12, 0  # after RIFF, size, WEBP
+    while pos + 8 <= len(data):
+        size = int.from_bytes(data[pos + 4 : pos + 8], "little")
+        if data.startswith(b"EXIF", pos):
+            exif += min(size, len(data) - pos - 8)
+            if exif > MAX_EXIF_BYTES:
+                raise _ExifTooLarge
+        pos += 8 + size + (size & 1)  # chunks are padded to even sizes
 
 
 def _log_cleanup_error(_function: Callable[..., Any], path: str, exc: BaseException) -> None:

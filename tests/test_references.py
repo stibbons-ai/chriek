@@ -10,7 +10,6 @@ import struct
 import subprocess
 import sys
 import threading
-import tracemalloc
 import uuid
 import zlib
 from pathlib import Path
@@ -1615,76 +1614,244 @@ def test_jpeg_structure_bounds_hold_at_their_limits(tmp_path):
         assert backend.renders == 3
 
 
-@pytest.mark.parametrize(
-    "upload",
-    [
-        pytest.param(_jpeg()[:20], id="truncated-segment"),
-        pytest.param(_jpeg()[:-2], id="scan-without-eoi"),
-        pytest.param(_after_first_segment(_jpeg(), b"\x00\x00"), id="junk-between-segments"),
-        pytest.param(_after_first_segment(_jpeg(), b"\xff\x00"), id="stuffing-between-segments"),
-        pytest.param(_after_first_segment(_jpeg(), b"\xff\xe1\x00\x00"), id="length-0"),
-        pytest.param(_after_first_segment(_jpeg(), b"\xff\xe1\x00\x01"), id="length-1"),
-        pytest.param(_after_first_segment(_jpeg(), b"\xff\xd8"), id="nested-soi"),
-    ],
-)
-def test_malformed_jpeg_structure_is_rejected_before_decoding(tmp_path, upload):
+def _ordinary_exif(orientation: int) -> bytes:
+    exif = Image.Exif()
+    exif[0x010F] = "Camera maker"
+    exif[0x0110] = "Camera model"
+    exif[0x0132] = "2026:11:11 12:00:00"
+    exif[0x0112] = orientation
+    return exif.tobytes()
+
+
+def _encoded(fmt: str, image: Image.Image, **save_args) -> bytes:
+    buf = io.BytesIO()
+    image.save(buf, format=fmt, **save_args)
+    return buf.getvalue()
+
+
+def _assert_stored_like_pillow_orients(tmp_path: Path, client, upload: bytes) -> Image.Image:
+    """Submit `upload` and compare the stored pixels with Pillow's own orientation of it."""
+    job = submit_multipart(
+        client, data=FORM_16, files=[("references", ("r", upload, "application/octet-stream"))]
+    )
+    assert wait_for(client, job["id"])["status"] == "succeeded"
+    with Image.open(io.BytesIO(upload)) as source:
+        expected = ImageOps.exif_transpose(source).convert("RGB")
+    stored = _stored_reference(tmp_path, job["id"])
+    assert (stored.size, stored.tobytes()) == (expected.size, expected.tobytes())
+    assert dict(stored.getexif()) == {}
+    return stored
+
+
+@pytest.mark.parametrize("orientation", range(1, 9))
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG", "WEBP"])
+def test_exif_orientation_is_applied_once_and_not_stored(client, tmp_path, fmt, orientation):
+    # Non-uniform, non-square pixels: every rotation and flip gives different bytes. The
+    # expected pixels are decoded from the upload itself, so lossy encoders compare exactly.
+    upload = _encoded(fmt, _noise_image((24, 16)), exif=_ordinary_exif(orientation))
+    stored = _assert_stored_like_pillow_orients(tmp_path, client, upload)
+    assert stored.size == ((16, 24) if orientation >= 5 else (24, 16))
+
+
+@pytest.mark.parametrize("fmt", ["JPEG", "WEBP"])
+def test_xmp_orientation_applies_when_exif_has_none(client, tmp_path, fmt):
+    xmp = (
+        b'<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF><rdf:Description '
+        b'tiff:Orientation="6"/></rdf:RDF></x:xmpmeta>'
+    )
+    upload = _encoded(fmt, _noise_image((24, 16)), xmp=xmp)
+    assert _assert_stored_like_pillow_orients(tmp_path, client, upload).size == (16, 24)
+
+
+def _oriented_exif(size: int) -> bytes:
+    """Big-endian TIFF of exactly `size` bytes: Orientation=6, then zero padding."""
+    tiff = b"MM\x00*" + struct.pack(">IH", 8, 1) + struct.pack(">HHIHH", 0x0112, 3, 1, 6, 0)
+    tiff += b"\x00\x00\x00\x00"  # no next IFD
+    return tiff + b"\x00" * (size - len(tiff))
+
+
+def _exif_array(tag: int, field_type: int, item: bytes, count: int) -> bytes:
+    """Big-endian TIFF whose only tag holds `count` copies of `item`, stored after the IFD."""
+    entry = struct.pack(">HHII", tag, field_type, count, 26)
+    return b"MM\x00*" + struct.pack(">IH", 8, 1) + entry + b"\x00\x00\x00\x00" + item * count
+
+
+def _jpeg_with_exif_segments(image: Image.Image, exif: bytes, parts: int) -> bytes:
+    """JPEG whose EXIF is split over `parts` APP1 segments, which Pillow concatenates."""
+    step = -(-len(exif) // parts)
+    segments = b"".join(
+        b"\xff\xe1" + (8 + len(piece)).to_bytes(2) + b"Exif\x00\x00" + piece
+        for piece in (exif[i : i + step] for i in range(0, len(exif), step))
+    )
+    return _after_first_segment(_jpeg(image), segments)
+
+
+def _png_with_chunks(*chunks: bytes) -> bytes:
+    png = _png_bytes(_noise_image((24, 16)))
+    return png[:33] + b"".join(chunks) + png[33:]  # after IHDR
+
+
+def _with_exif(fmt: str, exif: bytes) -> bytes:
+    if fmt == "JPEG":
+        return _jpeg_with_exif_segments(_noise_image((24, 16)), exif, parts=2)
+    return _encoded(fmt, _noise_image((24, 16)), exif=exif)
+
+
+@pytest.mark.parametrize("fmt", ["PNG", "JPEG", "WEBP"])
+def test_exif_cap_holds_at_its_limit(tmp_path, fmt):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
+        at_cap = _with_exif(fmt, _oriented_exif(chriek.api.MAX_EXIF_BYTES))
+        assert _assert_stored_like_pillow_orients(tmp_path, client, at_cap).size == (16, 24)
+        stored = sorted(p.name for p in (tmp_path / "images").iterdir())
+
+        over_cap = _with_exif(fmt, _oriented_exif(chriek.api.MAX_EXIF_BYTES + 1))
         response = post_multipart(
-            client, data=FORM_16, files=[("references", ("r.jpg", upload, "image/jpeg"))]
+            client, data=FORM_16, files=[("references", ("r", over_cap, "image/x"))]
         )
         assert response.status_code == 422, response.text
         [error] = response.json()["detail"]
         assert error["loc"] == ["body", "references", 0]
-        assert "not a valid image" in error["msg"]
-        _assert_nothing_persisted(tmp_path, backend)
+        assert "too much EXIF metadata (at most 65536 bytes)" in error["msg"]
+        assert sorted(p.name for p in (tmp_path / "images").iterdir()) == stored
+        assert backend.renders == 1
 
 
-@pytest.mark.parametrize("orientation", range(1, 9))
-def test_exif_orientation_is_applied_once_and_not_stored(client, tmp_path, orientation):
-    exif = Image.Exif()
-    exif[0x0112] = orientation
-    upload = _png_bytes(_noise_image((4, 2)), exif=exif.tobytes())
-    job = submit_multipart(
-        client, data=FORM_16, files=[("references", ("r.png", upload, "image/png"))]
-    )
-    assert wait_for(client, job["id"])["status"] == "succeeded"
-    with Image.open(io.BytesIO(upload)) as source:
-        expected = ImageOps.exif_transpose(source)
-    stored = _stored_reference(tmp_path, job["id"])
-    assert (stored.size, stored.tobytes()) == (expected.size, expected.tobytes())
-    assert dict(stored.getexif()) == {}
+@pytest.fixture
+def decoder_entries(monkeypatch) -> list:
+    """Records every `Image.open`: the boundary where Pillow's parsers start to run."""
+    entries = []
+    original_open = Image.open
+
+    def recording_open(fp, *args, **kwargs):
+        entries.append(fp)
+        return original_open(fp, *args, **kwargs)
+
+    monkeypatch.setattr(Image, "open", recording_open)
+    return entries
 
 
-def _png_with_short_array_exif(payload_bytes: int) -> bytes:
-    """24x16 PNG whose eXIf holds Orientation=6 plus one SHORT array of `payload_bytes`."""
-    count = payload_bytes // 2
-    entries = struct.pack(">HHIHH", 0x0112, 3, 1, 6, 0)
-    entries += struct.pack(">HHII", 0x9999, 3, count, 38)  # data after the 30-byte IFD
-    exif = b"MM\x00*" + struct.pack(">IH", 8, 2) + entries + b"\x00\x00\x00\x00"
-    exif += b"\x00\x01" * count
-    png = _png_bytes(_noise_image((24, 16)))
-    return png[:33] + _png_chunk(b"eXIf", exif) + png[33:]
+_BASELINE_16 = _jpeg(_noise_image((16, 16)))
 
 
-def test_large_exif_with_orientation_is_not_reserialized(client, tmp_path):
-    upload = _png_with_short_array_exif(1024 * 1024)
-    tracemalloc.start()
-    try:
+@pytest.mark.parametrize(
+    ("upload", "reason"),
+    [
+        # Structure Pillow or libjpeg would have to skip or guess at.
+        pytest.param(_jpeg()[:20], "not a valid image", id="truncated-segment"),
+        pytest.param(
+            _after_first_segment(_jpeg(), b"\x00\x00"),
+            "not a valid image",
+            id="junk-between-segments",
+        ),
+        pytest.param(
+            _after_first_segment(_jpeg(), b"\xff\x00"),
+            "not a valid image",
+            id="stuffing-between-segments",
+        ),
+        pytest.param(
+            _after_first_segment(_jpeg(), b"\xff\xe1\x00\x00"), "not a valid image", id="length-0"
+        ),
+        pytest.param(
+            _after_first_segment(_jpeg(), b"\xff\xe1\x00\x01"), "not a valid image", id="length-1"
+        ),
+        pytest.param(
+            _after_first_segment(_jpeg(), b"\xff\xd8"), "not a valid image", id="nested-soi"
+        ),
+        # Pillow's header parser reads on past an EOI until the first SOS, keeping every
+        # segment in Python objects.
+        pytest.param(
+            b"\xff\xd8\xff\xd9" + b"\xff\xe1\x00\x02" * 200_000 + _BASELINE_16[2:],
+            "not a valid image",
+            id="early-eoi-app1-flood",
+        ),
+        pytest.param(
+            b"\xff\xd8\xff\xd9" + b"\xff\xfe\x00\x02" * 200_000 + _BASELINE_16[2:],
+            "not a valid image",
+            id="early-eoi-com-flood",
+        ),
+        # Pillow accepts each of these; only the walk rejects them.
+        pytest.param(
+            _after_first_segment(_BASELINE_16, b"\xff\xd0" * 300),
+            "JPEG structure",
+            id="rst-flood",
+        ),
+        pytest.param(
+            _after_first_segment(_BASELINE_16, b"\xff\x01" * 300),
+            "JPEG structure",
+            id="tem-flood",
+        ),
+        pytest.param(
+            _with_fill(_after_first_segment(_BASELINE_16, b"\xff" * 57), 200),
+            "JPEG structure",
+            id="fill-200-plus-57",
+        ),
+        pytest.param(
+            _BASELINE_16[:-2] + b"\x00" * 4096, "not a valid image", id="scan-without-eoi"
+        ),
+        # EXIF that Pillow would decode into Python objects many times its size.
+        pytest.param(
+            _png_with_chunks(_png_chunk(b"eXIf", _exif_array(0x0112, 3, b"\x00\x06", 40_000))),
+            "too much EXIF",
+            id="png-orientation-short-array",
+        ),
+        pytest.param(
+            _with_exif("JPEG", _exif_array(0x0112, 3, b"\x00\x06", 40_000)),
+            "too much EXIF",
+            id="jpeg-orientation-short-array",
+        ),
+        pytest.param(
+            # Read by Pillow's JPEG open itself: no JFIF density, so it looks up the DPI.
+            _jpeg_with_exif_segments(
+                _noise_image((16, 16)), _exif_array(0x011A, 5, b"\x00\x00\x00\x48" * 2, 9_000), 2
+            ),
+            "too much EXIF",
+            id="jpeg-xresolution-split-over-two-segments",
+        ),
+        pytest.param(
+            _png_with_chunks(
+                _png_chunk(b"eXIf", _oriented_exif(40_000)),
+                _png_chunk(b"eXIf", _oriented_exif(40_000)),
+            ),
+            "too much EXIF",
+            id="png-repeated-exif-chunks",
+        ),
+        pytest.param(
+            _png_with_chunks(_png_chunk(b"tEXt", b"exif\x00" + _oriented_exif(70_000))),
+            "too much EXIF",
+            id="png-text-exif",
+        ),
+        pytest.param(
+            _png_with_chunks(
+                _png_chunk(b"zTXt", b"Raw profile type exif\x00\x00" + zlib.compress(b"0" * 70_000))
+            ),
+            "too much EXIF",
+            id="png-compressed-raw-profile",
+        ),
+        pytest.param(
+            _png_with_chunks(
+                _png_chunk(b"iTXt", b"exif\x00\x01\x00en\x00\x00" + zlib.compress(b"0" * 70_000))
+            ),
+            "too much EXIF",
+            id="png-compressed-international-text",
+        ),
+        pytest.param(_with_exif("WEBP", _oriented_exif(70_000)), "too much EXIF", id="webp-exif"),
+    ],
+)
+def test_costly_uploads_are_rejected_before_pillow_opens_them(
+    tmp_path, decoder_entries, upload, reason
+):
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
         response = post_multipart(
-            client, data=FORM_16, files=[("references", ("r.png", upload, "image/png"))]
+            client, data=FORM_16, files=[("references", ("r", upload, "image/x"))]
         )
-        _, peak = tracemalloc.get_traced_memory()
-    finally:
-        tracemalloc.stop()
-    assert response.status_code == 202, response.text
-    # Python-heap peak of the whole request, body copies included. Re-serialising the EXIF
-    # (ImageOps.exif_transpose) turned every SHORT into Python objects: ~75x the upload.
-    assert peak < 16 * len(upload)
-    assert wait_for(client, response.json()["id"])["status"] == "succeeded"
-    stored = _stored_reference(tmp_path, response.json()["id"])
-    assert stored.size == (16, 24)
-    assert dict(stored.getexif()) == {}
+        assert response.status_code == 422, response.text
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body", "references", 0]
+        assert reason in error["msg"]
+        assert decoder_entries == []
+        _assert_nothing_persisted(tmp_path, backend)
 
 
 def test_cmyk_jpeg_reference_uses_plain_rgb_conversion(client, tmp_path):
