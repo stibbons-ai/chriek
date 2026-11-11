@@ -19,7 +19,10 @@ class ImageBackend(Protocol):
         height: int,
         seed: int,
         references: Sequence[Image.Image] = (),
-    ) -> Image.Image: ...
+    ) -> Image.Image:
+        """Render one image. `references` are borrowed, read-only images shared by every
+        render of a job: implementations must not mutate or close them (copy first to edit)."""
+        ...
 
 
 class FakeBackend:

@@ -1,5 +1,6 @@
 """Issue #5: multipart reference images for edit jobs."""
 
+import hashlib
 import io
 import json
 import logging
@@ -9,6 +10,7 @@ import struct
 import subprocess
 import sys
 import threading
+import tracemalloc
 import uuid
 import zlib
 from pathlib import Path
@@ -29,7 +31,7 @@ from conftest import (
     wait_for,
 )
 from fastapi.testclient import TestClient
-from PIL import Image
+from PIL import Image, ImageOps
 from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -428,6 +430,10 @@ def test_references_stored_with_safe_names_and_persist_across_restart_for_queued
         assert not (tmp_path / "0.png").exists()
 
         with running(tmp_path) as after:
+            interrupted = after.get(f"/jobs/{first['id']}", headers=ALICE).json()
+            assert interrupted["status"] == "failed"
+            assert interrupted["error"].startswith("interrupted:")
+            assert interrupted["params"]["reference_count"] == 1
             survivor = wait_for(after, queued["id"])
             assert survivor["status"] == "succeeded"
             assert survivor["params"]["reference_count"] == 2
@@ -938,8 +944,8 @@ def _corrupt_exif_image(fmt: str) -> bytes:
     exif = Image.Exif()
     exif[0x0112] = 6
     exif[0x010F] = "maker"
-    # Tag 0x0100 (ImageWidth) with an ASCII string payload triggers struct.error inside
-    # ImageOps.exif_transpose when re-serializing stripped EXIF metadata.
+    # Tag 0x0100 (ImageWidth) with an ASCII string payload cannot be decoded as ImageWidth;
+    # only the orientation tag is read, so this metadata is dropped rather than parsed.
     corrupt_exif = exif.tobytes().replace(b"\x01\x0f\x00\x02", b"\x01\x00\x00\x02")
     buf = io.BytesIO()
     Image.new("RGB", (16, 16), (30, 60, 90)).save(buf, format=fmt, exif=corrupt_exif)
@@ -970,6 +976,10 @@ def test_reference_format_allowlist_corrupt_metadata_and_bomb_headers(tmp_path, 
     blp_buf = io.BytesIO()
     Image.new("P", (16, 16)).save(blp_buf, format="BLP")
     dds_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="DDS")
+    # Decodable by Pillow, but outside the allowlist (encoders installed with Pillow).
+    jpeg2000_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="JPEG2000")
+    ico_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="ICO")
+    ppm_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="PPM")
 
     with running(tmp_path) as client:
         for name, payload in (
@@ -979,8 +989,9 @@ def test_reference_format_allowlist_corrupt_metadata_and_bomb_headers(tmp_path, 
             ("scan.tiff", tiff_bytes),
             ("texture.blp", blp_buf.getvalue()),
             ("surface.dds", dds_bytes),
-            ("bad-exif.jpg", _corrupt_exif_image("JPEG")),
-            ("bad-exif.webp", _corrupt_exif_image("WEBP")),
+            ("image.jp2", jpeg2000_bytes),
+            ("favicon.ico", ico_bytes),
+            ("pixmap.ppm", ppm_bytes),
             ("trunc.png", make_image_bytes(fmt="PNG")[:45]),
         ):
             resp = post_multipart(
@@ -1005,23 +1016,32 @@ def test_reference_format_allowlist_corrupt_metadata_and_bomb_headers(tmp_path, 
         assert bomb_detail[0]["loc"] == ["body", "references", 0]
         assert "exceeds maximum of" in bomb_detail[0]["msg"]
 
-        # Valid EXIF orientation on an allowed format (JPEG) is transposed and normalized.
-        exif = Image.Exif()
-        exif[0x0112] = 6  # Rotate 90 degrees clockwise: 24x16 becomes 16x24
-        oriented_buf = io.BytesIO()
-        Image.new("RGB", (24, 16), (120, 40, 80)).save(
-            oriented_buf, format="JPEG", exif=exif.tobytes()
-        )
-        ok = submit_multipart(
-            client,
-            data={"prompt": "oriented", "width": "16", "height": "16"},
-            files=[("references", ("oriented.jpg", oriented_buf.getvalue(), "image/jpeg"))],
-        )
-        assert wait_for(client, ok["id"])["status"] == "succeeded"
-        with Image.open(reference_path(tmp_path / "images", ok["id"], 0)) as stored_ref:
-            assert stored_ref.format == "PNG"
-            assert stored_ref.mode == "RGB"
-            assert stored_ref.size == (16, 24)
+        # Valid EXIF orientation on an allowed format (JPEG) is transposed and normalized;
+        # an undecodable unrelated EXIF tag is dropped with the rest of the metadata.
+        for name, payload, size in (
+            ("oriented.jpg", _oriented_jpeg(), (16, 24)),
+            ("bad-exif.jpg", _corrupt_exif_image("JPEG"), (16, 16)),
+            ("bad-exif.webp", _corrupt_exif_image("WEBP"), (16, 16)),
+        ):
+            ok = submit_multipart(
+                client,
+                data={"prompt": "oriented", "width": "16", "height": "16"},
+                files=[("references", (name, payload, "image/jpeg"))],
+            )
+            assert wait_for(client, ok["id"])["status"] == "succeeded", name
+            with Image.open(reference_path(tmp_path / "images", ok["id"], 0)) as stored_ref:
+                assert stored_ref.format == "PNG", name
+                assert stored_ref.mode == "RGB", name
+                assert stored_ref.size == size, name
+                assert dict(stored_ref.getexif()) == {}, name
+
+
+def _oriented_jpeg() -> bytes:
+    exif = Image.Exif()
+    exif[0x0112] = 6  # Rotate 90 degrees clockwise: 24x16 becomes 16x24
+    buf = io.BytesIO()
+    Image.new("RGB", (24, 16), (120, 40, 80)).save(buf, format="JPEG", exif=exif.tobytes())
+    return buf.getvalue()
 
 
 def test_non_rgb_and_transparent_references_are_stored_as_plain_rgb(tmp_path):
@@ -1114,7 +1134,8 @@ def test_16_bit_greyscale_references_are_scaled_not_clipped(client, tmp_path):
 
 @pytest.mark.parametrize("fmt", ["JPEG", "WEBP"])
 def test_reference_icc_profile_is_dropped_so_large_profiles_stay_loadable(client, tmp_path, fmt):
-    icc = bytes(range(256)) * 4097  # 1,048,832 bytes: above Pillow's 1 MiB PNG iCCP read limit
+    # 1,048,832 bytes: above Pillow's 1 MiB limit on a decompressed PNG iCCP profile.
+    icc = bytes(range(256)) * 4097
     buf = io.BytesIO()
     Image.new("RGB", (16, 16), (10, 20, 30)).save(buf, format=fmt, icc_profile=icc)
     with Image.open(io.BytesIO(buf.getvalue())) as upload:
@@ -1416,9 +1437,9 @@ def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_w
 
         monkeypatch.undo()
 
-    # Next, a missing reference file (OSError) and a corrupt one (ValueError: a PNG whose iCCP
-    # chunk exceeds the reader's limit) each fail only their job: the error does not leak the
-    # absolute storage path, and subsequent jobs still succeed.
+    # Next, a missing reference file (OSError) and a corrupt one (ValueError: a PNG whose
+    # iCCP profile decompresses beyond the reader's limit) each fail only their job: the
+    # error does not leak the absolute storage path, and subsequent jobs still succeed.
     gated_next = GatedBackend()
     with running(tmp_path, backend=gated_next) as client:
         blocker = submit(client, prompt="hold worker", width=16, height=16)
@@ -1456,3 +1477,246 @@ def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_w
         assert wait_for(client, corrupt_ref_job["id"])["status"] == "failed"
         assert wait_for(client, follow_up["id"])["status"] == "succeeded"
         assert client.get("/health").status_code == 200
+
+
+FORM_16 = {"prompt": "reference checks", "width": "16", "height": "16"}
+
+
+def _noise_image(size: tuple[int, int] = (64, 64), mode: str = "RGB") -> Image.Image:
+    """Deterministic non-uniform pixels: rotations, flips and lossy decodes all show."""
+    noise = hashlib.shake_256(b"chriek").digest(size[0] * size[1] * 3)
+    image = Image.frombytes("RGB", size, noise)
+    return image.convert(mode)
+
+
+def _jpeg(image: Image.Image | None = None, **save_args) -> bytes:
+    buf = io.BytesIO()
+    (_noise_image() if image is None else image).save(buf, format="JPEG", **save_args)
+    return buf.getvalue()
+
+
+def _after_first_segment(data: bytes, extra: bytes) -> bytes:
+    """Insert `extra` right after the JPEG's first marker segment (Pillow writes APP0)."""
+    end = 4 + int.from_bytes(data[4:6])
+    return data[:end] + extra + data[end:]
+
+
+def _with_segments(baseline: bytes, total: int) -> bytes:
+    """Pad a single-scan JPEG with empty APP1 segments to `total` segments (SOS included)."""
+    pos, before_scan = 2, 0
+    while baseline[pos + 1] != 0xDA:
+        pos += 2 + int.from_bytes(baseline[pos + 2 : pos + 4])
+        before_scan += 1
+    return baseline[:2] + b"\xff\xe1\x00\x02" * (total - before_scan - 1) + baseline[2:]
+
+
+def _with_scans(progressive: bytes, total: int) -> bytes:
+    """Repeat a progressive JPEG's last scan until the file has `total` scans."""
+    last_scan = progressive[progressive.rindex(b"\xff\xda") : -2]
+    extra = total - progressive.count(b"\xff\xda")
+    return progressive[:-2] + last_scan * extra + b"\xff\xd9"
+
+
+def _with_fill(data: bytes, fill: int) -> bytes:
+    """Add `fill` 0xFF fill bytes before the marker after SOI."""
+    return data[:2] + b"\xff" * fill + data[2:]
+
+
+def _assert_nothing_persisted(tmp_path: Path, backend: CountingBackend) -> None:
+    assert not any((tmp_path / "images").iterdir())
+    with sqlite3.connect(tmp_path / "db" / "chriek.db") as conn:
+        assert conn.execute("SELECT count(*) FROM jobs").fetchone() == (0,)
+    assert backend.renders == 0
+
+
+def _stored_reference(tmp_path: Path, job_id: str) -> Image.Image:
+    with Image.open(reference_path(tmp_path / "images", job_id, 0)) as stored:
+        stored.load()
+        return stored
+
+
+@pytest.mark.parametrize(
+    "second",
+    [
+        pytest.param(b"not-an-image", id="corrupt"),
+        pytest.param(b"", id="empty"),
+        pytest.param(make_image_bytes(fmt="GIF"), id="unsupported-format"),
+        pytest.param(make_image_bytes(size=(64, 64)), id="over-pixel-limit"),
+        pytest.param(_with_segments(_jpeg(_noise_image((16, 16))), 257), id="complex-jpeg"),
+    ],
+)
+def test_invalid_second_reference_rejects_the_whole_request(tmp_path, second):
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend, CHRIEK_MAX_PIXELS="1024") as client:
+        response = post_multipart(
+            client,
+            data=FORM_16,
+            files=[
+                ("references", ("first.png", make_image_bytes(), "image/png")),
+                ("references", ("second.bin", second, "application/octet-stream")),
+            ],
+        )
+        assert response.status_code == 422, response.text
+        assert [err["loc"] for err in response.json()["detail"]] == [["body", "references", 1]]
+        _assert_nothing_persisted(tmp_path, backend)
+
+
+@pytest.mark.parametrize(
+    "upload",
+    [
+        pytest.param(_jpeg(), id="baseline"),
+        pytest.param(_jpeg(progressive=True), id="progressive"),
+        pytest.param(_jpeg(progressive=True, restart_marker_blocks=1), id="restart-markers"),
+        pytest.param(_with_fill(_jpeg(), 3), id="fill-bytes"),
+    ],
+)
+def test_jpeg_references_keep_their_decoded_pixels(client, tmp_path, upload):
+    assert b"\xff\x00" in upload  # the walk must skip stuffed bytes in scan data
+    job = submit_multipart(
+        client, data=FORM_16, files=[("references", ("r.jpg", upload, "image/jpeg"))]
+    )
+    assert wait_for(client, job["id"])["status"] == "succeeded"
+    with Image.open(io.BytesIO(upload)) as source:
+        expected = source.convert("RGB").tobytes()
+    assert _stored_reference(tmp_path, job["id"]).tobytes() == expected
+
+
+def test_jpeg_structure_bounds_hold_at_their_limits(tmp_path):
+    baseline = _jpeg(_noise_image((16, 16)))
+    progressive = _jpeg(_noise_image((16, 16)), progressive=True)
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        for name, upload in (
+            ("256 segments", _with_segments(baseline, 256)),
+            ("64 scans", _with_scans(progressive, 64)),
+            ("256 fill bytes", _with_fill(baseline, 256)),
+        ):
+            job = submit_multipart(
+                client, data=FORM_16, files=[("references", ("r.jpg", upload, "image/jpeg"))]
+            )
+            assert wait_for(client, job["id"])["status"] == "succeeded", name
+        accepted = sorted(p.name for p in (tmp_path / "images").iterdir())
+
+        for name, upload in (
+            ("257 segments", _with_segments(baseline, 257)),
+            ("65 scans", _with_scans(progressive, 65)),
+            ("257 fill bytes", _with_fill(baseline, 257)),
+            ("APP1 flood", _with_segments(baseline, 200_000)),
+            ("scan flood", _with_scans(progressive, 5_000)),
+        ):
+            response = post_multipart(
+                client, data=FORM_16, files=[("references", ("r.jpg", upload, "image/jpeg"))]
+            )
+            assert response.status_code == 422, f"{name}: {response.text}"
+            [error] = response.json()["detail"]
+            assert error["loc"] == ["body", "references", 0], name
+            assert "JPEG structure" in error["msg"], name
+        assert sorted(p.name for p in (tmp_path / "images").iterdir()) == accepted
+        assert backend.renders == 3
+
+
+@pytest.mark.parametrize(
+    "upload",
+    [
+        pytest.param(_jpeg()[:20], id="truncated-segment"),
+        pytest.param(_jpeg()[:-2], id="scan-without-eoi"),
+        pytest.param(_after_first_segment(_jpeg(), b"\x00\x00"), id="junk-between-segments"),
+        pytest.param(_after_first_segment(_jpeg(), b"\xff\x00"), id="stuffing-between-segments"),
+        pytest.param(_after_first_segment(_jpeg(), b"\xff\xe1\x00\x00"), id="length-0"),
+        pytest.param(_after_first_segment(_jpeg(), b"\xff\xe1\x00\x01"), id="length-1"),
+        pytest.param(_after_first_segment(_jpeg(), b"\xff\xd8"), id="nested-soi"),
+    ],
+)
+def test_malformed_jpeg_structure_is_rejected_before_decoding(tmp_path, upload):
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        response = post_multipart(
+            client, data=FORM_16, files=[("references", ("r.jpg", upload, "image/jpeg"))]
+        )
+        assert response.status_code == 422, response.text
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body", "references", 0]
+        assert "not a valid image" in error["msg"]
+        _assert_nothing_persisted(tmp_path, backend)
+
+
+@pytest.mark.parametrize("orientation", range(1, 9))
+def test_exif_orientation_is_applied_once_and_not_stored(client, tmp_path, orientation):
+    exif = Image.Exif()
+    exif[0x0112] = orientation
+    upload = _png_bytes(_noise_image((4, 2)), exif=exif.tobytes())
+    job = submit_multipart(
+        client, data=FORM_16, files=[("references", ("r.png", upload, "image/png"))]
+    )
+    assert wait_for(client, job["id"])["status"] == "succeeded"
+    with Image.open(io.BytesIO(upload)) as source:
+        expected = ImageOps.exif_transpose(source)
+    stored = _stored_reference(tmp_path, job["id"])
+    assert (stored.size, stored.tobytes()) == (expected.size, expected.tobytes())
+    assert dict(stored.getexif()) == {}
+
+
+def _png_with_short_array_exif(payload_bytes: int) -> bytes:
+    """24x16 PNG whose eXIf holds Orientation=6 plus one SHORT array of `payload_bytes`."""
+    count = payload_bytes // 2
+    entries = struct.pack(">HHIHH", 0x0112, 3, 1, 6, 0)
+    entries += struct.pack(">HHII", 0x9999, 3, count, 38)  # data after the 30-byte IFD
+    exif = b"MM\x00*" + struct.pack(">IH", 8, 2) + entries + b"\x00\x00\x00\x00"
+    exif += b"\x00\x01" * count
+    png = _png_bytes(_noise_image((24, 16)))
+    return png[:33] + _png_chunk(b"eXIf", exif) + png[33:]
+
+
+def test_large_exif_with_orientation_is_not_reserialized(client, tmp_path):
+    upload = _png_with_short_array_exif(1024 * 1024)
+    tracemalloc.start()
+    try:
+        response = post_multipart(
+            client, data=FORM_16, files=[("references", ("r.png", upload, "image/png"))]
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert response.status_code == 202, response.text
+    # Python-heap peak of the whole request, body copies included. Re-serialising the EXIF
+    # (ImageOps.exif_transpose) turned every SHORT into Python objects: ~75x the upload.
+    assert peak < 16 * len(upload)
+    assert wait_for(client, response.json()["id"])["status"] == "succeeded"
+    stored = _stored_reference(tmp_path, response.json()["id"])
+    assert stored.size == (16, 24)
+    assert dict(stored.getexif()) == {}
+
+
+def test_cmyk_jpeg_reference_uses_plain_rgb_conversion(client, tmp_path):
+    upload = _jpeg(_noise_image((16, 16), mode="CMYK"))
+    job = submit_multipart(
+        client, data=FORM_16, files=[("references", ("r.jpg", upload, "image/jpeg"))]
+    )
+    assert wait_for(client, job["id"])["status"] == "succeeded"
+    with Image.open(io.BytesIO(upload)) as source:
+        assert source.mode == "CMYK"
+        expected = source.convert("RGB").tobytes()
+    assert _stored_reference(tmp_path, job["id"]).tobytes() == expected
+
+
+@pytest.mark.parametrize(
+    ("fmt", "save_args"),
+    [
+        pytest.param("PNG", {}, id="apng-first-frame"),
+        pytest.param("PNG", {"default_image": True}, id="apng-default-image"),
+        pytest.param("WEBP", {"lossless": True}, id="animated-webp"),
+        pytest.param("MPO", {}, id="mpo-first-picture"),
+    ],
+)
+def test_multi_image_uploads_keep_only_the_first_picture(client, tmp_path, fmt, save_args):
+    first, *later = (
+        Image.new("RGB", (16, 16), c) for c in ((200, 30, 30), (30, 30, 200), (30, 200, 30))
+    )
+    buf = io.BytesIO()
+    first.save(buf, format=fmt, save_all=True, append_images=later, **save_args)
+    job = submit_multipart(
+        client, data=FORM_16, files=[("references", ("r", buf.getvalue(), "image/octet-stream"))]
+    )
+    assert wait_for(client, job["id"])["status"] == "succeeded"
+    red, green, blue = _stored_reference(tmp_path, job["id"]).getpixel((8, 8))
+    assert red > 190 and green < 40 and blue < 40  # MPO is lossy JPEG

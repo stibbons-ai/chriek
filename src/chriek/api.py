@@ -23,7 +23,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.routing import APIRoute
-from PIL import Image, ImageOps, UnidentifiedImageError
+from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 from python_multipart.exceptions import FormParserError
 from python_multipart.multipart import MultipartParser, parse_options_header
@@ -50,6 +50,27 @@ MAX_SCALAR_FIELD_BYTES = 1024 * 1024
 MAX_FORM_FIELDS = 32
 INTEGER_PATTERN = re.compile(r"[+-]?[0-9]{1,20}")
 ALLOWED_REFERENCE_FORMATS = ("PNG", "JPEG", "WEBP")
+# Pillow's JPEG header parser runs in Python and keeps every APPn segment, and libjpeg
+# decodes every progressive scan in full, so a small file can cost far more memory and CPU
+# than its pixel count suggests. These bound the JPEG structure before Pillow sees it.
+MAX_JPEG_SEGMENTS = 256
+MAX_JPEG_SCANS = 64
+MAX_JPEG_FILL_BYTES = 256
+# A marker outside entropy-coded data: optional 0xFF fill bytes, then the marker code.
+_JPEG_MARKER = re.compile(rb"\xff(\xff*+)([^\x00\xff])")
+# End of entropy-coded scan data: the next marker that is neither stuffing (FF00), fill
+# (FFFF) nor a restart marker (FFD0-FFD7); fill bytes before it are skipped by the search.
+_JPEG_SCAN_END = re.compile(rb"\xff[^\x00\xd0-\xd7\xff]")
+_EXIF_ORIENTATION = 0x0112
+_ORIENTATION_TRANSPOSE = {
+    2: Image.Transpose.FLIP_LEFT_RIGHT,
+    3: Image.Transpose.ROTATE_180,
+    4: Image.Transpose.FLIP_TOP_BOTTOM,
+    5: Image.Transpose.TRANSPOSE,
+    6: Image.Transpose.ROTATE_270,
+    7: Image.Transpose.TRANSVERSE,
+    8: Image.Transpose.ROTATE_90,
+}
 # Pillow raises these for corrupt input. AssertionError: Image.convert() on a palette PNG
 # with tRNS but no PLTE; under `python -O` that assert is gone and AttributeError follows.
 _DECODER_ERRORS = (
@@ -627,24 +648,44 @@ def _decode_reference_png(
             "input": None,
         }
     try:
+        if data.startswith(b"\xff\xd8\xff"):  # what Pillow's JPEG (and MPO) plugin accepts
+            _check_jpeg_structure(data)
         with Image.open(io.BytesIO(data), formats=ALLOWED_REFERENCE_FORMATS) as image:
             width, height = image.size
             if width <= 0 or height <= 0 or width * height > limits.max_pixels:
                 raise Image.DecompressionBombError
             image.load()
-            ImageOps.exif_transpose(image, in_place=True)
+            # Read only the orientation tag: ImageOps.exif_transpose re-serialises the
+            # whole EXIF block, which takes ~100x its size in memory for long SHORT arrays.
+            method = _ORIENTATION_TRANSPOSE.get(image.getexif().get(_EXIF_ORIENTATION))
+            if method is not None:
+                image = image.transpose(method)
             if image.mode.startswith("I;16"):
                 # convert() clips 16-bit samples at 255; scale them to 8 bits first.
                 image = image.point(lambda value: value / 256).convert("L")
             rgb = image if image.mode == "RGB" else image.convert("RGB")
-            # RGB references carry no transparency. Without the pop, an integer tRNS key
-            # kept from a 1-bit or 16-bit grey source makes the PNG writer raise.
-            rgb.info.pop("transparency", None)
-            # Pixels are not colour-managed, so a profile would not describe them; the
-            # worker's PNG reader also refuses iCCP chunks above 1 MiB.
-            rgb.info.pop("icc_profile", None)
+            # Drop all source metadata; the PNG writer would re-emit `icc_profile`,
+            # `transparency` and `default_image` from `info`. EXIF (with its orientation,
+            # already applied above) and XMP are never written, so nothing rotates twice.
+            # No colour management happens: pixel values pass through, and the profile that
+            # described them is dropped (Pillow's PNG reader also refuses profiles whose
+            # decompressed size exceeds 1 MiB). Without `transparency` no tRNS chunk is
+            # written for the opaque RGB result; a 1-bit source's integer key would even
+            # make the writer raise.
+            rgb.info.clear()
             buf = io.BytesIO()
             rgb.save(buf, format="PNG")
+    except _JpegTooComplex:
+        return None, {
+            "type": "value_error",
+            "loc": loc,
+            "msg": (
+                f"reference image {index} has too complex a JPEG structure (at most "
+                f"{MAX_JPEG_SEGMENTS} marker segments, {MAX_JPEG_SCANS} scans and "
+                f"{MAX_JPEG_FILL_BYTES} fill bytes between segments)"
+            ),
+            "input": None,
+        }
     except Image.DecompressionBombError, Image.DecompressionBombWarning:
         return None, {
             "type": "value_error",
@@ -662,6 +703,54 @@ def _decode_reference_png(
             "input": None,
         }
     return buf.getvalue(), None
+
+
+class _JpegTooComplex(Exception):
+    pass
+
+
+def _check_jpeg_structure(data: bytes) -> None:
+    """Walk JPEG markers up to the first EOI, without decoding anything.
+
+    Raises `_JpegTooComplex` above the segment, scan or fill-byte bounds and `SyntaxError`
+    for structure Pillow or libjpeg would have to skip or guess at: bytes other than a
+    marker between segments, a nested SOI, a length below 2, or a file that ends before
+    EOI. Entropy-coded data after each SOS is skipped with one regex search, so the walk
+    costs C-speed time linear in the upload plus at most `MAX_JPEG_SEGMENTS` iterations.
+    Data after the first EOI (further MPO pictures) is never decoded and not walked.
+    """
+    pos = 2  # after SOI
+    segments = scans = fill = 0
+    while True:
+        marker = _JPEG_MARKER.match(data, pos)
+        if marker is None:
+            raise SyntaxError("JPEG marker expected")
+        fill += len(marker.group(1))
+        if fill > MAX_JPEG_FILL_BYTES:
+            raise _JpegTooComplex
+        code = marker.group(2)[0]
+        pos = marker.end()
+        if code == 0xD9:  # EOI
+            return
+        if code == 0xD8:  # SOI
+            raise SyntaxError("nested JPEG SOI")
+        segments += 1
+        if segments > MAX_JPEG_SEGMENTS:
+            raise _JpegTooComplex
+        if 0xD0 <= code <= 0xD7 or code == 0x01:  # RSTn and TEM carry no length
+            continue
+        length = int.from_bytes(data[pos : pos + 2])
+        if length < 2 or pos + length > len(data):
+            raise SyntaxError("truncated JPEG segment")
+        pos += length
+        if code == 0xDA:  # SOS: entropy-coded data follows
+            scans += 1
+            if scans > MAX_JPEG_SCANS:
+                raise _JpegTooComplex
+            scan_end = _JPEG_SCAN_END.search(data, pos)
+            if scan_end is None:
+                raise SyntaxError("truncated JPEG scan")
+            pos = scan_end.start()
 
 
 def _log_cleanup_error(_function: Callable[..., Any], path: str, exc: BaseException) -> None:
