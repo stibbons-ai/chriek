@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
@@ -72,11 +73,12 @@ def create_app(
     """Build the home-mode app. `backend` and `clock` are test seams; `chriek serve` omits them."""
     # Both storage sides are checked before either is created: the database side here without
     # creating anything, then the image side by private_image_root. JobStore and Worker check
-    # their own side again, so they stay safe when used without the app.
-    if str(settings.db_path) != MEMORY_DATABASE:
-        check_database(settings.db_path)
+    # their own side again, so they stay safe when used without the app. A Postgres URL has no
+    # local database side.
+    if isinstance(settings.database, Path) and str(settings.database) != MEMORY_DATABASE:
+        check_database(settings.database)
     storage_dir = private_image_root(settings.storage_dir)
-    store = JobStore(settings.db_path)
+    store = JobStore(settings.database)
     try:
         worker = Worker(store, backend or FakeBackend(), storage_dir, clock)
     except BaseException:

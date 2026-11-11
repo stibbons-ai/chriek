@@ -23,7 +23,7 @@ Generate every API key and the signing secret independently from a cryptographic
 
 chriek runs only on POSIX hosts and filesystems (Linux, macOS) and refuses to start when a directory above its data is group- or other-writable without the sticky bit, such as a `0775` checkout under umask `002`; see [Storage permissions](#storage-permissions).
 
-`chriek serve` runs the API and the in-process worker in one process (home mode). It listens on `127.0.0.1:8000` by default. A missing setting that has no default, such as `CHRIEK_PUBLIC_URL`, or a setting rejected by configuration validation (see the ranges and formats in [Configuration](#configuration)) stops it before it opens the database or a port, with exit code 2 and a message that names the variable but never prints secret values or the rejected `CHRIEK_PUBLIC_URL`. Values that aren't validated, such as an unresolvable `CHRIEK_HOST`, fail later, when the server binds.
+`chriek serve` runs the API and the in-process worker in one process (home mode). It listens on `127.0.0.1:8000` by default. A missing setting that has no default, such as `CHRIEK_PUBLIC_URL`, or a setting rejected by configuration validation (see the ranges and formats in [Configuration](#configuration)) stops it before it opens the database or a port, with exit code 2 and a message that names the variable but never prints secret values or the rejected `CHRIEK_PUBLIC_URL`. A database that can't be opened or reached stops it with exit code 1 and `chriek: database error: ` followed by the driver's message, with the database password masked as `***`. Values that aren't validated, such as an unresolvable `CHRIEK_HOST`, fail later, when the server binds.
 
 Every environment variable whose name starts with `CHRIEK_` (in any letter case) must be one of the settings in [Configuration](#configuration); any other, such as a misspelt `CHRIEK_TLS_CERTFLE`, stops startup the same way, naming the variable but never its value. Earlier versions ignored unknown `CHRIEK_` names, so a leftover or misspelt one in an existing deployment now stops startup until you remove or correct it. On Kubernetes, a Service named `chriek` or starting with `chriek-` (such as `chriek-web`) can inject variables like `CHRIEK_WEB_SERVICE_HOST` into pods in its namespace; set `enableServiceLinks: false` in the pod spec, or rename the Service. Other variables, such as uvicorn's `FORWARDED_ALLOW_IPS`, are unaffected.
 
@@ -86,7 +86,8 @@ All configuration comes from environment variables.
 | `CHRIEK_SIGNING_SECRET` | required | HMAC secret for download URLs, at least 32 characters. Changing it invalidates every issued URL (polling the job again mints new ones). Anyone who knows it can sign download URLs, so it must not be one of the API keys: startup rejects a signing secret equal to any key or name in `CHRIEK_API_KEYS`. |
 | `CHRIEK_PUBLIC_URL` | required | Public base URL of download links, `http(s)://host[:port][/prefix]`, for example `https://images.example/chriek`. Final `/` characters are optional and ignored. The host is a DNS name, a dotted-decimal IPv4 address such as `192.0.2.10` or a bracketed IPv6 address; a port must be 1–65535. Hosts that browsers would read as a different IPv4 address (`017.0.0.1`, `2130706433`, `0x7f.1`) or as an invalid one (`1.2.3.4.5`) are rejected. The prefix must not contain `\`, `.` or `..` segments (also percent-encoded as `%2e`), which clients rewrite. Only printable ASCII is accepted (no whitespace or control characters; write internationalized host names in punycode), with no user name or password, query (`?`) or fragment (`#`). See [Public URL and reverse proxies](#public-url-and-reverse-proxies). |
 | `CHRIEK_URL_TTL_SECONDS` | `900` | Lifetime of a download URL, 1–604800 seconds. |
-| `CHRIEK_DB_PATH` | `chriek-data/chriek.db` | SQLite database file, used literally (`?` and `%20` are ordinary filename characters); missing parent directories are created private. Its parent must be a dedicated directory; see [Storage permissions](#storage-permissions). Put it on a volume to keep jobs across restarts. The exact value `:memory:` (or `./:memory:`) selects an ephemeral in-memory database instead; see [In-memory database](#in-memory-database). |
+| `CHRIEK_DATABASE_URL` | unset | Postgres database, `postgresql://user:password@host:5432/dbname` (or `postgresql+psycopg://…`; chriek always uses the psycopg 3 driver). When set, it takes precedence and `CHRIEK_DB_PATH` is ignored. Set but empty or malformed, or with another scheme, is a configuration error. See [Postgres](#postgres). |
+| `CHRIEK_DB_PATH` | `chriek-data/chriek.db` | SQLite database file, used when `CHRIEK_DATABASE_URL` is unset. Used literally (`?` and `%20` are ordinary filename characters); missing parent directories are created private. Its parent must be a dedicated directory; see [Storage permissions](#storage-permissions). Put it on a volume to keep jobs across restarts. The exact value `:memory:` (or `./:memory:`) selects an ephemeral in-memory database instead; see [In-memory database](#in-memory-database). |
 | `CHRIEK_STORAGE_DIR` | `chriek-data/images` | Dedicated directory for generated PNGs, one subdirectory per job; see [Storage permissions](#storage-permissions). |
 | `CHRIEK_HOST` | `127.0.0.1` | Listen address. |
 | `CHRIEK_ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` in `proxy` mode | `proxy` mode only: comma-separated host names and IP addresses (IPv6 in brackets, as in `[::1]`) that requests must name in their `Host` header; see [Behind a reverse proxy](#behind-a-reverse-proxy-chriek_auth_modeproxy). Exact names only: no wildcards, empty entries, schemes, ports or paths. Setting it in `api-key` mode stops startup. |
@@ -99,7 +100,19 @@ All configuration comes from environment variables.
 | `CHRIEK_MAX_PIXELS` | `1048576` | Maximum `width * height` (256–67108864). |
 | `CHRIEK_MAX_PROMPT_CHARS` | `2000` | Maximum prompt length in characters (1–100000). |
 
-Relative paths resolve against the working directory. The database schema is created on first start, and indexes added by newer chriek versions are created in an existing database file on start, keeping its jobs; there are no other migrations yet.
+Relative paths resolve against the working directory. The database schema (SQLite or Postgres) is created on first start, and indexes added by newer chriek versions are created in an existing database on start, keeping its jobs; there are no other migrations yet.
+
+### Postgres
+
+Set `CHRIEK_DATABASE_URL` to keep jobs in Postgres instead of a SQLite file:
+
+```sh
+export CHRIEK_DATABASE_URL="postgresql://chriek:$CHRIEK_DB_PASSWORD@db.internal:5432/chriek?sslmode=verify-full"
+```
+
+- **Credentials.** The URL carries the database password, so treat the whole variable as a secret: inject it from your secret store or an environment file readable only by the service, not from a command line or a committed file. Percent-encode reserved characters in the user name and password (`@` as `%40`, `:` as `%3A`, `/` as `%2F`). Query parameters go to libpq unchanged, so `sslmode`, `sslrootcert` and the like work as in any Postgres client; use TLS (`sslmode=verify-full`) when the database isn't on the same host or a private network. chriek never logs the variable.
+- **Database and role.** Create an empty database and a role that owns it (or may create tables in its default schema); chriek creates its `jobs` and `images` tables on first start and never drops anything.
+- **Limits of this release.** Postgres replaces only the job database. Run exactly **one** `chriek serve` per database: on startup, each process fails every job still `running` (see [Job behaviour](#job-behaviour)), so a second process would fail the first one's job in progress, and both would run queued jobs at once. PNGs still live in `CHRIEK_STORAGE_DIR` on the local disk of that one process. There is no tool to copy existing jobs from a SQLite file into Postgres.
 
 ### In-memory database
 
@@ -245,10 +258,10 @@ Returns `200 {"status": "ok"}`. If the worker could not save a job's result (suc
 
 ## Job behaviour
 
-- **Queue.** Jobs are stored in SQLite and run one at a time, oldest first, by a single worker thread in the `chriek serve` process. There is one global queue across all owners: no round-robin or per-owner fairness. If owner A submits A1 and A2 before owner B submits B1, both A jobs run before B1; an A3 submitted after B1 runs after B1, even if A1 and A2 finish first. An admitted job is delayed only by jobs submitted before it, never by later ones, but chriek promises no maximum wait: a long or stalled earlier job holds up everything behind it.
+- **Queue.** Jobs are stored in the database (SQLite or Postgres) and run one at a time, oldest first, by a single worker thread in the `chriek serve` process. There is one global queue across all owners: no round-robin or per-owner fairness. If owner A submits A1 and A2 before owner B submits B1, both A jobs run before B1; an A3 submitted after B1 runs after B1, even if A1 and A2 finish first. An admitted job is delayed only by jobs submitted before it, never by later ones, but chriek promises no maximum wait: a long or stalled earlier job holds up everything behind it.
 - **Admission cap.** Each owner may have at most `CHRIEK_MAX_QUEUED_JOBS` queued jobs; see [Queue limit](#queue-limit). The cap does not bound how long jobs run or how long another owner's job waits, and is no SLA.
 - **All or nothing.** If any image of a job fails, the job fails and the images it already rendered are discarded. A job is never partly successful.
-- **Restarts.** With a database file, queued jobs survive a restart and run afterwards. A job that was `running` when the process stopped is marked `failed` on the next start (`interrupted: the server stopped while this job was running`) and isn't retried. An [in-memory database](#in-memory-database) starts empty instead.
+- **Restarts.** With a database file or Postgres, queued jobs survive a restart and run afterwards. A job that was `running` when the process stopped is marked `failed` on the next start (`interrupted: the server stopped while this job was running`) and isn't retried. An [in-memory database](#in-memory-database) starts empty instead.
 - **Unsaved results stop the worker.** If saving a finished job's result to the database fails, the worker logs the error and stops instead of moving on: that job stays `running`, no later job runs, jobs accepted before the failure stay `queued`, new submissions are rejected with `503` (see [`POST /jobs`](#post-jobs)), and `GET /health` returns `503`. Fix the database or disk problem and restart `chriek serve`; restart recovery then fails the stuck job as interrupted, the queued jobs run, and submissions are accepted again. Rejected submissions were never stored, so they don't run after the restart.
 - **AI disclosure in every PNG**, always on: PNG text chunks `AI-Generated: true`, `Model`, `Model-Revision`, `Seed` and `Description`, plus XMP (`XML:com.adobe.xmp`) with IPTC `Iptc4xmpExt:DigitalSourceType` = `http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia`. With the fake backend, `Model` is `chriek-fake-backend` and `Model-Revision` is `fake-v1`.
 - No retention: generated files stay in `CHRIEK_STORAGE_DIR` until you delete them.
@@ -296,6 +309,14 @@ uv sync --locked && uv run --locked pre-commit run jscpd --all-files && uv run r
 The TLS tests generate throwaway certificates with the `openssl` command, so it must be on `PATH` (OpenSSL or LibreSSL).
 
 Application tests drive chriek through its HTTP API and the installed `chriek` command, with the fake backend. Some check what HTTP can't reach directly: they parse configuration, call the job store, inject store write failures, or open the SQLite file to read back stored jobs, their owners and indexes, hold its write lock from another connection, or prepare a database without a newer index; direct store, worker, app and `chriek.storage` checks cover where storage privacy must hold without the CLI. Another user's ownership is simulated by patching `os.stat`/`os.lstat`, so the suite runs as one user. Proxy tests use chriek's internal shared-owner name to check the owner stored for proxy-mode jobs and that no API key name can own them. Some installed-command tests send raw HTTP requests over a socket for `Host` headers an HTTP client won't send. `tests/test_dependency_audit.py` checks the dependency-audit gate's boundaries offline: injected pip-audit reports, and the real pinned pip-audit with only its HTTP transport answering canned PyPI responses.
+
+The suite runs on SQLite by default. To run it against Postgres as CI does, point `CHRIEK_TEST_POSTGRES_URL` at a disposable server with a superuser (or a role allowed to create databases). Each test creates its own `chriek_test_<random>` database and drops it afterwards; the fixtures drop no other database. Tests marked `sqlite` (in-memory and file-path behaviour) stay on SQLite. With Docker:
+
+```sh
+docker run --rm -d --name chriek-test-postgres -e POSTGRES_PASSWORD=chriek -p 127.0.0.1:55432:5432 postgres:18
+uv run pytest && CHRIEK_TEST_POSTGRES_URL=postgresql://postgres:chriek@127.0.0.1:55432/postgres uv run pytest
+docker stop chriek-test-postgres   # --rm deletes the container and its data
+```
 
 ### Dependency audit
 

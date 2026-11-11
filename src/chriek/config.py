@@ -10,7 +10,11 @@ from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import ArgumentError
+
 MIN_SECRET_LENGTH = 32
+POSTGRES_DRIVERS = ("postgresql", "postgresql+psycopg")
 KEY_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 # Host is a DNS name, an IPv4 address or a bracketed IPv6 literal; port is optional digits.
 # The bracket class excludes IPvFuture and zone IDs; urlsplit rejects other invalid literals.
@@ -79,7 +83,7 @@ class Tls:
 
 @dataclass(frozen=True)
 class Settings:
-    db_path: Path
+    database: Path | URL  # SQLite file (or ":memory:") or a Postgres URL
     public_url: str  # scheme://authority[/prefix], no trailing slash
     storage_dir: Path
     auth_mode: AuthMode
@@ -123,7 +127,7 @@ class Settings:
             )
         return cls(
             public_url=_public_url(env.get("CHRIEK_PUBLIC_URL", "")),
-            db_path=Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db")),
+            database=_database(env),
             storage_dir=Path(env.get("CHRIEK_STORAGE_DIR", "chriek-data/images")),
             auth_mode=auth_mode,
             api_keys=api_keys,
@@ -139,6 +143,23 @@ class Settings:
                 else ()
             ),
         )
+
+
+def _database(env: Mapping[str, str]) -> Path | URL:
+    """CHRIEK_DATABASE_URL (Postgres) takes precedence over CHRIEK_DB_PATH (SQLite)."""
+    raw = env.get("CHRIEK_DATABASE_URL")
+    if raw is None:
+        return Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db"))
+    # The URL carries the database password: errors name the variable, never the value.
+    try:
+        url = make_url(raw)
+    except ArgumentError, ValueError:
+        raise ConfigError("CHRIEK_DATABASE_URL is not a valid database URL") from None
+    if url.drivername not in POSTGRES_DRIVERS:
+        raise ConfigError(
+            "CHRIEK_DATABASE_URL must start with postgresql:// or postgresql+psycopg://"
+        )
+    return url
 
 
 def _int(env: Mapping[str, str], name: str, default: int, low: int, high: int) -> int:

@@ -1,12 +1,17 @@
 """Shared test helpers. Most tests talk to chriek through its HTTP API or the installed CLI;
-others check configuration, the store, the worker or the SQLite file directly, including where
-storage privacy must hold without the CLI (see README.md)."""
+others check configuration, the store, the worker or the database directly, including where
+storage privacy must hold without the CLI (see README.md).
+
+Every test runs on SQLite unless CHRIEK_TEST_POSTGRES_URL names a disposable Postgres server;
+then each test not marked `sqlite` gets its own fresh database there, dropped afterwards.
+"""
 
 import os
 import sqlite3
 import stat
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
@@ -14,10 +19,13 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import Engine, create_engine, make_url, text
 
 from chriek.api import create_app
 from chriek.backend import FakeBackend
 from chriek.config import Settings
+
+POSTGRES_URL = os.environ.get("CHRIEK_TEST_POSTGRES_URL")
 
 ALICE_KEY = "alice-key-0123456789abcdefghijklmnopqrstuvwxyz"
 BOB_KEY = "bob-key-0123456789abcdefghijklmnopqrstuvwxyz"
@@ -33,8 +41,11 @@ BACKEND_SECRET = (
 SMALL = {"width": 16, "height": 16}  # cheapest valid image size
 
 
+_postgres_database_url: str | None = None  # the running test's own Postgres database
+
+
 def base_env(tmp_path: Path) -> dict[str, str]:
-    return {
+    env = {
         "CHRIEK_DB_PATH": str(tmp_path / "db" / "chriek.db"),
         "CHRIEK_STORAGE_DIR": str(tmp_path / "images"),
         "CHRIEK_API_KEYS": f"alice:{ALICE_KEY},bob:{BOB_KEY}",
@@ -42,6 +53,40 @@ def base_env(tmp_path: Path) -> dict[str, str]:
         # TestClient's origin; `chriek serve` tests replace it with the served port.
         "CHRIEK_PUBLIC_URL": "http://testserver",
     }
+    if _postgres_database_url:
+        # CHRIEK_DB_PATH stays set: the URL must take precedence over it.
+        env["CHRIEK_DATABASE_URL"] = _postgres_database_url
+    return env
+
+
+def pytest_report_header() -> str:
+    return f"chriek test database: {'Postgres' if POSTGRES_URL else 'SQLite'}"
+
+
+@pytest.fixture(scope="session")
+def postgres_admin() -> Iterator[Engine]:
+    engine = create_engine(make_url(POSTGRES_URL), isolation_level="AUTOCOMMIT")
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture(autouse=True)
+def database(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[None]:
+    global _postgres_database_url
+    if POSTGRES_URL is None or request.node.get_closest_marker("sqlite"):
+        yield
+        return
+
+    admin: Engine = request.getfixturevalue("postgres_admin")
+    name = f"chriek_test_{uuid.uuid4().hex}"  # only databases this fixture created get dropped
+    with admin.connect() as connection:
+        connection.execute(text(f'CREATE DATABASE "{name}"'))
+    _postgres_database_url = admin.url.set(database=name).render_as_string(hide_password=False)
+    yield
+    _postgres_database_url = None
+    with admin.connect() as connection:
+        connection.execute(text(f'DROP DATABASE "{name}" WITH (FORCE)'))
+    assert not (tmp_path / "db").exists(), "a Postgres test wrote a SQLite database"
 
 
 def connect_db(tmp_path: Path) -> closing[sqlite3.Connection]:

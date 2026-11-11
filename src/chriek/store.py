@@ -1,11 +1,13 @@
-"""SQLite job store. Status changes are conditional updates; a stale writer can't override them."""
+"""Job store on SQLite or Postgres. Status changes are conditional updates; a stale writer can't
+override them."""
 
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     CheckConstraint,
     ForeignKey,
     Index,
@@ -29,6 +31,8 @@ from chriek.storage import private_database
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
 MEMORY_DATABASE = ":memory:"  # SQLite's sentinel for an ephemeral database
+# Seeds reach 2**32 - 1, which overflows a Postgres INTEGER.
+Seed = Annotated[int, mapped_column(BigInteger)]
 
 
 class Base(DeclarativeBase):
@@ -52,7 +56,7 @@ class Job(Base):
     image_count: Mapped[int]
     width: Mapped[int]
     height: Mapped[int]
-    seed: Mapped[int]
+    seed: Mapped[Seed]
     created_at: Mapped[float]
     started_at: Mapped[float | None]
     finished_at: Mapped[float | None]
@@ -68,13 +72,12 @@ class Image(Base):
 
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), primary_key=True)
     index: Mapped[int] = mapped_column(primary_key=True)
-    seed: Mapped[int]
+    seed: Mapped[Seed]
 
 
 class JobStore:
-    def __init__(self, db_path: Path) -> None:
-        self._engine = _create_engine(db_path)
-        event.listen(self._engine, "connect", _configure_sqlite)
+    def __init__(self, database: Path | URL) -> None:
+        self._engine = _create_engine(database)
         Base.metadata.create_all(self._engine)
         # create_all skips existing tables and so their indexes: add indexes introduced
         # after a database file was created. Idempotent; existing rows stay untouched.
@@ -201,21 +204,30 @@ class JobStore:
         ).one_or_none()
 
 
-def _create_engine(db_path: Path) -> Engine:
-    if str(db_path) == MEMORY_DATABASE:  # Path("./:memory:") normalizes to ":memory:" too
+def _create_engine(database: Path | URL) -> Engine:
+    if isinstance(database, URL):
+        return create_engine(database.set(drivername="postgresql+psycopg"))
+    return _sqlite_engine(database)
+
+
+def _sqlite_engine(path: Path) -> Engine:
+    if str(path) == MEMORY_DATABASE:  # Path("./:memory:") normalizes to ":memory:" too
         # An in-memory database exists only inside its one connection. A single-slot pool
         # keeps that connection for the store's lifetime and lends it to one session at a
         # time, so HTTP and worker threads share the data without interleaving transactions.
-        return create_engine(
+        engine = create_engine(
             URL.create("sqlite", database=MEMORY_DATABASE),
             poolclass=QueuePool,
             pool_size=1,
             max_overflow=0,
             connect_args={"check_same_thread": False},
         )
-    db_path = private_database(db_path)
-    # URL.create keeps the filename literal; an f-string URL would parse '?' and '%xx'.
-    return create_engine(URL.create("sqlite", database=str(db_path)))
+    else:
+        path = private_database(path)
+        # URL.create keeps the filename literal; an f-string URL would parse '?' and '%xx'.
+        engine = create_engine(URL.create("sqlite", database=str(path)))
+    event.listen(engine, "connect", _configure_sqlite)
+    return engine
 
 
 def _configure_sqlite(dbapi_connection, _record) -> None:

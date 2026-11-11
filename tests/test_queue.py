@@ -2,10 +2,12 @@
 
 import io
 import logging
+import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 
 import pytest
 from conftest import (
@@ -13,6 +15,7 @@ from conftest import (
     BOB,
     CountingBackend,
     FailingBackend,
+    FakeClock,
     GatedBackend,
     connect_db,
     db_dump,
@@ -106,6 +109,67 @@ def test_jobs_and_downloads_survive_a_clean_restart(tmp_path):
         assert after.get(again["images"][0]["url"]).status_code == 200
 
 
+def test_boundary_seeds_and_precise_timestamps_survive_a_restart(tmp_path):
+    # The largest seeds overflow a 32-bit INTEGER; microseconds need double precision.
+    clock = FakeClock(1_800_000_000.123457)
+    with running(tmp_path, clock=clock) as before:
+        submitted = submit(before, image_count=2, seed=2**32 - 2, width=16, height=16)
+        body = wait_for(before, submitted["id"])
+        assert body["status"] == "succeeded", body
+
+    with running(tmp_path, clock=clock) as after:
+        again = after.get(f"/jobs/{body['id']}", headers=ALICE).json()
+
+    assert again["params"]["seed"] == 2**32 - 2
+    assert [image["seed"] for image in again["images"]] == [2**32 - 2, 2**32 - 1]
+    expected = datetime.fromtimestamp(clock.now, UTC).isoformat()
+    assert expected.endswith(".123457+00:00")
+    assert [again[key] for key in ("created_at", "started_at", "finished_at")] == [expected] * 3
+
+
+# The schema created by chriek before Postgres support (base 06f0fbe), verbatim.
+PRE_POSTGRES_SQLITE_SCHEMA = """
+CREATE TABLE jobs (
+    seq INTEGER NOT NULL, id VARCHAR(36) NOT NULL, owner VARCHAR(64) NOT NULL,
+    status VARCHAR(16) NOT NULL, prompt TEXT NOT NULL, image_count INTEGER NOT NULL,
+    width INTEGER NOT NULL, height INTEGER NOT NULL, seed INTEGER NOT NULL,
+    created_at DOUBLE NOT NULL, started_at DOUBLE, finished_at DOUBLE, error TEXT,
+    run_record JSON, PRIMARY KEY (seq),
+    CHECK (status IN ('queued', 'running', 'succeeded', 'failed')), UNIQUE (id)
+);
+CREATE INDEX ix_jobs_status ON jobs (status);
+CREATE TABLE images (
+    job_id VARCHAR(36) NOT NULL, "index" INTEGER NOT NULL, seed INTEGER NOT NULL,
+    PRIMARY KEY (job_id, "index"), FOREIGN KEY(job_id) REFERENCES jobs (id)
+);
+"""
+
+
+@pytest.mark.sqlite
+def test_existing_sqlite_database_keeps_working(tmp_path):
+    db_path = tmp_path / "db" / "chriek.db"
+    db_path.parent.mkdir()
+    job_id = str(uuid.uuid7())
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(PRE_POSTGRES_SQLITE_SCHEMA)
+        connection.execute(
+            "INSERT INTO jobs (id, owner, status, prompt, image_count, width, height, seed,"
+            " created_at) VALUES (?, 'alice', 'queued', 'old', 2, 16, 16, ?, 1800000000.5)",
+            (job_id, 2**32 - 2),
+        )
+    connection.close()
+
+    with running(tmp_path) as client:
+        old = wait_for(client, job_id)
+        assert old["status"] == "succeeded", old
+        assert [image["seed"] for image in old["images"]] == [2**32 - 2, 2**32 - 1]
+        assert client.get(old["images"][1]["url"]).status_code == 200
+        assert client.get(f"/jobs/{job_id}", headers=BOB).status_code == 404
+        new = wait_for(client, submit(client, width=16, height=16)["id"])
+        assert new["status"] == "succeeded", new
+
+
+@pytest.mark.sqlite
 @pytest.mark.parametrize("filename", ["chriek?home.db", "chriek%20home.db"])
 def test_database_path_is_used_literally_across_restart(tmp_path, filename):
     db_dir = tmp_path / "db"
@@ -122,6 +186,7 @@ def test_database_path_is_used_literally_across_restart(tmp_path, filename):
     assert sorted(path.name for path in db_dir.iterdir() if path.is_file()) == [filename]
 
 
+@pytest.mark.sqlite
 @pytest.mark.parametrize("sentinel", [":memory:", "./:memory:"])
 def test_memory_database_serves_one_lifetime_and_resets_on_restart(tmp_path, monkeypatch, sentinel):
     # A shared (0755) working directory: the database checks must skip it, not refuse it.
@@ -148,6 +213,7 @@ def test_memory_database_serves_one_lifetime_and_resets_on_restart(tmp_path, mon
     assert tree_state(cwd) == before_cwd
 
 
+@pytest.mark.sqlite
 def test_memory_database_keeps_every_write_under_concurrent_polling(tmp_path):
     backend = GatedBackend()
     with running(tmp_path, backend=backend, CHRIEK_DB_PATH=":memory:") as client:

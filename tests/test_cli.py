@@ -64,6 +64,7 @@ def exit_output(process: subprocess.Popen) -> str:
 
 
 EMOJI_KEY = "\N{OTTER}" * 32
+DB_PASSWORD = "db-password-0123456789"
 LATIN1_KEY = "\N{LATIN SMALL LETTER E WITH ACUTE}" * 32
 CONTROL_KEY = ALICE_KEY + "\x07"
 MARKER = "public-url-secret-marker"
@@ -78,7 +79,14 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
     assert process.returncode == 2
     assert output.startswith("chriek: configuration error: ")
     assert message in output
-    for secret in (ALICE_KEY, BOB_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
+    for secret in (
+        ALICE_KEY,
+        BOB_KEY,
+        SIGNING_SECRET,
+        "short-secret-key",
+        "short-signing-secret",
+        DB_PASSWORD,
+    ):
         assert secret not in output
     for secret in (EMOJI_KEY, LATIN1_KEY):
         assert secret[:2] not in output
@@ -237,6 +245,15 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
             {"CHRIEK_AUTH_MODE": "proxy", "CHRIEK_API_KEYS": None, "CHRIEK_ALLOWED_HOSTS": "*"},
             "CHRIEK_ALLOWED_HOSTS entry 1",
         ),
+        (
+            {"CHRIEK_DATABASE_URL": f"postgresql://chriek:{DB_PASSWORD}@db:port/chriek"},
+            "CHRIEK_DATABASE_URL is not a valid database URL",
+        ),
+        ({"CHRIEK_DATABASE_URL": ""}, "CHRIEK_DATABASE_URL is not a valid database URL"),
+        (
+            {"CHRIEK_DATABASE_URL": f"mysql://chriek:{DB_PASSWORD}@db/chriek"},
+            "CHRIEK_DATABASE_URL must start with postgresql:// or postgresql+psycopg://",
+        ),
     ],
 )
 def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrides, message):
@@ -270,6 +287,28 @@ def test_missing_public_url_exits_2_without_fallback(tmp_path):
     assert process.returncode == 2
     assert output.startswith("chriek: configuration error: CHRIEK_PUBLIC_URL is required")
     assert not (tmp_path / "db").exists(), "nothing may start without a public URL"
+
+
+@pytest.mark.parametrize(
+    ("host", "detail"),
+    [
+        ("127.0.0.1:1", "connection failed: "),
+        # A driver message that echoes a password-bearing host name still hides the password.
+        (f"{DB_PASSWORD}.invalid", "'***.invalid'"),
+    ],
+    ids=["refused", "echoed"],
+)
+def test_unreachable_postgres_exits_1_without_leaking_the_password(tmp_path, host, detail):
+    url = f"postgresql://chriek:{DB_PASSWORD}@{host}/chriek"
+    process = serve(base_env(tmp_path) | {"CHRIEK_DATABASE_URL": url})
+    output, _ = process.communicate(timeout=60)
+
+    assert process.returncode == 1, output
+    assert output.startswith("chriek: database error: "), output
+    assert detail in output
+    assert DB_PASSWORD not in output
+    assert "Traceback" not in output
+    assert not (tmp_path / "db").exists(), "CHRIEK_DATABASE_URL takes precedence over the path"
 
 
 def free_port() -> int:
@@ -332,17 +371,21 @@ def test_chriek_serve_round_trip(tmp_path, signing_secret):
             assert png.size == (1024, 1024)
             assert png.text["Seed"] == str(image["seed"])
         job = body["id"]
-        # Checked while serving, so the open database's WAL and SHM sidecars exist.
-        assert modes(tmp_path) == {
-            "db": 0o700,
-            "db/chriek.db": 0o600,
-            "db/chriek.db-wal": 0o600,
-            "db/chriek.db-shm": 0o600,
+        expected = {
             "images": 0o700,
             f"images/{job}": 0o700,
             f"images/{job}/0.png": 0o600,
             f"images/{job}/1.png": 0o600,
         }
+        if "CHRIEK_DATABASE_URL" not in env:
+            # Checked while serving, so the open database's WAL and SHM sidecars exist.
+            expected |= {
+                "db": 0o700,
+                "db/chriek.db": 0o600,
+                "db/chriek.db-wal": 0o600,
+                "db/chriek.db-shm": 0o600,
+            }
+        assert modes(tmp_path) == expected
 
 
 def test_chriek_serve_shipped_defaults_keep_jobs_private_across_restart(tmp_path):
@@ -364,15 +407,19 @@ def test_chriek_serve_shipped_defaults_keep_jobs_private_across_restart(tmp_path
         assert again["status"] == "succeeded"
         download = client.get(again["images"][0]["url"])
         job = body["id"]
-        assert modes(project) == {
+        expected = {
             "chriek-data": 0o700,
-            "chriek-data/chriek.db": 0o600,
-            "chriek-data/chriek.db-wal": 0o600,
-            "chriek-data/chriek.db-shm": 0o600,
             "chriek-data/images": 0o700,
             f"chriek-data/images/{job}": 0o700,
             f"chriek-data/images/{job}/0.png": 0o600,
         }
+        if "CHRIEK_DATABASE_URL" not in env:
+            expected |= {
+                "chriek-data/chriek.db": 0o600,
+                "chriek-data/chriek.db-wal": 0o600,
+                "chriek-data/chriek.db-shm": 0o600,
+            }
+        assert modes(project) == expected
 
     assert download.status_code == 200
     assert download.content == first
@@ -380,6 +427,7 @@ def test_chriek_serve_shipped_defaults_keep_jobs_private_across_restart(tmp_path
     assert stat.S_IMODE(project.stat().st_mode) == 0o755
 
 
+@pytest.mark.sqlite
 def test_chriek_serve_memory_database_runs_jobs_and_resets_on_restart(tmp_path):
     env = base_env(tmp_path) | {"CHRIEK_DB_PATH": ":memory:"}
     with served(env, cwd=tmp_path) as client:
