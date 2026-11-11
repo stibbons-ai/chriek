@@ -192,15 +192,53 @@ def test_valid_unicode_prompt_is_persisted_and_rendered(client, prompt_json, pro
 
 
 @pytest.mark.parametrize(
+    ("payload", "expected_prompt"),
+    [
+        (
+            b'\xef\xbb\xbf{"prompt": "bom lighthouse", "image_count": 2, "seed": 19, '
+            b'"width": 32, "height": 16}',
+            "bom lighthouse",
+        ),
+        (
+            '{"prompt": "utf16 lighthouse", "image_count": 2, "seed": 19, '
+            '"width": 32, "height": 16}'.encode("utf-16"),
+            "utf16 lighthouse",
+        ),
+    ],
+    ids=["utf8-bom", "utf16"],
+)
+def test_json_bom_and_utf16_encodings_are_accepted(client, payload, expected_prompt):
+    response = client.post(
+        "/jobs",
+        headers=ALICE | {"Content-Type": "application/json"},
+        content=payload,
+    )
+
+    assert response.status_code == 202, response.text
+    body = wait_for(client, response.json()["id"])
+    assert body["status"] == "succeeded"
+    assert body["params"] == {
+        "prompt": expected_prompt,
+        "image_count": 2,
+        "seed": 19,
+        "width": 32,
+        "height": 16,
+        "reference_count": 0,
+    }
+
+
+@pytest.mark.parametrize(
     ("content", "expected"),
     [
         (b"not json", 422),
+        (b"\xff\xfe", 422),
+        (b"", 422),
         # Python's JSON parser refuses integers this long; FastAPI answers 400.
         (b'{"prompt": "x", "seed": 1' + b"0" * 5000 + b"}", 400),
         # JSON bodies must be valid UTF-8; FastAPI answers 400 before validation.
         (b'{"prompt": "a light\xffhouse"}', 400),
     ],
-    ids=["not-json", "5000-digit-seed", "invalid-utf8"],
+    ids=["not-json", "empty-utf16-bom", "empty-body", "5000-digit-seed", "invalid-utf8"],
 )
 def test_unparseable_body_is_rejected(client, content, expected):
     response = client.post(

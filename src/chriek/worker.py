@@ -90,14 +90,28 @@ class Worker:
         started = self._clock()
         partial = self._storage_dir / f"{job.id}.partial"
         final = self._storage_dir / job.id
-        index = 0
         references: list[Image.Image] = []
+        for ref in job.references:
+            try:
+                with Image.open(reference_path(self._storage_dir, job.id, ref.index)) as opened:
+                    references.append(opened.copy())
+            except Exception as exc:
+                reason = (
+                    exc.strerror
+                    if isinstance(exc, OSError) and exc.strerror
+                    else type(exc).__name__
+                )
+                log.exception("job %s failed loading reference %d", job.id, ref.index)
+                error = (
+                    f"reference {ref.index + 1} of {len(job.references)} "
+                    f"could not be loaded: {reason}"
+                )[:500]
+                self._store.fail(job.id, error, self._run_record(started), self._clock())
+                return
+        index = 0
         try:
             shutil.rmtree(partial, ignore_errors=True)
             partial.mkdir(parents=True)
-            for ref in job.references:
-                with Image.open(reference_path(self._storage_dir, job.id, ref.index)) as opened:
-                    references.append(opened.copy())
             for index in range(job.image_count):
                 seed = job.seed + index
                 image = self._backend.render(job.prompt, job.width, job.height, seed, references)
@@ -125,7 +139,11 @@ class Worker:
 
     def _remove_outputs(self, job_id: str, image_count: int) -> None:
         for i in range(image_count):
-            image_path(self._storage_dir, job_id, i).unlink(missing_ok=True)
+            path = image_path(self._storage_dir, job_id, i)
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log.exception("could not remove unpublished output %s for job %s", path, job_id)
 
     def _run_record(self, started: float) -> dict[str, object]:
         finished = self._clock()

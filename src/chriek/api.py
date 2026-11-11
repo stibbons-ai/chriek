@@ -6,16 +6,21 @@ import math
 import re
 import secrets
 import shutil
+import struct
 import time
 import uuid
+import warnings
+import zlib
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.routing import APIRoute
 from PIL import Image, ImageOps, UnidentifiedImageError
@@ -43,6 +48,22 @@ TOO_DEEP = "<nested too deeply>"
 MAX_SCALAR_FIELD_BYTES = 1024 * 1024
 MAX_FORM_FIELDS = 32
 INTEGER_PATTERN = re.compile(r"[+-]?[0-9]{1,20}")
+ALLOWED_REFERENCE_FORMATS = ("PNG", "JPEG", "WEBP")
+_DECODER_ERRORS = (
+    UnidentifiedImageError,
+    OSError,
+    ValueError,
+    SyntaxError,
+    RuntimeError,
+    struct.error,
+    TypeError,
+    KeyError,
+    IndexError,
+    ZeroDivisionError,
+    OverflowError,
+    EOFError,
+    zlib.error,
+)
 
 
 class JobRequest(BaseModel):
@@ -57,6 +78,37 @@ class JobRequest(BaseModel):
 
 SCALAR_FIELDS = tuple(JobRequest.model_fields)
 _JOB_REQUEST_ADAPTER = TypeAdapter(JobRequest)
+_JOB_REQUEST_SCHEMA = JobRequest.model_json_schema(ref_template="#/components/schemas/{model}")
+_JOBS_POST_OPENAPI: dict[str, Any] = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/JobRequest"}},
+            "multipart/form-data": {
+                "schema": {
+                    **_JOB_REQUEST_SCHEMA,
+                    "title": "Body_submit_job_jobs_post",
+                    "properties": {
+                        **_JOB_REQUEST_SCHEMA["properties"],
+                        "references": {
+                            "type": "array",
+                            "items": {"type": "string", "format": "binary"},
+                            "title": "References",
+                        },
+                    },
+                }
+            },
+        },
+    },
+    "responses": {
+        "422": {
+            "description": "Validation Error",
+            "content": {
+                "application/json": {"schema": {"$ref": "#/components/schemas/HTTPValidationError"}}
+            },
+        }
+    },
+}
 
 
 def create_app(
@@ -83,6 +135,16 @@ def create_app(
         store.close()
 
     app = FastAPI(title="chriek", lifespan=lifespan)
+
+    def custom_openapi() -> dict[str, Any]:
+        if app.openapi_schema is None:
+            schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
+            schemas = schema.setdefault("components", {}).setdefault("schemas", {})
+            schemas["JobRequest"] = _JOB_REQUEST_SCHEMA
+            app.openapi_schema = schema
+        return app.openapi_schema
+
+    app.openapi = custom_openapi  # type: ignore[method-assign]
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -139,30 +201,36 @@ def create_app(
             return {"status": "error", "detail": WORKER_STOPPED}
         return {"status": "ok"}
 
-    @jobs.post("/jobs", status_code=status.HTTP_202_ACCEPTED)
+    @jobs.post("/jobs", status_code=status.HTTP_202_ACCEPTED, openapi_extra=_JOBS_POST_OPENAPI)
     async def submit_job(owner: Owner, request: Request, response: Response) -> dict[str, Any]:
-        body, references = await _parse_submission(request, settings.limits)
-        seed = body.seed
-        if seed is None:
-            seed = secrets.randbelow(MAX_SEED - body.image_count + 2)
-        job_id = str(uuid.uuid7())
-        try:
-            write_references(storage_dir, job_id, references)
-            job = store.create(
-                job_id=job_id,
-                owner=owner,
-                prompt=body.prompt,
-                image_count=body.image_count,
-                width=body.width,
-                height=body.height,
-                seed=seed,
-                reference_count=len(references),
-                now=clock(),
-            )
-        except BaseException:
-            shutil.rmtree(storage_dir / job_id, ignore_errors=True)
-            raise
-        worker.notify()
+        complete_submission = await _stream_submission(request, settings.limits)
+
+        def decode_and_persist() -> Job:
+            body, references = complete_submission()
+            seed = body.seed
+            if seed is None:
+                seed = secrets.randbelow(MAX_SEED - body.image_count + 2)
+            job_id = str(uuid.uuid7())
+            try:
+                write_references(storage_dir, job_id, references)
+                job = store.create(
+                    job_id=job_id,
+                    owner=owner,
+                    prompt=body.prompt,
+                    image_count=body.image_count,
+                    width=body.width,
+                    height=body.height,
+                    seed=seed,
+                    reference_count=len(references),
+                    now=clock(),
+                )
+            except BaseException:
+                shutil.rmtree(storage_dir / job_id, ignore_errors=True)
+                raise
+            worker.notify()
+            return job
+
+        job = await run_in_threadpool(decode_and_persist)
         response.headers["Location"] = f"/jobs/{job.id}"
         return job_body(job, request)
 
@@ -250,21 +318,28 @@ def _limit_errors(body: JobRequest, limits: Limits) -> list[dict[str, Any]]:
     return errors
 
 
-async def _parse_submission(request: Request, limits: Limits) -> tuple[JobRequest, list[bytes]]:
+async def _stream_submission(
+    request: Request, limits: Limits
+) -> Callable[[], tuple[JobRequest, list[bytes]]]:
     content_type, params = parse_options_header(request.headers.get("content-type", ""))
     if content_type == b"multipart/form-data":
-        return await _parse_multipart_job(request, params, limits)
-    return await _parse_json_job(request, content_type, limits), []
-
-
-async def _parse_json_job(request: Request, content_type: bytes, limits: Limits) -> JobRequest:
+        acc = await _stream_multipart_job(request, params, limits)
+        return lambda: _finish_multipart_job(acc, limits)
     body_bytes = await _read_bounded_body(request, limits.max_upload_bytes)
+    return lambda: (_decode_json_job(body_bytes, content_type, limits), [])
+
+
+def _decode_json_job(body_bytes: bytes, content_type: bytes, limits: Limits) -> JobRequest:
+    if not body_bytes:
+        raise RequestValidationError(
+            [{"type": "missing", "loc": ("body",), "msg": "Field required", "input": None}]
+        )
     is_json = content_type == b"application/json" or (
         content_type.startswith(b"application/") and content_type.endswith(b"+json")
     )
-    if body_bytes and is_json:
+    if is_json:
         try:
-            raw: Any = json.loads(body_bytes.decode("utf-8"))
+            raw: Any = json.loads(body_bytes)
         except json.JSONDecodeError as exc:
             raise RequestValidationError(
                 [
@@ -281,10 +356,8 @@ async def _parse_json_job(request: Request, content_type: bytes, limits: Limits)
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "There was an error parsing the body"
             ) from exc
-    elif body_bytes:
-        raw = body_bytes
     else:
-        raw = None
+        raw = body_bytes
     try:
         body = _JOB_REQUEST_ADAPTER.validate_python(raw)
     except ValidationError as exc:
@@ -401,9 +474,9 @@ class _MultipartAccumulator:
         self.ended = True
 
 
-async def _parse_multipart_job(
+async def _stream_multipart_job(
     request: Request, params: dict[bytes, bytes], limits: Limits
-) -> tuple[JobRequest, list[bytes]]:
+) -> _MultipartAccumulator:
     boundary = params.get(b"boundary")
     if not boundary:
         raise _validation_error(("body",), "missing boundary in multipart/form-data")
@@ -429,7 +502,7 @@ async def _parse_multipart_job(
             total_bytes += len(chunk)
             if total_bytes > limits.max_upload_bytes:
                 raise _validation_error(
-                    ("body", "references"),
+                    ("body",),
                     f"upload exceeds maximum size of {limits.max_upload_bytes} bytes",
                 )
             parser.write(chunk)
@@ -439,7 +512,12 @@ async def _parse_multipart_job(
 
     if not acc.ended:
         raise _validation_error(("body",), "incomplete multipart/form-data body")
+    return acc
 
+
+def _finish_multipart_job(
+    acc: _MultipartAccumulator, limits: Limits
+) -> tuple[JobRequest, list[bytes]]:
     body, errors = _build_multipart_job_request(acc.fields)
     if body is not None:
         errors.extend(_limit_errors(body, limits))
@@ -538,34 +616,34 @@ def _decode_reference_png(
             "input": None,
         }
     try:
-        with Image.open(io.BytesIO(data)) as image:
-            width, height = image.size
-            if width <= 0 or height <= 0 or width * height > limits.max_pixels:
-                return None, {
-                    "type": "value_error",
-                    "loc": loc,
-                    "msg": f"reference image {index} exceeds maximum of {limits.max_pixels} pixels",
-                    "input": None,
-                }
-            image.load()
-            ImageOps.exif_transpose(image, in_place=True)
-            rgb = image if image.mode == "RGB" else image.convert("RGB")
-            buf = io.BytesIO()
-            rgb.save(buf, format="PNG")
-            return buf.getvalue(), None
-    except (
-        UnidentifiedImageError,
-        Image.DecompressionBombError,
-        OSError,
-        ValueError,
-        SyntaxError,
-    ):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data), formats=ALLOWED_REFERENCE_FORMATS) as image:
+                width, height = image.size
+                if width <= 0 or height <= 0 or width * height > limits.max_pixels:
+                    raise Image.DecompressionBombError
+                image.load()
+                ImageOps.exif_transpose(image, in_place=True)
+                rgb = image if image.mode == "RGB" else image.convert("RGB")
+    except Image.DecompressionBombError, Image.DecompressionBombWarning:
         return None, {
             "type": "value_error",
             "loc": loc,
-            "msg": f"reference image {index} is not a valid image",
+            "msg": f"reference image {index} exceeds maximum of {limits.max_pixels} pixels",
             "input": None,
         }
+    except _DECODER_ERRORS:
+        return None, {
+            "type": "value_error",
+            "loc": loc,
+            "msg": (
+                f"reference image {index} is not a valid image (supported formats: PNG, JPEG, WebP)"
+            ),
+            "input": None,
+        }
+    buf = io.BytesIO()
+    rgb.save(buf, format="PNG")
+    return buf.getvalue(), None
 
 
 def _validation_error(
