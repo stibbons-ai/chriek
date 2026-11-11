@@ -96,6 +96,22 @@ def test_jobs_and_downloads_survive_a_clean_restart(tmp_path):
         assert after.get(again["images"][0]["url"]).status_code == 200
 
 
+@pytest.mark.parametrize("filename", ["chriek?home.db", "chriek%20home.db"])
+def test_database_path_is_used_literally_across_restart(tmp_path, filename):
+    db_dir = tmp_path / "db"
+    env = {"CHRIEK_DB_PATH": str(db_dir / filename)}
+    with running(tmp_path, **env) as before:
+        body = wait_for(before, submit(before, width=16, height=16)["id"])
+        assert body["status"] == "succeeded"
+
+    with running(tmp_path, **env) as after:
+        again = after.get(f"/jobs/{body['id']}", headers=ALICE).json()
+        assert again["status"] == "succeeded"
+        assert again["params"] == body["params"]
+
+    assert sorted(path.name for path in db_dir.iterdir() if path.is_file()) == [filename]
+
+
 @pytest.mark.parametrize(
     ("store_method", "first_render_fails"),
     [("succeed", False), ("fail", True)],

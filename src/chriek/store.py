@@ -15,6 +15,7 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
@@ -62,7 +63,8 @@ class Image(Base):
 class JobStore:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._engine = create_engine(f"sqlite:///{db_path}")
+        # URL.create keeps the filename literal; an f-string URL would parse '?' and '%xx'.
+        self._engine = create_engine(URL.create("sqlite", database=str(db_path)))
         event.listen(self._engine, "connect", _configure_sqlite)
         Base.metadata.create_all(self._engine)
         self._session = sessionmaker(self._engine, expire_on_commit=False)
