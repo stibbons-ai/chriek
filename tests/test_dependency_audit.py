@@ -1,7 +1,8 @@
 """Boundaries of the fail-closed dependency audit gate (scripts/audit_dependencies.py).
 
-Offline and deterministic: uv runs for real on fixture projects, pip-audit reports are
-injected; real PyPI runs are documented in README.md.
+Offline and deterministic: uv runs for real on fixture projects; pip-audit reports are
+injected, or the real pinned pip-audit runs against canned PyPI HTTP responses. Real PyPI
+runs are documented in README.md.
 """
 
 import importlib.util
@@ -159,14 +160,28 @@ def test_missing_lock_is_an_operational_failure_and_nothing_is_resolved(
 _real_run = subprocess.run
 
 
+def is_pip_audit(command: list[str]) -> bool:
+    return str(audit.PIP_AUDIT) in command
+
+
 def fake_pip_audit(
-    monkeypatch: pytest.MonkeyPatch, returncode: int, report_text: str | None, stderr: str = ""
+    monkeypatch: pytest.MonkeyPatch,
+    returncode: int,
+    report_text: str | None,
+    stderr: str = "",
+    validated: str | None = None,
 ) -> None:
-    """Replace only the pip-audit process: it writes `report_text` where asked; uv runs for real."""
+    """Replace only the pip-audit process; uv runs for real.
+
+    It writes `report_text` where asked and records `validated` as the PyPI responses it
+    checked (default: one per requested package).
+    """
 
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        if "pip_audit" not in command:
+        if not is_pip_audit(command):
             return _real_run(command, **kwargs)  # type: ignore[call-overload]
+        requested = Path(command[command.index("--requirement") + 1]).read_text()
+        Path(command[2]).write_text(requested if validated is None else validated)
         if report_text is not None:
             Path(command[command.index("--output") + 1]).write_text(report_text)
         return subprocess.CompletedProcess(command, returncode, "", stderr)
@@ -231,7 +246,7 @@ def test_gate_reports_an_auditor_that_cannot_start_as_an_operational_error(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     def run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        if "pip_audit" not in command:
+        if not is_pip_audit(command):
             return _real_run(command, **kwargs)  # type: ignore[call-overload]
         raise FileNotFoundError(command[0])
 
@@ -241,3 +256,138 @@ def test_gate_reports_an_auditor_that_cannot_start_as_an_operational_error(
     out = capsys.readouterr()
     assert "PASSED" not in out.out
     assert "DEPENDENCY AUDIT ERROR (operational, nothing proven): cannot run" in out.err
+
+
+def test_gate_rejects_a_report_whose_service_responses_were_not_all_validated(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_pip_audit(monkeypatch, 0, iniconfig(), validated="")
+
+    assert audit.main(["--project", str(FIXTURE_CLEAN)]) == audit.EXIT_OPERATIONAL
+    out = capsys.readouterr()
+    assert "PASSED" not in out.out
+    assert "not validated for exactly the locked packages: missing iniconfig==2.3.1" in out.err
+
+
+# Loaded into the real pip-audit process: replaces only the HTTP transport under pip-audit's
+# own requests session, so its cache layer, PyPI service, CLI and JSON report all run for real.
+TRANSPORT = """
+import io, json, os
+import requests.adapters
+from urllib3 import HTTPResponse
+
+RESPONSES = json.loads(os.environ["AUDIT_TEST_PYPI_RESPONSES"])
+
+def send(self, request, *args, **kwargs):
+    if request.url not in RESPONSES:
+        raise requests.ConnectionError(f"offline test: no response for {request.url}")
+    status, body = RESPONSES[request.url]
+    raw = HTTPResponse(
+        body=io.BytesIO(body.encode()),
+        headers={"Content-Type": "application/json"},
+        status=status,
+        preload_content=False,
+        request_method=request.method,
+        request_url=request.url,
+    )
+    return self.build_response(request, raw)
+
+requests.adapters.HTTPAdapter.send = send
+"""
+INICONFIG_URL = "https://pypi.org/pypi/iniconfig/2.3.1/json"
+ADVISORY = {
+    "id": "PYSEC-9",
+    "aliases": ["CVE-9"],
+    "fixed_in": ["2.3.2"],
+    "summary": None,
+    "details": "details",
+    "withdrawn": None,
+    "link": "https://osv.dev/vulnerability/PYSEC-9",
+    "source": "osv",
+}
+
+
+def pypi_serves(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: int, body: str) -> int:
+    """Run the real gate and pinned pip-audit; PyPI answers iniconfig 2.3.1 with `body`."""
+    (tmp_path / "sitecustomize.py").write_text(TRANSPORT)
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    monkeypatch.setenv("AUDIT_TEST_PYPI_RESPONSES", json.dumps({INICONFIG_URL: [status, body]}))
+    return audit.main(["--project", str(FIXTURE_CLEAN)])
+
+
+def payload(*vulns: dict) -> str:
+    return json.dumps({"info": {"name": "iniconfig"}, "vulnerabilities": list(vulns)})
+
+
+@pytest.mark.parametrize(
+    ("body", "code", "message"),
+    [
+        (payload(), audit.EXIT_CLEAN, "DEPENDENCY AUDIT PASSED"),
+        (payload(dict(ADVISORY, withdrawn="2026-01-01T00:00:00Z")), audit.EXIT_CLEAN, "PASSED"),
+        # Lower-case "t", fraction and offset are all valid RFC 3339.
+        (
+            payload(dict(ADVISORY, withdrawn="2016-12-31t23:59:59.5+05:30")),
+            audit.EXIT_CLEAN,
+            "PASSED",
+        ),
+        (
+            payload(ADVISORY),
+            audit.EXIT_VULNERABLE,
+            "VULNERABLE iniconfig==2.3.1: PYSEC-9 aliases [CVE-9] fixed in [2.3.2]",
+        ),
+    ],
+)
+def test_valid_pypi_responses_keep_their_meaning_through_the_real_auditor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    body: str,
+    code: int,
+    message: str,
+) -> None:
+    assert pypi_serves(monkeypatch, tmp_path, 200, body) == code
+    out = capsys.readouterr()
+    assert message in out.out + out.err
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "message"),
+    [
+        # Each 200 body below is one pinned pip-audit 2.10.1 turns into a clean result.
+        (200, json.dumps({"vulnerabilities": {}}), "vulnerabilities is not a list: {}"),
+        (200, json.dumps({"vulnerabilities": ""}), "vulnerabilities is not a list: ''"),
+        (200, json.dumps({"vulnerabilities": None}), "vulnerabilities is not a list: None"),
+        (200, json.dumps({"info": {}}), "vulnerabilities is not a list: None"),
+        (200, payload(dict(ADVISORY, withdrawn=False)), "withdrawn is not a timestamp: False"),
+        (200, payload(dict(ADVISORY, withdrawn="")), "withdrawn is not a timestamp: ''"),
+        (200, payload(dict(ADVISORY, withdrawn="not-a-timestamp")), "withdrawn is not a"),
+        (200, payload(dict(ADVISORY, withdrawn="2026-02-30T00:00:00Z")), "withdrawn is not a"),
+        # Python's datetime accepts both; RFC 3339 requires a "T" and a UTC offset.
+        (200, payload(dict(ADVISORY, withdrawn="2026-01-01 00:00:00Z")), "withdrawn is not a"),
+        (200, payload(dict(ADVISORY, withdrawn="2026-01-01T00:00:00")), "withdrawn is not a"),
+        (200, payload(dict(ADVISORY, withdrawn="2026-01-01T00:00:00+24:00")), "withdrawn is not"),
+        # Leap seconds are unsupported: midday, wrong-offset and a real one (2016-12-31) all fail.
+        (200, payload(dict(ADVISORY, withdrawn="2026-01-01T12:34:60Z")), "withdrawn is not"),
+        (200, payload(dict(ADVISORY, withdrawn="2016-12-31t23:59:60.5+05:30")), "withdrawn is"),
+        (200, payload(dict(ADVISORY, withdrawn="2016-12-31T23:59:60Z")), "withdrawn is not"),
+        # Lossy rather than clean: pip-audit would split the string into one alias per character.
+        (200, payload(dict(ADVISORY, aliases="CVE-9")), "aliases is not a list of strings"),
+        (200, payload(dict(ADVISORY, id=None)), "entry without a string id"),
+        (200, json.dumps([]), "vulnerabilities is not a list"),
+        (200, "<html>maintenance</html>", "not JSON"),
+        (503, "", "ServiceError"),
+    ],
+)
+def test_malformed_or_failed_pypi_responses_are_operational_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    status: int,
+    body: str,
+    message: str,
+) -> None:
+    assert pypi_serves(monkeypatch, tmp_path, status, body) == audit.EXIT_OPERATIONAL
+    out = capsys.readouterr()
+    assert "PASSED" not in out.out
+    assert "DEPENDENCY AUDIT ERROR (operational, nothing proven)" in out.err
+    assert message in out.err

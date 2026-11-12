@@ -33,6 +33,8 @@ EXIT_VULNERABLE = 1
 EXIT_OPERATIONAL = 2
 SERVICE = "pypi"
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# pip-audit with PyPI responses validated before its lossy parsing; see that script.
+PIP_AUDIT = Path(__file__).with_name("pip_audit_checked.py")
 
 Inventory = dict[str, Version]
 
@@ -222,17 +224,24 @@ def _export_requirements(project: Path) -> str:
     return export.stdout
 
 
-def _run_pip_audit(inventory: Inventory) -> tuple[subprocess.CompletedProcess[str], str | None]:
-    """pip-audit on exactly `inventory`, markers dropped, with a fresh HTTP cache."""
+def _run_pip_audit(
+    inventory: Inventory,
+) -> tuple[subprocess.CompletedProcess[str], str | None, str]:
+    """pip-audit on exactly `inventory`, markers dropped, with a fresh HTTP cache.
+
+    Returns the process, its JSON report (None if it wrote none) and the record of PyPI
+    responses validated before pip-audit parsed them.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         requirements = Path(tmp) / "requirements.txt"
         report = Path(tmp) / "report.json"
+        validated = Path(tmp) / "validated.txt"
         requirements.write_text("".join(f"{name}=={v}\n" for name, v in inventory.items()))
         result = _run(
             [
                 sys.executable,
-                "-m",
-                "pip_audit",
+                str(PIP_AUDIT),
+                str(validated),
                 "--requirement",
                 str(requirements),
                 "--no-deps",
@@ -250,7 +259,21 @@ def _run_pip_audit(inventory: Inventory) -> tuple[subprocess.CompletedProcess[st
                 str(Path(tmp) / "cache"),
             ]
         )
-        return result, report.read_text() if report.exists() else None
+        report_text = report.read_text() if report.exists() else None
+        return result, report_text, validated.read_text() if validated.exists() else ""
+
+
+def check_validated(inventory: Inventory, record_text: str) -> None:
+    """Every audited package's PyPI response passed validation, exactly once."""
+    validated: Inventory = {}
+    for line in record_text.splitlines():
+        name, _, version = line.partition("==")
+        _add(validated, name, _version(name, version), "validated PyPI responses")
+    if validated != inventory:
+        raise AuditError(
+            "PyPI responses were not validated for exactly the locked packages: "
+            + _describe_mismatch(inventory, validated)
+        )
 
 
 def audit(project: Path) -> list[Finding]:
@@ -261,11 +284,13 @@ def audit(project: Path) -> list[Finding]:
         raise AuditError(f"uv.lock: {exc}") from exc
     inventory = collect_inventory(export_text, lock_text)
     print(f"inventory: {len(inventory)} locked third-party packages")
-    result, report_text = _run_pip_audit(inventory)
+    result, report_text, record_text = _run_pip_audit(inventory)
     try:
-        return evaluate(inventory, result.returncode, report_text)
+        findings = evaluate(inventory, result.returncode, report_text)
+        check_validated(inventory, record_text)
     except AuditError as exc:
         raise AuditError(f"{exc}\npip-audit stderr:\n{result.stderr}") from exc
+    return findings
 
 
 def main(argv: list[str] | None = None) -> int:
