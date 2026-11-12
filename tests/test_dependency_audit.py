@@ -271,20 +271,33 @@ def test_gate_rejects_a_report_whose_service_responses_were_not_all_validated(
 
 # Loaded into the real pip-audit process: replaces only the HTTP transport under pip-audit's
 # own requests session, so its cache layer, PyPI service, CLI and JSON report all run for real.
+# Responses are cacheable and close at EOF like a real socket, which is when the cache stores them.
 TRANSPORT = """
 import io, json, os
+from email.utils import formatdate
 import requests.adapters
 from urllib3 import HTTPResponse
 
 RESPONSES = json.loads(os.environ["AUDIT_TEST_PYPI_RESPONSES"])
+
+class Body(io.BytesIO):
+    def read(self, *args):
+        data = super().read(*args)
+        if self.tell() == len(self.getbuffer()):
+            self.close()
+        return data
 
 def send(self, request, *args, **kwargs):
     if request.url not in RESPONSES:
         raise requests.ConnectionError(f"offline test: no response for {request.url}")
     status, body = RESPONSES[request.url]
     raw = HTTPResponse(
-        body=io.BytesIO(body.encode()),
-        headers={"Content-Type": "application/json"},
+        body=Body(body.encode()),
+        headers={
+            "Content-Type": "application/json",
+            "Date": formatdate(usegmt=True),
+            "Cache-Control": "public, max-age=86400",
+        },
         status=status,
         preload_content=False,
         request_method=request.method,
@@ -350,10 +363,24 @@ def test_valid_pypi_responses_keep_their_meaning_through_the_real_auditor(
     assert message in out.out + out.err
 
 
+def test_a_clean_answer_from_an_earlier_run_never_hides_a_new_advisory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # pip-audit's default cache would live under these, never the user's real cache.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "home" / "cache"))
+    assert pypi_serves(monkeypatch, tmp_path, 200, payload()) == audit.EXIT_CLEAN
+    capsys.readouterr()
+
+    assert pypi_serves(monkeypatch, tmp_path, 200, payload(ADVISORY)) == audit.EXIT_VULNERABLE
+    assert "VULNERABLE iniconfig==2.3.1: PYSEC-9" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     ("status", "body", "message"),
     [
-        # Each 200 body below is one pinned pip-audit 2.10.1 turns into a clean result.
+        # Malformed responses, including ones pinned pip-audit 2.10.1 would turn into a
+        # false-clean or lossy result.
         (200, json.dumps({"vulnerabilities": {}}), "vulnerabilities is not a list: {}"),
         (200, json.dumps({"vulnerabilities": ""}), "vulnerabilities is not a list: ''"),
         (200, json.dumps({"vulnerabilities": None}), "vulnerabilities is not a list: None"),
