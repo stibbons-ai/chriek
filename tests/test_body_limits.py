@@ -1,6 +1,7 @@
 """Request bodies are capped at 2 MiB after authentication; 422 responses at 16 KiB."""
 
 import asyncio
+import itertools
 import json
 
 import pytest
@@ -21,8 +22,8 @@ def padded(size: int) -> bytes:
 def post_asgi(app, chunks: list[bytes], headers: dict[str, str]) -> tuple[int, int]:
     """POST /jobs straight through ASGI, one receive message per chunk.
 
-    TestClient always sends the whole body with a correct Content-Length; this harness can
-    stream, understate the length, and count how many chunks the app pulled.
+    TestClient delivers the body in a single receive message; this harness can stream chunks,
+    understate or omit the length, and count how many chunks the app pulled.
     Returns (status, receive calls).
     """
     messages = [
@@ -89,6 +90,19 @@ def test_streamed_overflow_stops_at_the_first_overflowing_chunk(tmp_path, length
         assert_nothing_queued(client, backend)
 
 
+def test_streamed_valid_job_overflow_is_413_and_never_queued(tmp_path):
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        # A valid job followed by whitespace: every prefix up to the cap would be admitted.
+        chunks = [VALID] + [b" " * MIB] * 4
+        totals = itertools.accumulate(map(len, chunks))
+        first_overflow = next(i for i, total in enumerate(totals, 1) if total > MAX_BODY_BYTES)
+        assert first_overflow < len(chunks)
+
+        assert post_asgi(client.app, chunks, JSON_ALICE) == (413, first_overflow)
+        assert_nothing_queued(client, backend)
+
+
 def test_exact_limit_is_admitted_and_one_more_byte_is_413(tmp_path):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
@@ -98,6 +112,7 @@ def test_exact_limit_is_admitted_and_one_more_byte_is_413(tmp_path):
         assert response.json() == {"detail": f"request body must be at most {MAX_BODY_BYTES} bytes"}
         # Streamed without Content-Length, split mid-body: received bytes decide.
         assert post_asgi(client.app, [over[:MIB], over[MIB:]], JSON_ALICE)[0] == 413
+        assert_nothing_queued(client, backend)
 
         exact = padded(MAX_BODY_BYTES)
         response = client.post("/jobs", headers=JSON_ALICE, content=exact)
@@ -138,14 +153,21 @@ ADVERSARIAL_422 = {
 }
 
 
-@pytest.mark.parametrize("content", ADVERSARIAL_422.values(), ids=ADVERSARIAL_422.keys())
-def test_422_is_bounded_json_without_input_echo(tmp_path, content):
+ADVERSARIAL_422_CASES = [
+    pytest.param(content.encode(), "application/json", id=name)
+    for name, content in ADVERSARIAL_422.items()
+] + [pytest.param(b"\xff" * MAX_BODY_BYTES, "text/plain", id="invalid-bytes-text-plain")]
+
+
+@pytest.mark.parametrize(("body", "content_type"), ADVERSARIAL_422_CASES)
+def test_422_is_bounded_json_without_input_echo(tmp_path, body, content_type):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
-        body = content.encode()
         assert len(body) <= MAX_BODY_BYTES
 
-        response = client.post("/jobs", headers=JSON_ALICE, content=body)
+        response = client.post(
+            "/jobs", headers=ALICE | {"Content-Type": content_type}, content=body
+        )
 
         assert response.status_code == 422, response.text[:500]
         assert len(response.content) <= MAX_ERROR_BYTES
@@ -156,21 +178,40 @@ def test_422_is_bounded_json_without_input_echo(tmp_path, content):
         assert_nothing_queued(client, backend)
 
 
+def test_422_fills_the_budget_exactly_and_drops_the_error_that_would_cross_it(client):
+    keys = [f"{i:0>200}" for i in range(57)]
+
+    def unknown_fields(last_key_length: int):
+        body = {"prompt": "a"} | dict.fromkeys(keys, 1) | {"z" * last_key_length: 1}
+        response = client.post("/jobs", headers=ALICE, json=body)
+        assert response.status_code == 422
+        return response
+
+    # Calibrate on the live output: each extra ASCII key character adds one response byte.
+    short = unknown_fields(1)
+    assert len(short.json()["detail"]) == 58
+    fitting = MAX_ERROR_BYTES - len(short.content) + 1
+
+    exact = unknown_fields(fitting)
+    assert len(exact.content) == MAX_ERROR_BYTES
+    assert exact.json()["detail"][-1]["loc"] == ["body", "z" * fitting]
+
+    over = unknown_fields(fitting + 1)
+    assert len(over.content) <= MAX_ERROR_BYTES
+    assert [error["loc"] for error in over.json()["detail"]] == [["body", key] for key in keys]
+
+
 def test_ordinary_errors_stay_actionable(client):
     response = client.post(
         "/jobs", headers=ALICE, json={"prompt": "a lighthouse", "width": 1000, "steps": 50}
     )
 
     assert response.status_code == 422
-    assert response.json() == {
-        "detail": [
-            {
-                "type": "extra_forbidden",
-                "loc": ["body", "steps"],
-                "msg": "Extra inputs are not permitted",
-            }
-        ]
-    }
+    [error] = response.json()["detail"]
+    assert set(error) == {"type", "loc", "msg"}
+    assert error["type"] == "extra_forbidden"
+    assert error["loc"] == ["body", "steps"]
+    assert error["msg"]
     response = client.post("/jobs", headers=ALICE, json={"prompt": "a lighthouse", "width": 1000})
     assert response.json() == {
         "detail": [

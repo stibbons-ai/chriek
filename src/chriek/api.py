@@ -203,8 +203,8 @@ def _authenticated_route(authenticate: ApiKeyAuth) -> type[APIRoute]:
                 received = 0
 
                 async def capped_receive() -> Message:
-                    # Raising here drops the overflowing chunk before FastAPI buffers it;
-                    # FastAPI re-raises HTTPException from body reading unchanged.
+                    # Raising here drops the overflowing chunk before Starlette's Request.body()
+                    # buffers it; FastAPI re-raises HTTPException from body reading unchanged.
                     nonlocal received
                     message = await request.receive()
                     received += len(message.get("body", b""))
@@ -268,8 +268,8 @@ def _is_utf8(text: str) -> bool:
 def _error_detail(errors: Sequence[Any]) -> bytes:
     """Encode `{"detail": [...]}` within MAX_ERROR_BYTES, keeping each error's type, loc and msg.
 
-    Rejected input and ctx are never echoed; text is clipped and trailing errors that no longer
-    fit are dropped. Errors are rendered like JSONResponse, so the byte count is exact.
+    Rejected input and validation ctx are never echoed; text is clipped and trailing errors that
+    no longer fit are dropped. The counted bytes are the bytes sent, so the budget is exact.
     """
     entries: list[bytes] = []
     size = len(b'{"detail":[]}')
@@ -285,7 +285,7 @@ def _error_detail(errors: Sequence[Any]) -> bytes:
 
 
 def _clip(value: Any) -> str:
-    """At most MAX_ERROR_TEXT characters; unpaired surrogates become escape text, as JSON needs."""
+    """First MAX_ERROR_TEXT characters; unpaired surrogates then become (longer) escape text."""
     return str(value)[:MAX_ERROR_TEXT].encode("utf-8", "backslashreplace").decode("utf-8")
 
 
