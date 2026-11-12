@@ -13,7 +13,17 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx2
 import pytest
-from conftest import ALICE, ALICE_KEY, BOB_KEY, SIGNING_SECRET, base_env, submit, wait_for
+from conftest import (
+    ALICE,
+    ALICE_KEY,
+    BOB_KEY,
+    SIGNING_SECRET,
+    base_env,
+    modes,
+    submit,
+    tree_state,
+    wait_for,
+)
 from PIL import Image
 
 CHRIEK = Path(sys.executable).parent / "chriek"
@@ -26,6 +36,7 @@ def serve(env: dict[str, str], **kwargs) -> subprocess.Popen:
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        umask=0o022,  # the common permissive default; storage must stay private under it
         **kwargs,
     )
 
@@ -160,11 +171,18 @@ def test_chriek_serve_round_trip(tmp_path, signing_secret):
             png = Image.open(io.BytesIO(client.get(image["url"]).content))
             assert png.size == (1024, 1024)
             assert png.text["Seed"] == str(image["seed"])
-        assert (tmp_path / "db" / "chriek.db").is_file()
-        assert sorted(p.name for p in (tmp_path / "images" / body["id"]).iterdir()) == [
-            "0.png",
-            "1.png",
-        ]
+        job = body["id"]
+        # Checked while serving, so the open database's WAL and SHM sidecars exist.
+        assert modes(tmp_path) == {
+            "db": 0o700,
+            "db/chriek.db": 0o600,
+            "db/chriek.db-wal": 0o600,
+            "db/chriek.db-shm": 0o600,
+            "images": 0o700,
+            f"images/{job}": 0o700,
+            f"images/{job}/0.png": 0o600,
+            f"images/{job}/1.png": 0o600,
+        }
 
 
 def test_chriek_serve_memory_database_runs_jobs_and_resets_on_restart(tmp_path):
@@ -175,6 +193,12 @@ def test_chriek_serve_memory_database_runs_jobs_and_resets_on_restart(tmp_path):
         download = client.get(body["images"][0]["url"])
         assert download.status_code == 200
         assert Image.open(io.BytesIO(download.content)).text["Seed"] == "3"
+        job = body["id"]
+        assert modes(tmp_path) == {
+            "images": 0o700,
+            f"images/{job}": 0o700,
+            f"images/{job}/0.png": 0o600,
+        }
 
     with served(env, cwd=tmp_path) as client:
         assert client.get(f"/jobs/{body['id']}", headers=ALICE).status_code == 404
@@ -192,3 +216,22 @@ def test_chriek_serve_output_never_contains_download_signatures(tmp_path):
     assert "Uvicorn running on" in output, output
     assert query["sig"][0] not in output
     assert f"expires={query['expires'][0]}" not in output
+
+
+def test_chriek_serve_refuses_a_shared_database_directory_without_changing_it(tmp_path):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    shared.chmod(0o755)
+    (shared / "notes.txt").write_text("keep me")
+    before = tree_state(shared)
+    # A bare filename puts the database directly in the shared working directory.
+    process = serve(base_env(tmp_path) | {"CHRIEK_DB_PATH": "chriek.db"}, cwd=shared)
+    output, _ = process.communicate(timeout=30)
+
+    assert process.returncode == 2, output
+    assert (
+        f"chriek: storage error: {shared} is accessible to other users (mode 0755). "
+        "chriek needs dedicated directories" in output
+    )
+    assert "Uvicorn running on" not in output
+    assert tree_state(shared) == before

@@ -19,6 +19,8 @@ from sqlalchemy.engine import URL, Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from chriek.storage import private_database
+
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
 _MEMORY = ":memory:"  # SQLite's sentinel for an ephemeral database
@@ -172,7 +174,7 @@ def _create_engine(db_path: Path) -> Engine:
             max_overflow=0,
             connect_args={"check_same_thread": False},
         )
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    db_path = private_database(db_path)
     # URL.create keeps the filename literal; an f-string URL would parse '?' and '%xx'.
     return create_engine(URL.create("sqlite", database=str(db_path)))
 

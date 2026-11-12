@@ -21,6 +21,7 @@ from chriek.auth import ApiKeyAuth
 from chriek.backend import FakeBackend, ImageBackend
 from chriek.config import Limits, Settings
 from chriek.signing import UrlSigner
+from chriek.storage import private_image_root
 from chriek.store import SUCCEEDED, Job, JobStore
 from chriek.worker import Worker, image_path
 
@@ -68,16 +69,20 @@ def create_app(
     clock: Callable[[], float] = time.time,
 ) -> FastAPI:
     """Build the home-mode app. `backend` and `clock` are test seams; `chriek serve` omits them."""
-    storage_dir = settings.storage_dir.resolve()
+    # Every storage check runs before JobStore creates or migrates the database.
+    storage_dir = private_image_root(settings.storage_dir)
     store = JobStore(settings.db_path)
-    worker = Worker(store, backend or FakeBackend(), storage_dir, clock)
+    try:
+        worker = Worker(store, backend or FakeBackend(), storage_dir, clock)
+    except BaseException:
+        store.close()
+        raise
     signer = UrlSigner(settings.signing_secret)
     jobs = APIRouter(route_class=_authenticated_route(ApiKeyAuth(settings.api_keys)))
     Owner = Annotated[str, Depends(_owner)]
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        storage_dir.mkdir(parents=True, exist_ok=True)
         store.fail_interrupted(clock())
         worker.start()
         yield

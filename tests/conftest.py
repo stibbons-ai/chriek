@@ -1,6 +1,9 @@
-"""Shared HTTP test helpers. Tests talk to chriek only through its HTTP API (and CLI)."""
+"""Shared HTTP test helpers. Tests talk to chriek through its HTTP API and CLI, plus the direct
+store, worker and app entry points where storage privacy must hold without the CLI."""
 
+import os
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Iterator
@@ -43,6 +46,24 @@ def connect_db(tmp_path: Path) -> closing[sqlite3.Connection]:
 def db_dump(tmp_path: Path) -> str:
     with connect_db(tmp_path) as db:
         return "\n".join(db.iterdump())
+
+
+def modes(root: Path) -> dict[str, int]:
+    """Permission bits of every path below `root`, by relative path; links are not followed."""
+    return {str(p.relative_to(root)): stat.S_IMODE(p.lstat().st_mode) for p in root.rglob("*")}
+
+
+def tree_state(root: Path) -> dict[str, tuple]:
+    """Mode, owner and content (or link target) of `root` and everything below it."""
+    state = {}
+    for path in [root, *root.rglob("*")]:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            content = os.readlink(path)
+        else:
+            content = path.read_bytes() if stat.S_ISREG(info.st_mode) else None
+        state[str(path.relative_to(root))] = (info.st_mode, info.st_uid, content)
+    return state
 
 
 class FakeClock:

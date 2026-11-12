@@ -45,8 +45,8 @@ All configuration comes from environment variables.
 | `CHRIEK_API_KEYS` | required | Named static API keys, `name:key,name:key`. The name is the owner of the jobs created with that key. Names: 1–64 characters from `A-Z a-z 0-9 _ . -`, unique. Names are not secret: each job stores its owner's name in plain text, so never use a key or the signing secret as a name. Keys: at least 32 printable ASCII characters (`!` to `~`; no spaces, control or non-ASCII characters, no commas), unique. Keys travel in an HTTP header, so other characters are rejected at startup. Startup errors identify an invalid entry by its position, never by its name or key. |
 | `CHRIEK_SIGNING_SECRET` | required | HMAC secret for download URLs, at least 32 characters. Changing it invalidates every issued URL (polling the job again mints new ones). Anyone who knows it can sign download URLs, so it must not be one of the API keys: startup rejects a signing secret equal to any key or name in `CHRIEK_API_KEYS`. |
 | `CHRIEK_URL_TTL_SECONDS` | `900` | Lifetime of a download URL, 1–604800 seconds. |
-| `CHRIEK_DB_PATH` | `chriek-data/chriek.db` | SQLite database file, used literally (`?` and `%20` are ordinary filename characters); parent directories are created. Put it on a volume to keep jobs across restarts. The exact value `:memory:` (or `./:memory:`) selects an ephemeral in-memory database instead; see [In-memory database](#in-memory-database). |
-| `CHRIEK_STORAGE_DIR` | `chriek-data/images` | Directory for generated PNGs, one subdirectory per job. |
+| `CHRIEK_DB_PATH` | `chriek-data/chriek.db` | SQLite database file, used literally (`?` and `%20` are ordinary filename characters); missing parent directories are created private. Its parent must be a dedicated directory; see [Storage permissions](#storage-permissions). Put it on a volume to keep jobs across restarts. The exact value `:memory:` (or `./:memory:`) selects an ephemeral in-memory database instead; see [In-memory database](#in-memory-database). |
+| `CHRIEK_STORAGE_DIR` | `chriek-data/images` | Dedicated directory for generated PNGs, one subdirectory per job; see [Storage permissions](#storage-permissions). |
 | `CHRIEK_HOST` | `127.0.0.1` | Listen address. |
 | `CHRIEK_PORT` | `8000` | Listen port. |
 | `CHRIEK_MAX_IMAGES` | `4` | Maximum `image_count` per job (configurable 1–64). |
@@ -59,6 +59,38 @@ Relative paths resolve against the working directory. The database schema is cre
 ### In-memory database
 
 `CHRIEK_DB_PATH=:memory:` keeps the job database in memory, meant for tests and local development. No database file is written. The database lives exactly as long as one `chriek serve` process: submissions, the worker and polling share it while the process runs, and every restart starts empty, so job IDs from an earlier run return `404` and their download URLs stop working. The restart guarantees in [Job behaviour](#job-behaviour) (queued jobs survive, running jobs fail as interrupted) hold only for a database file. PNGs still go to `CHRIEK_STORAGE_DIR` on disk and aren't deleted on restart.
+
+### Storage permissions
+
+Jobs and images are private to the user chriek runs as (the service user) on POSIX filesystems. The database's directory (the parent of `CHRIEK_DB_PATH`) and `CHRIEK_STORAGE_DIR` must be dedicated to chriek and owned by the service user; the defaults (`chriek-data/` and `chriek-data/images/`) are. chriek creates missing directories with mode `0700`, the database with `0600` (SQLite gives its `-wal` and `-shm` sidecars the database's mode, also when it recreates them) and every PNG with `0600` from its first byte, including while a job is still rendering. This holds whatever the process umask is, for `chriek serve` and for code that embeds chriek's app, store or worker.
+
+Before the database is opened or any job runs, chriek checks, and refuses to start if any check fails (`chriek serve` prints `chriek: storage error: <path> <problem>` and exits with status 2 without listening):
+
+- The database's directory and `CHRIEK_STORAGE_DIR`: a directory, not a symbolic link, owned by the service user (effective UID), no group or other permission bits (`mode & 077 == 0`).
+- Every existing ancestor of those two directories, after resolving symbolic links: owned by root or the service user, and not writable by group or others unless the sticky bit is set (as on `/tmp`). Links in ancestors, such as macOS's `/var`, are fine.
+- The database file and any existing `-wal`, `-shm` or `-journal` sidecar: a regular file, not a symbolic link, owned by the service user, no group or other permission bits.
+- Every file and directory below `CHRIEK_STORAGE_DIR`: not a symbolic link, owned by the service user, no group or other permission bits.
+
+chriek never changes permissions or ownership of anything that already exists: not your data, not the directories above it. A bare filename such as `CHRIEK_DB_PATH=chriek.db` puts the database in the working directory, which is usually shared (`0755`) and is refused; point it into a dedicated directory such as `chriek-data/chriek.db` instead. With `CHRIEK_DB_PATH=:memory:` there is no database file, and `CHRIEK_STORAGE_DIR` is checked and protected the same way.
+
+**Migrating an existing installation.** Earlier versions created directories `0755` and files `0644`, so chriek refuses to start on their data. Stop chriek, then as the service user make only chriek's dedicated directories private and restart:
+
+```sh
+# chriek stopped; run as the service user. Only chriek's own directory, never a shared parent.
+chmod -R go= chriek-data
+```
+
+If the database sits in a shared directory, move it with its sidecars into a new dedicated directory and set `CHRIEK_DB_PATH` to the new location:
+
+```sh
+mkdir -m 700 chriek-db
+mv chriek.db chriek-db/            # plus chriek.db-wal / chriek.db-shm if present
+chmod go= chriek-db/chriek.db*
+```
+
+A configured path that is a symbolic link is refused; configure its real target instead. Data owned by another user must be copied or `chown`ed by an administrator before chriek will use it.
+
+**Limits.** Mode bits keep other local users out; they don't protect against root, against other processes running as the same user, or against access granted separately through ACLs (chriek neither inspects nor manages ACLs, and mode bits don't revoke them). Checks run at startup; chriek doesn't watch for permission changes made while it runs. Only POSIX filesystems with real ownership and modes are supported: on FAT/exFAT, some network or FUSE mounts, or other filesystems that synthesize modes, the checks can pass without protecting anything.
 
 ## API
 
