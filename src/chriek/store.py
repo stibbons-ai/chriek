@@ -1,6 +1,5 @@
 """SQLite job store. Status changes are conditional updates; a stale writer can't override them."""
 
-import re
 import uuid
 from pathlib import Path
 from typing import Any
@@ -23,8 +22,6 @@ from sqlalchemy.pool import QueuePool
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
 _MEMORY = ":memory:"  # SQLite's sentinel for an ephemeral database
-# Pre-#21 image failures: `image <N> of <M> failed: <exception text>`, N and M positive integers.
-_LEGACY_FAILURE = re.compile(r"(image [1-9][0-9]* of [1-9][0-9]* failed): .*", re.DOTALL)
 
 
 class Base(DeclarativeBase):
@@ -71,17 +68,6 @@ class JobStore:
         event.listen(self._engine, "connect", _configure_sqlite)
         Base.metadata.create_all(self._engine)
         self._session = sessionmaker(self._engine, expire_on_commit=False)
-        self._strip_legacy_failure_details()
-
-    def _strip_legacy_failure_details(self) -> None:
-        """Older versions appended exception text (`image N of M failed: <exc>`); drop it."""
-        with self._session.begin() as session:
-            candidates = session.scalars(
-                select(Job).where(Job.status == FAILED, Job.error.like("image % of % failed: %"))
-            )
-            for job in candidates:
-                if legacy := _LEGACY_FAILURE.fullmatch(job.error):
-                    job.error = legacy[1]
 
     def close(self) -> None:
         self._engine.dispose()

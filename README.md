@@ -105,7 +105,7 @@ curl -s http://127.0.0.1:8000/jobs/$JOB_ID -H "Authorization: Bearer $KEY"
 - `status` is `queued`, `running`, `succeeded` or `failed`.
 - `run` is the run record, set once the worker finishes the job: which backend, model and revision rendered it and how long rendering took. The fake backend reports no hardware or memory figures because it measures none. A job failed by restart recovery (see [Job behaviour](#job-behaviour)) has `run: null`, because no run record was persisted.
 - `images` is filled only when `succeeded`. Every poll mints fresh URLs that expire `CHRIEK_URL_TTL_SECONDS` later.
-- `error` is `null` unless the job `failed`. A failed image is reported as exactly `image N of M failed` (N is the one-based image that failed, M the requested `image_count`); a job failed by restart recovery carries the interrupted message below. The error never includes exception text, classes or other backend details: the server log keeps the full traceback with the job ID and the zero-based image index. On startup, chriek rewrites errors stored by older versions (`image N of M failed: <details>`) to `image N of M failed` before serving requests.
+- `error` is `null` unless the job `failed`. A failed image is reported as exactly `image N of M failed` (N is the one-based image that failed, M the requested `image_count`); a job failed by restart recovery carries the interrupted message below. The error never includes exception text, classes or other backend details: the server log keeps the full traceback with the job ID and the zero-based image index.
 
 ### `GET /images/{id}/{index}.png?expires=…&sig=…`
 

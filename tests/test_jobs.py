@@ -16,8 +16,6 @@ from conftest import (
     wait_for,
 )
 
-from chriek.backend import FakeBackend
-
 MAX_SEED = 2**32 - 1
 
 
@@ -308,67 +306,6 @@ def test_any_image_failure_fails_the_whole_job_without_images_or_details(tmp_pat
     with running(tmp_path) as after:
         again = after.get(f"/jobs/{job['id']}", headers=ALICE)
         assert again.json()["error"] == "image 2 of 3 failed"
-
-
-class AlwaysFailingBackend(FakeBackend):
-    def render(self, prompt, width, height, seed):
-        raise RuntimeError(BACKEND_SECRET)
-
-
-def test_restart_strips_exception_details_from_legacy_failures(tmp_path, caplog):
-    legacy = {
-        f"image 2 of 12 failed: {BACKEND_SECRET}\nTraceback: x: y": "image 2 of 12 failed",
-        f"image 10 of 100 failed: {BACKEND_SECRET}": "image 10 of 100 failed",
-        "image 3 of 3 failed: ": "image 3 of 3 failed",
-    }
-    kept = [
-        "image 1 of 1 failed",
-        "interrupted: the server stopped while this job was running",
-        "note: image 1 of 2 failed: unrelated text stays",
-        "image 1banana of 2 failed: unrelated text stays",
-        "image 1 of 2banana failed: unrelated text stays",
-        "image 1st of 2 failed: unrelated diagnostic",
-        "image 1 of 2 pending failed: unrelated diagnostic",
-        "image 0 of 2 failed: unrelated diagnostic",
-        "image 1 of 0 failed: unrelated diagnostic",
-        "image 01 of 2 failed: unrelated diagnostic",
-        "image 1 of 02 failed: unrelated diagnostic",
-        "image -1 of 2 failed: unrelated diagnostic",
-        "Image 1 of 2 failed: unrelated diagnostic",
-    ]
-    expected = [*legacy.values(), *kept]
-    with running(tmp_path, backend=AlwaysFailingBackend()) as client:
-        failed = [submit(client, width=16, height=16)["id"] for _ in expected]
-        for job_id in failed:
-            assert wait_for(client, job_id)["status"] == "failed"
-    with running(tmp_path) as client:
-        succeeded = wait_for(client, submit(client, width=16, height=16)["id"])
-    with _connect(tmp_path) as db, db:
-        for job_id, error in zip(failed, [*legacy, *kept], strict=True):
-            db.execute("UPDATE jobs SET error = ? WHERE id = ?", (error, job_id))
-    before = _rows_without_error(tmp_path)
-    caplog.clear()
-
-    for _ in range(2):  # a second restart leaves normalized rows alone
-        with running(tmp_path) as client:
-            errors = [client.get(f"/jobs/{i}", headers=ALICE).json()["error"] for i in failed]
-            assert errors == expected
-            after = client.get(f"/jobs/{succeeded['id']}", headers=ALICE).json()
-            assert after == succeeded | {"images": after["images"]}
-        _assert_no_backend_details(_db_dump(tmp_path))
-        _assert_no_backend_details(caplog.text)
-
-    with _connect(tmp_path) as db:
-        errors = [error for (error,) in db.execute("SELECT error FROM jobs ORDER BY seq")]
-    assert errors == [*expected, None]
-    assert _rows_without_error(tmp_path) == before
-
-
-def _rows_without_error(tmp_path) -> list[dict]:
-    with _connect(tmp_path) as db:
-        db.row_factory = sqlite3.Row
-        rows = db.execute("SELECT * FROM jobs ORDER BY seq").fetchall()
-    return [{key: value for key, value in dict(row).items() if key != "error"} for row in rows]
 
 
 def test_failed_job_does_not_stop_the_queue(tmp_path):
