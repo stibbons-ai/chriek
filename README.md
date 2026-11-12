@@ -164,7 +164,41 @@ Local hooks can be bypassed; CI remains authoritative. Requiring the CI check be
 The full check, also run by CI (`.github/workflows/ci.yml`):
 
 ```sh
-uv sync --locked && uv run --locked pre-commit run jscpd --all-files && uv run ruff check . && uv run ruff format --check . && uv run pytest
+uv sync --locked && uv run --locked pre-commit run jscpd --all-files && uv run ruff check . && uv run ruff format --check . && uv run pytest && uv run --locked python scripts/audit_dependencies.py
 ```
 
-Tests drive chriek only through its HTTP API and the installed `chriek` command, with the fake backend.
+Application tests drive chriek only through its HTTP API and the installed `chriek` command, with the fake backend. `tests/test_dependency_audit.py` checks the dependency-audit gate's boundaries offline with injected pip-audit reports.
+
+### Dependency audit
+
+CI runs the same command on every PR and push to `main`:
+
+```sh
+uv run --locked python scripts/audit_dependencies.py
+```
+
+It audits every third-party package locked in `uv.lock` against PyPI's vulnerability service with `pip-audit`, pinned in the `dev` group (`pip-audit==2.10.1`, its own dependencies locked too):
+
+1. `uv export --locked --all-groups --all-extras --no-emit-project` lists the exact locked versions. A lockfile that is stale against `pyproject.toml` fails here; nothing is resolved anew.
+2. The export must match the registry packages in `uv.lock` exactly. Only the local project (`chriek`, editable) is excluded. Git, URL or path dependencies fail the gate because the PyPI service can only audit registry packages by name and version. A package locked at two versions (for example per platform) also fails: the gate's inventory and the requirements file it hands `pip-audit` hold one version per package.
+3. Environment markers are dropped before auditing, so platform-specific packages (for example `colorama` on Windows) are audited on every machine; `pip-audit` would otherwise skip them silently.
+4. `pip-audit --no-deps --disable-pip --strict -s pypi -f json` runs with a fresh, empty HTTP cache, so no stale advisory data is reused. The gate then reads its JSON report: every package from step 1 must appear, once, at its locked version, with none skipped.
+
+| Exit | Meaning |
+|---|---|
+| 0 | `DEPENDENCY AUDIT PASSED`: every locked package audited, no known advisory |
+| 1 | `DEPENDENCY AUDIT FAILED`: each `VULNERABLE name==version: ID aliases [...] fixed in [...]` |
+| 2 | `DEPENDENCY AUDIT ERROR (operational, nothing proven)`: stale lock, network or service failure, skipped or missing packages, malformed report, or a pip-audit exit code that contradicts its report |
+
+Only exit 0 passes. There is no ignore list, severity threshold or fallback; a vulnerability without a compatible fix blocks the build until a person decides. `pip-audit` exits 1 both for findings and for its own errors, so the gate never reads its exit code alone.
+
+Coverage limits: the gate covers the application dependencies, the `dev` group (including `pip-audit`'s own dependencies) and any future optional extras or groups, on all platforms in the universal lock. It does not cover the Python interpreter, `uv`, system libraries, anything a locked package downloads or bundles itself, packages outside `uv.lock` (such as GPU backends installed separately), or vulnerabilities with no published PyPI advisory. A pass means no known advisory on PyPI at that moment, not that the dependencies are secure.
+
+Fixture projects in `tests/fixtures/dependency_audit/` demonstrate both outcomes against the real service without touching this project's lock (`--project` points the gate at another uv project):
+
+```sh
+uv run --locked python scripts/audit_dependencies.py --project tests/fixtures/dependency_audit/clean       # exit 0
+uv run --locked python scripts/audit_dependencies.py --project tests/fixtures/dependency_audit/vulnerable  # exit 1, urllib3 1.26.4
+```
+
+Recorded run, 2026-11-12, Python 3.14.6 on macOS 27.2.1 arm64, pip-audit 2.10.1, PyPI service: this lock, 61 third-party packages, no known vulnerabilities (exit 0). Same day: clean fixture exit 0; vulnerable fixture exit 1 with 11 advisories for `urllib3==1.26.4` (PYSEC-2021-108, PYSEC-2023-192, PYSEC-2023-212, PYSEC-2026-141, PYSEC-2026-1994, PYSEC-2026-1995, PYSEC-2026-1996, PYSEC-2026-1998, PYSEC-2026-1999, PYSEC-2026-4175, PYSEC-2026-4177); unreachable service (`HTTPS_PROXY=http://127.0.0.1:9`) exit 2; stale lock exit 2.
