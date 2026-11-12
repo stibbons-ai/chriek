@@ -2,9 +2,21 @@
 
 import io
 import xml.etree.ElementTree as ET
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-from conftest import ALICE, BOB, SIGNING_SECRET, FakeClock, running, submit, wait_for
+import pytest
+from conftest import (
+    ALICE,
+    BOB,
+    SIGNING_SECRET,
+    FakeClock,
+    base_env,
+    proxy_env,
+    running,
+    submit,
+    wait_for,
+    with_query,
+)
 from PIL import Image
 
 TRAINED_ALGORITHMIC_MEDIA = "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
@@ -15,12 +27,6 @@ def finished_job(client, **fields):
     body = wait_for(client, submit(client, **{"width": 32, "height": 16} | fields)["id"])
     assert body["status"] == "succeeded", body
     return body
-
-
-def with_query(url, **changes):
-    parts = urlsplit(url)
-    query = {key: values[0] for key, values in parse_qs(parts.query).items()} | changes
-    return parts._replace(query=urlencode(query)).geturl()
 
 
 def test_download_needs_no_api_key_and_returns_the_png(client):
@@ -114,9 +120,10 @@ def test_malformed_image_paths_are_404(client):
         assert client.get(path).status_code == 404, path
 
 
-def test_links_expire_and_polling_mints_fresh_ones(tmp_path):
+@pytest.mark.parametrize("env_base", [base_env, proxy_env], ids=["api-key", "proxy"])
+def test_links_expire_and_polling_mints_fresh_ones(tmp_path, env_base):
     clock = FakeClock()
-    with running(tmp_path, clock=clock, CHRIEK_URL_TTL_SECONDS="60") as client:
+    with running(tmp_path, clock=clock, env_base=env_base, CHRIEK_URL_TTL_SECONDS="60") as client:
         old = finished_job(client)["images"][0]
         job_id = urlsplit(old["url"]).path.split("/")[2]
 

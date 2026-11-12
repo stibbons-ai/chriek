@@ -26,5 +26,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     # No access log: download URLs carry their signature, a bearer credential until expiry.
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port, access_log=False)
+    uvicorn.run(
+        create_app(settings),
+        host=settings.host,
+        port=settings.port,
+        access_log=False,
+        ssl_certfile=settings.tls.certfile if settings.tls else None,
+        ssl_keyfile=settings.tls.keyfile if settings.tls else None,
+    )
     return 0

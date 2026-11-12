@@ -8,16 +8,21 @@ from sqlalchemy import (
     JSON,
     CheckConstraint,
     ForeignKey,
+    Index,
     String,
     Text,
     create_engine,
     event,
+    func,
+    insert,
+    literal,
     select,
     update,
 )
 from sqlalchemy.engine import URL, Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import QueuePool
+from sqlalchemy.schema import CreateIndex
 
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
@@ -32,6 +37,8 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(f"status IN ('{QUEUED}', '{RUNNING}', '{SUCCEEDED}', '{FAILED}')"),
+        # Covers the per-owner queued count of every submission.
+        Index("ix_jobs_owner_status", "owner", "status"),
     )
 
     # `seq` is the persisted FIFO order; `id` is the public UUIDv7.
@@ -67,6 +74,12 @@ class JobStore:
         self._engine = _create_engine(db_path)
         event.listen(self._engine, "connect", _configure_sqlite)
         Base.metadata.create_all(self._engine)
+        # create_all skips existing tables and so their indexes: add indexes introduced
+        # after a database file was created. Idempotent; existing rows stay untouched.
+        with self._engine.begin() as connection:
+            for table in Base.metadata.sorted_tables:
+                for index in table.indexes:
+                    connection.execute(CreateIndex(index, if_not_exists=True))
         self._session = sessionmaker(self._engine, expire_on_commit=False)
 
     def close(self) -> None:
@@ -82,22 +95,48 @@ class JobStore:
         height: int,
         seed: int,
         now: float,
-    ) -> Job:
-        job = Job(
-            id=str(uuid.uuid7()),
-            owner=owner,
-            status=QUEUED,
-            prompt=prompt,
-            image_count=image_count,
-            width=width,
-            height=height,
-            seed=seed,
-            created_at=now,
-            images=[],
+        max_queued: int,
+    ) -> Job | None:
+        """Queue a job unless `owner` already has `max_queued` queued jobs; None if full.
+
+        A queue that is already full when read is rejected by that read alone, without the
+        write lock, so a flood of submissions against a full queue doesn't hold up other
+        writers (the worker saving results). That read only rejects; it never admits.
+        Submissions that pass it while the queue is near the cap wait for the write lock
+        and may still be rejected there: admission counts again inside the one
+        INSERT ... SELECT statement, which SQLite runs under the write lock, so the count
+        always sees the rows it races with and concurrent submissions, even through other
+        connections, can't overshoot the cap. Keep that count inside the statement; an
+        unconditional insert after a separate count would let two submissions both see
+        room.
+        """
+        jobs = Job.__table__
+        queued = (
+            select(func.count())
+            .select_from(jobs)
+            .where(jobs.c.owner == owner, jobs.c.status == QUEUED)
         )
+        with self._session() as session:
+            if session.scalar(queued) >= max_queued:
+                return None
+        values = {
+            "id": str(uuid.uuid7()),
+            "owner": owner,
+            "status": QUEUED,
+            "prompt": prompt,
+            "image_count": image_count,
+            "width": width,
+            "height": height,
+            "seed": seed,
+            "created_at": now,
+        }
+        row = select(*(literal(value, jobs.c[name].type) for name, value in values.items()))
+        has_room = queued.correlate(None).scalar_subquery() < max_queued
         with self._session.begin() as session:
-            session.add(job)
-        return job
+            seq = session.scalar(
+                insert(jobs).from_select(list(values), row.where(has_room)).returning(jobs.c.seq)
+            )
+        return None if seq is None else Job(**values, seq=seq, images=[])
 
     def get(self, owner: str, job_id: str) -> Job | None:
         with self._session() as session:
