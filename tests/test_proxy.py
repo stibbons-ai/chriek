@@ -102,8 +102,8 @@ def test_jobs_never_cross_between_api_key_and_proxy_mode(tmp_path, key_name):
 
 
 def test_no_api_key_name_can_own_the_proxy_owners_jobs(tmp_path):
-    # Whatever an operator writes, the key names chriek accepts (the owners of api-key jobs)
-    # never include the proxy owner, so the two modes can't share jobs on one database.
+    # Key names can't contain ":", so configuring the proxy owner as a key name is either
+    # rejected or parsed as a different legal name: no api-key owner is the proxy owner.
     env = base_env(tmp_path) | {"CHRIEK_API_KEYS": f"{PROXY_OWNER}:{ALICE_KEY}"}
     try:
         owners = Settings.from_env(env).api_keys.keys()

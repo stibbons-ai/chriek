@@ -3,9 +3,12 @@
 import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 
 import pytest
 from conftest import ALICE, BOB, SMALL, StepBackend, base_env, post_job, running, submit, wait_for
+
+from chriek.store import JobStore
 
 
 def queue_full(cap: int) -> dict[str, str]:
@@ -68,8 +71,9 @@ def test_full_queue_rejects_while_another_connection_holds_the_write_lock(tmp_pa
         backend.wait_started(1)
         queued = submit(client, prompt="queued", **SMALL)
 
-        # A writer that keeps the lock longer than SQLite's busy timeout, like a flood of
-        # submissions does; a rejection that needed the lock would fail with a 500.
+        # Another connection holds the write lock across these requests. A rejection that
+        # needed the lock would block for SQLite's busy timeout and then raise "database is
+        # locked" (a 500 in production; TestClient re-raises it).
         writer = sqlite3.connect(db_file(tmp_path), timeout=0, isolation_level=None)
         try:
             writer.execute("BEGIN IMMEDIATE")
@@ -195,3 +199,55 @@ def test_concurrent_submissions_through_separate_connections_never_exceed_the_ca
         backend.step(len(busy) + cap + 1)
         for job in admitted:
             assert wait_for(one, job["id"])["status"] == "succeeded"
+
+
+def test_existing_database_gains_the_owner_queue_index_and_keeps_its_jobs(tmp_path):
+    # A database file from before the owner/status index: same schema, no such index.
+    path = tmp_path / "existing.db"
+    store = JobStore(path)
+    job = {"prompt": "p", "image_count": 2, "width": 16, "height": 16, "seed": 7}
+    for n in range(4):
+        store.create(owner="alice", now=float(n), max_queued=100, **job)
+    succeeded, failed, _running = (store.claim_next(now=10.0) for _ in range(3))
+    store.succeed(succeeded.id, {"backend": "fake"}, now=11.0)
+    store.fail(failed.id, "boom", {"backend": "fake"}, now=12.0)
+    store.close()
+
+    def owner_status_indexes(db) -> list[str]:
+        return [
+            name
+            for _, name, *_ in db.execute("PRAGMA index_list(jobs)")
+            if [row[2] for row in db.execute(f"PRAGMA index_info({name})")] == ["owner", "status"]
+        ]
+
+    def snapshot() -> tuple[list, list, list[str]]:
+        with closing(sqlite3.connect(path)) as db:
+            jobs = db.execute("SELECT * FROM jobs ORDER BY seq").fetchall()
+            images = db.execute('SELECT * FROM images ORDER BY job_id, "index"').fetchall()
+            return jobs, images, owner_status_indexes(db)
+
+    with closing(sqlite3.connect(path, isolation_level=None)) as db:
+        for name in owner_status_indexes(db):
+            db.execute(f"DROP INDEX {name}")
+        statuses = [row[0] for row in db.execute("SELECT status FROM jobs ORDER BY seq")]
+    assert statuses == ["succeeded", "failed", "running", "queued"]
+    jobs, images, indexes = snapshot()
+    assert len(images) == 2
+    assert indexes == []
+
+    for _ in range(2):  # starting again on an upgraded file changes nothing
+        store = JobStore(path)
+        try:
+            upgraded_jobs, upgraded_images, indexes = snapshot()
+            assert (upgraded_jobs, upgraded_images) == (jobs, images)
+            assert len(indexes) == 1
+            assert store.is_published(succeeded.id, 1)
+        finally:
+            store.close()
+
+    store = JobStore(path)
+    try:
+        assert store.create(owner="alice", now=20.0, max_queued=1, **job) is None
+        assert store.create(owner="alice", now=21.0, max_queued=2, **job) is not None
+    finally:
+        store.close()
