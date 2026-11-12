@@ -1,0 +1,11 @@
+{
+  "path": ["src"],
+  "format": ["python"],
+  "minLines": 10,
+  "minTokens": 70,
+  "mode": "weak",
+  "threshold": 0,
+  "failOnEmpty": true,
+  "gitignore": true,
+  "reporters": ["console"]
+}

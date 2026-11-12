@@ -129,10 +129,29 @@ This section matters once a real FLUX backend runs; the fake backend uses no FLU
 
 ## Development
 
+Install development dependencies and activate the commit hook once per checkout (uv must be on PATH when committing):
+
+```sh
+uv sync --locked
+uv run --locked pre-commit install
+```
+
+The hook scans all Python production code under `src/` on every commit, including documentation-only commits. CI runs the same gate on every PR and pushes to `main`. Zero qualifying clones are allowed, including existing clones; there is no baseline or percentage allowance. Tests and tooling outside `src/` are excluded.
+
+`.jscpd.json` requires both 10 lines and 70 tokens per clone. Weak mode ignores comments and whitespace, but Python docstrings are strings and may still match. Identifiers and literals remain significant; this is not fuzzy or semantic detection. Missing roots or an empty corpus fail the check.
+
+Run the hook manually:
+
+```sh
+uv run --locked pre-commit run jscpd --all-files
+```
+
+Local hooks can be bypassed; CI remains authoritative. Requiring the CI check before merging is a separate branch-protection setting.
+
 The full check, also run by CI (`.github/workflows/ci.yml`):
 
 ```sh
-uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv run pytest
+uv sync --locked && uv run --locked pre-commit run jscpd --all-files && uv run ruff check . && uv run ruff format --check . && uv run pytest
 ```
 
 Tests drive chriek only through its HTTP API and the installed `chriek` command, with the fake backend.

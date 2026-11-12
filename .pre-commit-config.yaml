@@ -1,0 +1,11 @@
+repos:
+  - repo: local
+    hooks:
+      - id: jscpd
+        name: jscpd - production duplicate code
+        entry: uv run --locked jscpd --config .jscpd.json
+        language: system
+        pass_filenames: false
+        always_run: true
+        require_serial: true
+        stages: [pre-commit]
