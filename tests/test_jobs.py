@@ -1,9 +1,20 @@
 """Job submission, polling, validation (property 5) and whole-job failure (property 4)."""
 
+import sqlite3
 import uuid
+from contextlib import closing
 
 import pytest
-from conftest import ALICE, CountingBackend, FailingBackend, running, submit, wait_for
+from conftest import (
+    ALICE,
+    BACKEND_SECRET,
+    CountingBackend,
+    FailingBackend,
+    base_env,
+    running,
+    submit,
+    wait_for,
+)
 
 MAX_SEED = 2**32 - 1
 
@@ -252,19 +263,49 @@ def test_limits_come_from_configuration(tmp_path):
             assert response.status_code == 422, rejected
 
 
-def test_any_image_failure_fails_the_whole_job_without_images(tmp_path):
-    backend = FailingBackend(fail_index=1)
+def _connect(tmp_path):
+    return closing(sqlite3.connect(base_env(tmp_path)["CHRIEK_DB_PATH"]))
+
+
+def _db_dump(tmp_path) -> str:
+    with _connect(tmp_path) as db:
+        return "\n".join(db.iterdump())
+
+
+def _assert_no_backend_details(text: str) -> None:
+    for leak in (BACKEND_SECRET, "secret-weights", "hf_SENTINEL", "p4ss", "RuntimeError"):
+        assert leak not in text
+
+
+def test_any_image_failure_fails_the_whole_job_without_images_or_details(tmp_path, caplog):
+    backend = FailingBackend(fail_index=1)  # image 1 renders, image 2 raises
     with running(tmp_path, backend=backend) as client:
         job = submit(client, image_count=3, seed=5, width=16, height=16)
 
         body = wait_for(client, job["id"])
+        response = client.get(f"/jobs/{job['id']}", headers=ALICE)
 
         assert body["status"] == "failed"
         assert body["images"] == []
-        assert body["error"] == "image 2 of 3 failed: injected backend failure"
+        assert body["error"] == "image 2 of 3 failed"
         assert body["run"]["backend"] == "fake"
+        _assert_no_backend_details(response.text)
         assert backend.renders == 2  # rendering stops at the first failure
         assert not any((tmp_path / "images").iterdir()), "partial output must be discarded"
+
+        following = wait_for(client, submit(client, width=16, height=16)["id"])
+        assert (following["status"], following["error"]) == ("succeeded", None)
+
+    _assert_no_backend_details(_db_dump(tmp_path))
+    # Operators keep the full exception, correlated with the job and image.
+    (record,) = [r for r in caplog.records if r.exc_info and job["id"] in r.getMessage()]
+    assert "image 1" in record.getMessage()  # zero-based index of the failed image
+    assert str(record.exc_info[1]) == BACKEND_SECRET
+    assert BACKEND_SECRET in str(record.exc_info[1].__cause__)
+
+    with running(tmp_path) as after:
+        again = after.get(f"/jobs/{job['id']}", headers=ALICE)
+        assert again.json()["error"] == "image 2 of 3 failed"
 
 
 def test_failed_job_does_not_stop_the_queue(tmp_path):
