@@ -22,7 +22,7 @@ def padded(size: int) -> bytes:
 def post_asgi(app, chunks: list[bytes], headers: dict[str, str]) -> tuple[int, int]:
     """POST /jobs straight through ASGI, one receive message per chunk.
 
-    TestClient delivers the body in a single receive message; this harness can stream chunks,
+    TestClient delivers bytes content in a single receive message; this harness can stream chunks,
     understate or omit the length, and count how many chunks the app pulled.
     Returns (status, receive calls).
     """
@@ -76,13 +76,15 @@ def test_declared_oversize_is_413_without_reading_the_body(tmp_path):
         assert_nothing_queued(client, backend)
 
 
+@pytest.mark.parametrize("content_type", ["application/json", "text/plain"])
 @pytest.mark.parametrize(
     "length", [None, "10", "not-a-number"], ids=["absent", "understated", "malformed"]
 )
-def test_streamed_overflow_stops_at_the_first_overflowing_chunk(tmp_path, length):
+def test_streamed_overflow_stops_at_the_first_overflowing_chunk(tmp_path, length, content_type):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
-        headers = JSON_ALICE | ({} if length is None else {"Content-Length": length})
+        headers = ALICE | {"Content-Type": content_type}
+        headers |= {} if length is None else {"Content-Length": length}
         # 1 MiB + 1 MiB is exactly the cap; the third chunk overflows; two more stay unread.
         chunks = [b" " * MIB] * 5
 
@@ -173,6 +175,7 @@ def test_422_is_bounded_json_without_input_echo(tmp_path, body, content_type):
         )
 
         assert response.status_code == 422, response.text[:500]
+        assert response.headers["content-type"] == "application/json"
         assert len(response.content) <= MAX_ERROR_BYTES
         detail = response.json()["detail"]
         assert detail, "at least one actionable error survives the bound"
@@ -225,3 +228,26 @@ def test_ordinary_errors_stay_actionable(client):
             }
         ]
     }
+
+
+def test_422_omits_the_rejected_value_and_validation_context(client):
+    sentinel = "REJECTED-VALUE-7f3a9c"
+    response = client.post("/jobs", headers=ALICE, json={"prompt": "a", "width": sentinel})
+
+    assert response.status_code == 422
+    assert sentinel not in response.text
+    [error] = response.json()["detail"]
+    assert (error["type"], error["loc"]) == ("int_type", ["body", "width"])
+    assert error["msg"]
+
+    # FastAPI puts the JSON decoder's reason in the error's ctx; the response must not carry it.
+    malformed = '{"prompt": "a", "width": }'
+    with pytest.raises(json.JSONDecodeError) as decoded:
+        json.loads(malformed)
+    response = client.post("/jobs", headers=JSON_ALICE, content=malformed)
+
+    assert response.status_code == 422
+    assert decoded.value.msg not in response.text
+    [error] = response.json()["detail"]
+    assert (error["type"], error["loc"]) == ("json_invalid", ["body", decoded.value.pos])
+    assert error["msg"]
