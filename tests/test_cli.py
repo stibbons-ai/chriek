@@ -47,7 +47,17 @@ CONTROL_KEY = ALICE_KEY + "\x07"
         ({"CHRIEK_API_KEYS": f"bad name:{ALICE_KEY}"}, "must be name:key"),
         (
             {"CHRIEK_API_KEYS": f"alice:{ALICE_KEY},alice:{ALICE_KEY}z"},
-            "names 'alice' more than once",
+            "repeats an earlier name",
+        ),
+        # Names may equal secrets; errors must not echo them. base_env signs with SIGNING_SECRET.
+        (
+            {"CHRIEK_API_KEYS": f"{SIGNING_SECRET}:{SIGNING_SECRET},{SIGNING_SECRET}:{ALICE_KEY}"},
+            "repeats an earlier name",
+        ),
+        ({"CHRIEK_API_KEYS": f"{BOB_KEY}:short-secret-key"}, "at least 32 printable ASCII"),
+        (
+            {"CHRIEK_API_KEYS": f"alice:{ALICE_KEY},{BOB_KEY}:{ALICE_KEY}"},
+            "shared with another name",
         ),
         (
             {"CHRIEK_API_KEYS": f"alice:{ALICE_KEY},bob:{ALICE_KEY}"},

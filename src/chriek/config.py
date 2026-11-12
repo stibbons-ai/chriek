@@ -89,15 +89,16 @@ def _api_keys(raw: str) -> dict[str, str]:
             )
         # Starlette decodes headers as Latin-1, and clients differ in how they encode
         # anything beyond ASCII: only printable ASCII keys reliably authenticate.
+        # Errors name the entry position, never the name: a name may equal a secret.
         if len(key) < MIN_SECRET_LENGTH or not all("!" <= c <= "~" for c in key):
             raise ConfigError(
-                f"CHRIEK_API_KEYS key for {name!r} must be at least "
+                f"CHRIEK_API_KEYS entry {position} key must be at least "
                 f"{MIN_SECRET_LENGTH} printable ASCII characters without whitespace"
             )
         if name in keys:
-            raise ConfigError(f"CHRIEK_API_KEYS names {name!r} more than once")
+            raise ConfigError(f"CHRIEK_API_KEYS entry {position} repeats an earlier name")
         if key in keys.values():
-            raise ConfigError(f"CHRIEK_API_KEYS key for {name!r} is shared with another name")
+            raise ConfigError(f"CHRIEK_API_KEYS entry {position} key is shared with another name")
         keys[name] = key
     if not keys:
         raise ConfigError("CHRIEK_API_KEYS must name at least one key")
