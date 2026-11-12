@@ -24,6 +24,16 @@ Logs go to standard output/error: startup, shutdown and errors. There is no HTTP
 
 chriek has no TLS of its own. Expose it only on a private network or behind a TLS-terminating reverse proxy: API keys and download signatures travel in requests.
 
+### Backend dependencies
+
+Today's supported installation remains `uv sync --locked`: only the fake backend is available, with no GPU runtimes or model weights.
+
+Shared runtime dependencies stay in `pyproject.toml` under `[project].dependencies`; development tools stay in `[dependency-groups].dev`. Real backend implementations will add `mlx` and `cuda` extras under `[project.optional-dependencies]`, containing their actual inference dependencies, not just a tensor library.
+
+The future commands `uv sync --locked --extra mlx` and `uv sync --locked --extra cuda` are **not available today**: neither extra exists yet. Extras install dependencies; they neither detect hardware nor select a runtime backend. CUDA wheel source and version configuration belongs with the real CUDA implementation; naming an extra `cuda` does not select a CUDA build.
+
+Keep the committed `uv.lock` as the single lockfile; do not introduce hand-maintained `requirements_mlx.txt` or `requirements_cuda.txt` copies.
+
 ## Configuration
 
 All configuration comes from environment variables.
