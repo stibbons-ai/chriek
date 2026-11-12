@@ -1,4 +1,4 @@
-"""Shared HTTP test helpers. Tests talk to chriek only through its HTTP API (and CLI)."""
+"""Shared HTTP test helpers. Tests talk to chriek through its HTTP API (and CLI)."""
 
 import threading
 import time

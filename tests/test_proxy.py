@@ -10,6 +10,7 @@ from conftest import (
     BOB,
     SMALL,
     StepBackend,
+    base_env,
     post_job,
     proxy_env,
     running,
@@ -17,6 +18,9 @@ from conftest import (
     wait_for,
     with_query,
 )
+
+from chriek.auth import PROXY_OWNER
+from chriek.config import ConfigError, Settings
 
 # What clients behind a proxy may send: nothing, keys valid or invalid in api-key mode,
 # other schemes, and identity headers chriek must not trust.
@@ -28,6 +32,9 @@ CLIENT_HEADERS = [
     {"Authorization": f"Basic {ALICE_KEY}"},
     {"X-Forwarded-User": "carol"},
     {"X-Remote-User": "dave", "X-Forwarded-Email": "dave@example.com"},
+    {"X-Forwarded-For": "203.0.113.7"},
+    {"Forwarded": "for=203.0.113.8;proto=https;by=203.0.113.1"},
+    {"X-Real-IP": "203.0.113.9"},
 ]
 
 
@@ -92,6 +99,17 @@ def test_jobs_never_cross_between_api_key_and_proxy_mode(tmp_path, key_name):
     with running(tmp_path, CHRIEK_API_KEYS=f"{key_name}:{ALICE_KEY}") as api_key_mode:
         assert api_key_mode.get(f"/jobs/{keyed['id']}", headers=ALICE).status_code == 200
         assert api_key_mode.get(f"/jobs/{proxied['id']}", headers=ALICE).status_code == 404
+
+
+def test_no_api_key_name_can_own_the_proxy_owners_jobs(tmp_path):
+    # Whatever an operator writes, the key names chriek accepts (the owners of api-key jobs)
+    # never include the proxy owner, so the two modes can't share jobs on one database.
+    env = base_env(tmp_path) | {"CHRIEK_API_KEYS": f"{PROXY_OWNER}:{ALICE_KEY}"}
+    try:
+        owners = Settings.from_env(env).api_keys.keys()
+    except ConfigError:
+        owners = set()
+    assert PROXY_OWNER not in owners
 
 
 def test_explicit_api_key_mode_still_requires_a_key(tmp_path):

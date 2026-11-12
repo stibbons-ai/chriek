@@ -150,7 +150,7 @@ def create_app(
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 f"queue full: at most {settings.limits.max_queued_jobs} queued jobs per owner; "
-                "retry after some of them have started",
+                "new jobs are accepted only while fewer are queued",
             )
         worker.notify()
         response.headers["Location"] = f"/jobs/{job.id}"

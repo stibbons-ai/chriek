@@ -8,6 +8,7 @@ from sqlalchemy import (
     JSON,
     CheckConstraint,
     ForeignKey,
+    Index,
     String,
     Text,
     create_engine,
@@ -21,6 +22,7 @@ from sqlalchemy import (
 from sqlalchemy.engine import URL, Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import QueuePool
+from sqlalchemy.schema import CreateIndex
 
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
@@ -35,6 +37,8 @@ class Job(Base):
     __tablename__ = "jobs"
     __table_args__ = (
         CheckConstraint(f"status IN ('{QUEUED}', '{RUNNING}', '{SUCCEEDED}', '{FAILED}')"),
+        # Covers the per-owner queued count of every submission.
+        Index("ix_jobs_owner_status", "owner", "status"),
     )
 
     # `seq` is the persisted FIFO order; `id` is the public UUIDv7.
@@ -70,6 +74,12 @@ class JobStore:
         self._engine = _create_engine(db_path)
         event.listen(self._engine, "connect", _configure_sqlite)
         Base.metadata.create_all(self._engine)
+        # create_all skips existing tables and so their indexes: add indexes introduced
+        # after a database file was created. Idempotent; existing rows stay untouched.
+        with self._engine.begin() as connection:
+            for table in Base.metadata.sorted_tables:
+                for index in table.indexes:
+                    connection.execute(CreateIndex(index, if_not_exists=True))
         self._session = sessionmaker(self._engine, expire_on_commit=False)
 
     def close(self) -> None:
@@ -89,14 +99,25 @@ class JobStore:
     ) -> Job | None:
         """Queue a job unless `owner` already has `max_queued` queued jobs; None if full.
 
-        Count and insert are one INSERT ... SELECT statement, so the count always sees the
-        rows it races with: SQLite runs the statement under the write lock, and concurrent
-        submissions, even through other connections or processes, can't overshoot the cap.
-        Keep the count inside this statement; a separate count before the insert would let
-        two submissions both see room. (With an explicit BEGIN or non-legacy transaction
-        mode, a read earlier in the same transaction would also pin an older snapshot and
-        turn contention into busy errors.)
+        A full queue is rejected by a read alone, without the write lock, so a flood of
+        rejected submissions can't starve other writers (the worker saving results). That
+        read only rejects; it never admits. Admission counts again inside the one
+        INSERT ... SELECT statement, which SQLite runs under the write lock, so the count
+        always sees the rows it races with and concurrent submissions, even through other
+        connections, can't overshoot the cap. Keep that count inside the statement; an
+        unconditional insert after a separate count would let two submissions both see
+        room. The read runs in its own session, closed before the insert, so it never pins
+        an older snapshot for the write.
         """
+        jobs = Job.__table__
+        queued = (
+            select(func.count())
+            .select_from(jobs)
+            .where(jobs.c.owner == owner, jobs.c.status == QUEUED)
+        )
+        with self._session() as session:
+            if session.scalar(queued) >= max_queued:
+                return None
         values = {
             "id": str(uuid.uuid7()),
             "owner": owner,
@@ -108,20 +129,11 @@ class JobStore:
             "seed": seed,
             "created_at": now,
         }
-        jobs = Job.__table__
-        queued = (
-            select(func.count())
-            .select_from(jobs)
-            .where(jobs.c.owner == owner, jobs.c.status == QUEUED)
-            .correlate(None)
-            .scalar_subquery()
-        )
         row = select(*(literal(value, jobs.c[name].type) for name, value in values.items()))
+        has_room = queued.correlate(None).scalar_subquery() < max_queued
         with self._session.begin() as session:
             seq = session.scalar(
-                insert(jobs)
-                .from_select(list(values), row.where(queued < max_queued))
-                .returning(jobs.c.seq)
+                insert(jobs).from_select(list(values), row.where(has_room)).returning(jobs.c.seq)
             )
         return None if seq is None else Job(**values, seq=seq, images=[])
 

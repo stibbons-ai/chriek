@@ -4,13 +4,14 @@ import sqlite3
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from conftest import ALICE, BOB, SMALL, StepBackend, post_job, running, submit, wait_for
+import pytest
+from conftest import ALICE, BOB, SMALL, StepBackend, base_env, post_job, running, submit, wait_for
 
 
 def queue_full(cap: int) -> dict[str, str]:
     return {
         "detail": f"queue full: at most {cap} queued jobs per owner; "
-        "retry after some of them have started"
+        "new jobs are accepted only while fewer are queued"
     }
 
 
@@ -18,31 +19,71 @@ def post(client, prompt: str, headers=ALICE):
     return post_job(client, prompt, headers=headers, **SMALL)
 
 
+def db_file(tmp_path) -> str:
+    return base_env(tmp_path)["CHRIEK_DB_PATH"]
+
+
 def stored_prompts(tmp_path) -> list[str]:
-    with sqlite3.connect(tmp_path / "db" / "chriek.db") as db:
+    with sqlite3.connect(db_file(tmp_path)) as db:
         return [row[0] for row in db.execute("SELECT prompt FROM jobs ORDER BY seq")]
 
 
-def test_full_queue_rejects_with_429_without_storing_or_running_the_job(tmp_path):
+@pytest.mark.parametrize(
+    ("env", "cap"),
+    [
+        ({"CHRIEK_MAX_QUEUED_JOBS": "2"}, 2),
+        ({}, 100),
+        ({"CHRIEK_MAX_QUEUED_JOBS": "2", "CHRIEK_DB_PATH": ":memory:"}, 2),
+    ],
+    ids=["configured", "default", "memory-db"],
+)
+def test_full_queue_rejects_with_429_without_storing_or_running_the_job(tmp_path, env, cap):
     backend = StepBackend()
-    with running(tmp_path, backend=backend, CHRIEK_MAX_QUEUED_JOBS="2") as client:
+    with running(tmp_path, backend=backend, **env) as client:
         running_job = submit(client, prompt="running", **SMALL)
         backend.wait_started(1)  # a running job doesn't count against the cap
-        queued = [submit(client, prompt=f"queued-{n}", **SMALL) for n in range(2)]
+        queued = [submit(client, prompt=f"queued-{n}", **SMALL) for n in range(cap)]
 
         rejected = post(client, "rejected")
 
         assert rejected.status_code == 429
-        assert rejected.json() == queue_full(2)
+        assert rejected.json() == queue_full(cap)
         assert "location" not in rejected.headers
         invalid = client.post("/jobs", headers=ALICE, json={"prompt": "x", "width": 17})
         assert invalid.status_code == 422, "validation comes before the queue limit"
-        assert stored_prompts(tmp_path) == ["running", "queued-0", "queued-1"]
 
-        backend.step(3)
+        backend.step(cap + 2)
         for job in (running_job, *queued):
             assert wait_for(client, job["id"])["status"] == "succeeded"
-    assert backend.prompts == ["running", "queued-0", "queued-1"]
+        # FIFO: had the rejected job been stored, it would have run before this one.
+        after = submit(client, prompt="after", **SMALL)
+        assert wait_for(client, after["id"])["status"] == "succeeded"
+    assert backend.prompts == ["running", *(f"queued-{n}" for n in range(cap)), "after"]
+
+
+def test_full_queue_rejects_while_another_connection_holds_the_write_lock(tmp_path):
+    backend = StepBackend()
+    with running(tmp_path, backend=backend, CHRIEK_MAX_QUEUED_JOBS="1") as client:
+        held = submit(client, prompt="running", **SMALL)
+        backend.wait_started(1)
+        queued = submit(client, prompt="queued", **SMALL)
+
+        # A writer that keeps the lock longer than SQLite's busy timeout, like a flood of
+        # submissions does; a rejection that needed the lock would fail with a 500.
+        writer = sqlite3.connect(db_file(tmp_path), timeout=0, isolation_level=None)
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            for _ in range(3):
+                rejected = post(client, "rejected")
+                assert (rejected.status_code, rejected.json()) == (429, queue_full(1))
+            assert client.get(f"/jobs/{queued['id']}", headers=ALICE).status_code == 200
+        finally:
+            writer.close()
+
+        backend.step(2)
+        for job in (held, queued):
+            assert wait_for(client, job["id"])["status"] == "succeeded"
+    assert stored_prompts(tmp_path) == ["running", "queued"]
 
 
 def test_each_owner_has_an_independent_queue(tmp_path):
@@ -118,9 +159,9 @@ def test_failed_jobs_do_not_take_queue_capacity(tmp_path):
     assert backend.prompts == ["fails", "running", "queued"]
 
 
-def test_concurrent_submissions_through_two_servers_never_exceed_the_cap(tmp_path):
-    # Two app instances on one database file: each has its own SQLite connections, like two
-    # `chriek serve` processes. Both workers are kept busy so queued jobs stay queued.
+def test_concurrent_submissions_through_separate_connections_never_exceed_the_cap(tmp_path):
+    # Two app instances on one database file only to get independent SQLite connections
+    # (one server per database is supported). Both workers stay busy so jobs stay queued.
     backend = StepBackend()
     cap, attempts = 3, 16
     env = {"CHRIEK_MAX_QUEUED_JOBS": str(cap)}

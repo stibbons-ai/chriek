@@ -4,11 +4,14 @@ import io
 import xml.etree.ElementTree as ET
 from urllib.parse import parse_qs, urlsplit
 
+import pytest
 from conftest import (
     ALICE,
     BOB,
     SIGNING_SECRET,
     FakeClock,
+    base_env,
+    proxy_env,
     running,
     submit,
     wait_for,
@@ -117,9 +120,10 @@ def test_malformed_image_paths_are_404(client):
         assert client.get(path).status_code == 404, path
 
 
-def test_links_expire_and_polling_mints_fresh_ones(tmp_path):
+@pytest.mark.parametrize("env_base", [base_env, proxy_env], ids=["api-key", "proxy"])
+def test_links_expire_and_polling_mints_fresh_ones(tmp_path, env_base):
     clock = FakeClock()
-    with running(tmp_path, clock=clock, CHRIEK_URL_TTL_SECONDS="60") as client:
+    with running(tmp_path, clock=clock, env_base=env_base, CHRIEK_URL_TTL_SECONDS="60") as client:
         old = finished_job(client)["images"][0]
         job_id = urlsplit(old["url"]).path.split("/")[2]
 

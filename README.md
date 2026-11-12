@@ -42,6 +42,8 @@ In `proxy` mode chriek does no authentication of its own: the reverse proxy in f
 
 Anyone who reaches chriek's port directly bypasses the proxy and gets full access. Bind chriek where only the proxy can reach it: the default `CHRIEK_HOST=127.0.0.1` with the proxy on the same host, or a private network. `CHRIEK_API_KEYS` must be unset or empty in proxy mode (startup stops otherwise, so nobody relies on keys that are never checked); `CHRIEK_SIGNING_SECRET` is still required, and downloads still need valid signed URLs. Polling is separate per mode: jobs created in one mode can't be polled in the other, even on the same database. Signed download URLs are bearer links and don't depend on the mode: one issued before a mode change keeps working until it expires, as long as the database, image directory and `CHRIEK_SIGNING_SECRET` stay the same.
 
+Download URLs are built from the request's `Host` header and scheme, so the proxy must forward the public `Host` and set `X-Forwarded-Proto: https`. chriek (uvicorn) trusts `X-Forwarded-Proto` only from the addresses in `FORWARDED_ALLOW_IPS`, by default `127.0.0.1` and `::1`. A proxy on another host or in another container needs `FORWARDED_ALLOW_IPS=<the proxy's actual address>`; the value replaces the default list rather than adding to it. Without a trusted proxy address, polled jobs return `http://` download URLs, so clients send the signed link over plain HTTP or the download fails. List only the proxy's own addresses, never `*`: any trusted client can choose the scheme of the URLs it receives.
+
 ```sh
 export CHRIEK_AUTH_MODE=proxy
 unset CHRIEK_API_KEYS
@@ -71,7 +73,7 @@ All configuration comes from environment variables.
 | `CHRIEK_MAX_PIXELS` | `1048576` | Maximum `width * height` (256–67108864). |
 | `CHRIEK_MAX_PROMPT_CHARS` | `2000` | Maximum prompt length in characters (1–100000). |
 
-Relative paths resolve against the working directory. The database schema is created on first start; there are no migrations yet.
+Relative paths resolve against the working directory. The database schema is created on first start, and indexes added by newer chriek versions are created in an existing database file on start, keeping its jobs; there are no other migrations yet.
 
 ### In-memory database
 
@@ -151,7 +153,7 @@ Returns `200 {"status": "ok"}`. If the worker could not save a job's result (suc
 
 ### Queue limit
 
-Each owner may have at most `CHRIEK_MAX_QUEUED_JOBS` jobs (default `100`, configurable 1–100000) in status `queued` at once. Only `queued` jobs count: once the worker starts a job (`running`) it frees its slot, and `succeeded` or `failed` jobs never count. A submission that would exceed the limit returns `429 {"detail": "queue full: at most <n> queued jobs per owner; retry after some of them have started"}`; the rejected job is not stored and never runs. Each API key has its own limit; in `proxy` mode all clients share one. The check and the insert are one SQLite statement, so concurrent submissions, also from several `chriek serve` processes on the same database file, can't exceed the limit.
+Each owner may have at most `CHRIEK_MAX_QUEUED_JOBS` jobs (default `100`, configurable 1–100000) in status `queued` at once. Only `queued` jobs count: once the worker starts a job (`running`) it frees its slot, and `succeeded` or `failed` jobs never count. A submission that would exceed the limit returns `429 {"detail": "queue full: at most <n> queued jobs per owner; new jobs are accepted only while fewer are queued"}`; the rejected job is not stored and never runs. A full queue frees up only while the worker runs; if it has stopped (`GET /health` returns `503`), retrying doesn't help until chriek restarts. Each API key has its own limit; in `proxy` mode all clients share one. A full queue is rejected by a read alone, so rejected submissions don't hold up other writers such as the worker. Admission counts again inside the same SQLite statement that inserts the job, so concurrent submissions, even through separate database connections, can't exceed the limit. Run one `chriek serve` per database file: on startup each server fails every `running` job as interrupted, including jobs another live server is rendering.
 
 ## Operator obligations under the FLUX Kommunity License
 
@@ -191,4 +193,4 @@ uv sync --locked && uv run --locked pre-commit run jscpd --all-files && uv run r
 
 The TLS tests generate throwaway certificates with the `openssl` command, so it must be on `PATH` (OpenSSL or LibreSSL).
 
-Tests drive chriek only through its HTTP API and the installed `chriek` command, with the fake backend.
+Tests drive chriek through its HTTP API and the installed `chriek` command, with the fake backend. A few go further where HTTP can't reach: they parse configuration directly, inject store write failures, or open the SQLite file to read back stored jobs and to hold its write lock from another connection.

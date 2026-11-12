@@ -26,6 +26,7 @@ from conftest import (
     proxy_env,
     submit,
     wait_for,
+    with_query,
 )
 from PIL import Image
 
@@ -56,6 +57,21 @@ def exit_output(process: subprocess.Popen) -> str:
 EMOJI_KEY = "\N{OTTER}" * 32
 LATIN1_KEY = "\N{LATIN SMALL LETTER E WITH ACUTE}" * 32
 CONTROL_KEY = ALICE_KEY + "\x07"
+
+
+def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str) -> None:
+    """Startup stopped with exit code 2, named the problem, leaked no secret, opened nothing."""
+    output = exit_output(process)
+
+    assert process.returncode == 2
+    assert output.startswith("chriek: configuration error: ")
+    assert message in output
+    for secret in (ALICE_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
+        assert secret not in output
+    for secret in (EMOJI_KEY, LATIN1_KEY):
+        assert secret[:2] not in output
+    assert "PRIVATE KEY" not in output
+    assert not (tmp_path / "db").exists(), "nothing may start on invalid configuration"
 
 
 @pytest.mark.parametrize(
@@ -106,18 +122,7 @@ CONTROL_KEY = ALICE_KEY + "\x07"
     ],
 )
 def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrides, message):
-    env = base_env(tmp_path) | overrides
-    process = serve(env)
-    output = exit_output(process)
-
-    assert process.returncode == 2
-    assert output.startswith("chriek: configuration error: ")
-    assert message in output
-    for secret in (ALICE_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
-        assert secret not in output
-    for secret in (EMOJI_KEY, LATIN1_KEY):
-        assert secret[:2] not in output
-    assert not (tmp_path / "db").exists(), "nothing may start on invalid configuration"
+    assert_config_error(serve(base_env(tmp_path) | overrides), tmp_path, message)
 
 
 def free_port() -> int:
@@ -260,13 +265,7 @@ def bad_tls_files(tmp_path: Path, kind: str) -> tuple[Path, Path]:
 def test_unusable_tls_files_stop_startup_instead_of_serving_plain_http(tmp_path, kind, message):
     cert, key = bad_tls_files(tmp_path, kind)
     process = serve(tls_env(tmp_path, cert, key), stdin=subprocess.DEVNULL)
-    output = exit_output(process)
-
-    assert process.returncode == 2
-    assert output.startswith("chriek: configuration error: ")
-    assert message in output
-    assert "PRIVATE KEY" not in output
-    assert not (tmp_path / "db").exists(), "nothing may start on invalid configuration"
+    assert_config_error(process, tmp_path, message)
 
 
 def test_walkthrough_api_key_operator_keeps_owners_apart(tmp_path):
@@ -285,7 +284,7 @@ def test_walkthrough_api_key_operator_keeps_owners_apart(tmp_path):
 
 def test_walkthrough_proxy_operator_without_api_keys_shares_one_owner(tmp_path):
     with served(proxy_env(tmp_path)) as client:
-        anonymous = submit(client, prompt="anonymous", **SMALL)
+        anonymous = submit(client, headers={}, prompt="anonymous", **SMALL)
         claimed = submit(client, headers={"X-Forwarded-User": "bob"}, prompt="claimed", **SMALL)
 
         for job in (anonymous, claimed):
@@ -293,7 +292,7 @@ def test_walkthrough_proxy_operator_without_api_keys_shares_one_owner(tmp_path):
                 assert wait_for(client, job["id"], headers=headers)["status"] == "succeeded"
         url = wait_for(client, claimed["id"])["images"][0]["url"]
         assert client.get(url).status_code == 200
-        assert client.get(url.replace("sig=", "sig=0")).status_code == 403
+        assert client.get(with_query(url, sig="0" * 64)).status_code == 403
 
 
 def test_walkthrough_native_tls_operator_downloads_over_https_only(tmp_path):
@@ -306,7 +305,7 @@ def test_walkthrough_native_tls_operator_downloads_over_https_only(tmp_path):
         download = client.get(url)
         assert download.status_code == 200
         assert Image.open(io.BytesIO(download.content)).text["Seed"] == "5"
-        assert client.get(url.replace("sig=", "sig=0")).status_code == 403
+        assert client.get(with_query(url, sig="0" * 64)).status_code == 403
 
         plain = f"http://127.0.0.1:{client.base_url.port}/health"
         with pytest.raises(httpx2.TransportError):
