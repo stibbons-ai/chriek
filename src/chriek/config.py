@@ -159,7 +159,9 @@ def _tls(env: Mapping[str, str]) -> Tls | None:
     try:
         # Loading the pair here turns a bad file into a configuration error before the
         # database or port opens. The callback rejects encrypted keys instead of prompting.
-        ssl.create_default_context(ssl.Purpose.CLIENT_AUTH).load_cert_chain(
+        # A bare server context, like uvicorn's: create_default_context would also open
+        # SSLKEYLOGFILE and blame its failure on the certificate pair.
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(
             tls.certfile, tls.keyfile, password=_reject_encrypted_key
         )
     except OSError as error:  # ssl.SSLError is an OSError

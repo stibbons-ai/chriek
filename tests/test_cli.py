@@ -77,6 +77,7 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
+        ({"CHRIEK_API_KEYS": None}, "CHRIEK_API_KEYS must name at least one key"),
         ({"CHRIEK_API_KEYS": ""}, "CHRIEK_API_KEYS must name at least one key"),
         ({"CHRIEK_API_KEYS": "alice:short-secret-key"}, "at least 32 printable ASCII"),
         ({"CHRIEK_API_KEYS": f"alice:{EMOJI_KEY}"}, "at least 32 printable ASCII"),
@@ -106,6 +107,14 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
             {"CHRIEK_AUTH_MODE": "proxy", "CHRIEK_API_KEYS": "", "CHRIEK_SIGNING_SECRET": ""},
             "CHRIEK_SIGNING_SECRET must be at least 32",
         ),
+        (
+            {
+                "CHRIEK_AUTH_MODE": "proxy",
+                "CHRIEK_API_KEYS": None,
+                "CHRIEK_SIGNING_SECRET": "short-signing-secret",
+            },
+            "CHRIEK_SIGNING_SECRET must be at least 32",
+        ),
         ({"CHRIEK_MAX_QUEUED_JOBS": "0"}, "CHRIEK_MAX_QUEUED_JOBS must be between 1 and 100000"),
         ({"CHRIEK_MAX_QUEUED_JOBS": "100001"}, "CHRIEK_MAX_QUEUED_JOBS must be between"),
         ({"CHRIEK_MAX_QUEUED_JOBS": "lots"}, "CHRIEK_MAX_QUEUED_JOBS must be an integer"),
@@ -122,7 +131,10 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
     ],
 )
 def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrides, message):
-    assert_config_error(serve(base_env(tmp_path) | overrides), tmp_path, message)
+    # An override of None removes the variable, so nothing configured at all is covered too.
+    env = base_env(tmp_path) | overrides
+    env = {name: value for name, value in env.items() if value is not None}
+    assert_config_error(serve(env), tmp_path, message)
 
 
 def free_port() -> int:
@@ -230,8 +242,8 @@ def make_tls_files(directory: Path, name: str = "server") -> tuple[Path, Path]:
     return cert, key
 
 
-def tls_env(tmp_path: Path, cert: Path, key: Path) -> dict[str, str]:
-    return base_env(tmp_path) | {"CHRIEK_TLS_CERTFILE": str(cert), "CHRIEK_TLS_KEYFILE": str(key)}
+def tls_env(tmp_path: Path, cert: Path, key: Path, env_base=base_env) -> dict[str, str]:
+    return env_base(tmp_path) | {"CHRIEK_TLS_CERTFILE": str(cert), "CHRIEK_TLS_KEYFILE": str(key)}
 
 
 UNUSABLE_TLS = "must name a readable PEM certificate and its unencrypted private key"
@@ -282,22 +294,49 @@ def test_walkthrough_api_key_operator_keeps_owners_apart(tmp_path):
         assert client.get(alice["images"][0]["url"]).status_code == 200
 
 
-def test_walkthrough_proxy_operator_without_api_keys_shares_one_owner(tmp_path):
-    with served(proxy_env(tmp_path)) as client:
+# What the reverse proxy sends: the public host, and that the client used HTTPS.
+FORWARDED_HTTPS = {"Host": "img.example.com", "X-Forwarded-Proto": "https"}
+
+
+@pytest.mark.parametrize(
+    ("allowed", "scheme"),
+    [("127.0.0.1", "https"), ("192.0.2.1", "http")],
+    ids=["proxy-trusted", "proxy-untrusted"],
+)
+def test_walkthrough_proxy_operator_without_api_keys_shares_one_owner(tmp_path, allowed, scheme):
+    with served(proxy_env(tmp_path) | {"FORWARDED_ALLOW_IPS": allowed}) as client:
         anonymous = submit(client, headers={}, prompt="anonymous", **SMALL)
-        claimed = submit(client, headers={"X-Forwarded-User": "bob"}, prompt="claimed", **SMALL)
+        claimed = submit(
+            client,
+            headers={"X-Forwarded-User": "bob", "X-Forwarded-For": "203.0.113.7"},
+            prompt="claimed",
+            **SMALL,
+        )
 
         for job in (anonymous, claimed):
-            for headers in ({}, ALICE, {"X-Forwarded-User": "someone-else"}):
+            for headers in (
+                {},
+                ALICE,
+                {"X-Forwarded-User": "someone-else", "X-Forwarded-For": "198.51.100.9"},
+            ):
                 assert wait_for(client, job["id"], headers=headers)["status"] == "succeeded"
         url = wait_for(client, claimed["id"])["images"][0]["url"]
         assert client.get(url).status_code == 200
         assert client.get(with_query(url, sig="0" * 64)).status_code == 403
 
+        # Only a trusted proxy address may set the scheme of the download URLs.
+        forwarded = wait_for(client, claimed["id"], headers=FORWARDED_HTTPS)["images"][0]["url"]
+        assert forwarded.startswith(f"{scheme}://img.example.com/images/{claimed['id']}/")
 
-def test_walkthrough_native_tls_operator_downloads_over_https_only(tmp_path):
+
+@pytest.mark.parametrize("env_base", [base_env, proxy_env], ids=["api-key", "proxy"])
+def test_walkthrough_native_tls_operator_downloads_over_https_only(tmp_path, env_base):
     cert, key = make_tls_files(tmp_path / "tls")
-    with served_process(tls_env(tmp_path, cert, key), ca=cert) as (process, client):
+    # uvicorn ignores SSLKEYLOGFILE, so a key log path in a missing directory must not stop TLS.
+    env = tls_env(tmp_path, cert, key, env_base) | {
+        "SSLKEYLOGFILE": str(tmp_path / "absent" / "keys.log")
+    }
+    with served_process(env, ca=cert) as (process, client):
         body = wait_for(client, submit(client, seed=5, width=32, height=16)["id"])
         assert body["status"] == "succeeded", body
         url = body["images"][0]["url"]

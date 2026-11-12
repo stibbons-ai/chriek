@@ -99,15 +99,16 @@ class JobStore:
     ) -> Job | None:
         """Queue a job unless `owner` already has `max_queued` queued jobs; None if full.
 
-        A full queue is rejected by a read alone, without the write lock, so a flood of
-        rejected submissions can't starve other writers (the worker saving results). That
-        read only rejects; it never admits. Admission counts again inside the one
+        A queue that is already full when read is rejected by that read alone, without the
+        write lock, so a flood of submissions against a full queue doesn't hold up other
+        writers (the worker saving results). That read only rejects; it never admits.
+        Submissions that pass it while the queue is near the cap wait for the write lock
+        and may still be rejected there: admission counts again inside the one
         INSERT ... SELECT statement, which SQLite runs under the write lock, so the count
         always sees the rows it races with and concurrent submissions, even through other
         connections, can't overshoot the cap. Keep that count inside the statement; an
         unconditional insert after a separate count would let two submissions both see
-        room. The read runs in its own session, closed before the insert, so it never pins
-        an older snapshot for the write.
+        room.
         """
         jobs = Job.__table__
         queued = (

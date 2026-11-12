@@ -1,4 +1,5 @@
-"""Shared HTTP test helpers. Tests talk to chriek through its HTTP API (and CLI)."""
+"""Shared test helpers. Most tests talk to chriek through its HTTP API or the installed
+CLI; a few check configuration, the store or the SQLite file directly (see README.md)."""
 
 import threading
 import time

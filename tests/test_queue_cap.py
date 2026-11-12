@@ -36,9 +36,10 @@ def stored_prompts(tmp_path) -> list[str]:
     [
         ({"CHRIEK_MAX_QUEUED_JOBS": "2"}, 2),
         ({}, 100),
+        ({"CHRIEK_MAX_QUEUED_JOBS": "150"}, 150),
         ({"CHRIEK_MAX_QUEUED_JOBS": "2", "CHRIEK_DB_PATH": ":memory:"}, 2),
     ],
-    ids=["configured", "default", "memory-db"],
+    ids=["configured", "default", "above-default", "memory-db"],
 )
 def test_full_queue_rejects_with_429_without_storing_or_running_the_job(tmp_path, env, cap):
     backend = StepBackend()
