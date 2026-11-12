@@ -62,6 +62,8 @@ Relative paths resolve against the working directory. The database schema is cre
 
 Every `/jobs` request needs `Authorization: Bearer <key>`. A missing or invalid key returns `401` before the request body is read, so even a malformed body gets `401`. A job created with another key returns `404`, exactly like a job that doesn't exist. `GET /health` and image downloads need no key.
 
+This README is the API reference. chriek serves no runtime documentation or schema: `/docs`, `/redoc`, `/openapi.json` and `/docs/oauth2-redirect` return `404` with or without a key.
+
 ### `POST /jobs`
 
 ```sh

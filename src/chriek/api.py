@@ -68,7 +68,8 @@ def create_app(
         worker.stop(WORKER_STOP_TIMEOUT_SECONDS)
         store.close()
 
-    app = FastAPI(title="chriek", lifespan=lifespan)
+    # No openapi_url also unregisters /docs, /redoc and /docs/oauth2-redirect.
+    app = FastAPI(title="chriek", lifespan=lifespan, openapi_url=None)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:

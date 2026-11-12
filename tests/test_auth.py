@@ -118,3 +118,13 @@ def test_health_needs_no_key_and_reveals_nothing(client):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize(
+    "headers", [{}, {"Authorization": "Bearer invalid"}, ALICE], ids=["missing", "invalid", "valid"]
+)
+@pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"])
+def test_runtime_docs_and_schema_are_not_served(client, headers, path):
+    response = client.get(path, headers=headers)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
