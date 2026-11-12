@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -28,6 +29,23 @@ from chriek.worker import Worker
 root = Path(sys.argv[1])
 db_path = root / "data" / "db" / "chriek.db"
 paused, resume = threading.Event(), threading.Event()
+exposed = set()
+
+
+def watch(event, args):
+    # Before every Python-level open, chmod, mkdir or rename, nothing created so far may be
+    # open to other users: a file created readable and fixed later is caught at the fix.
+    if event not in ("open", "os.chmod", "os.mkdir", "os.rename"):
+        return
+    for path in root.rglob("*"):
+        try:
+            if path.lstat().st_mode & 0o077:
+                exposed.add(str(path.relative_to(root)))
+        except FileNotFoundError:  # removed by the worker meanwhile
+            pass
+
+
+sys.addaudithook(watch)
 
 
 class PausingBackend(FakeBackend):
@@ -57,7 +75,7 @@ store = JobStore(db_path)
 store.create(owner="alice", prompt="q", image_count=1, width=16, height=16, seed=0, now=1.0)
 seen["reopened"] = modes(root)
 store.close()
-print(json.dumps(seen))
+print(json.dumps(seen | {"exposed": sorted(exposed)}))
 """
 
 
@@ -90,6 +108,7 @@ def test_direct_store_and_worker_keep_everything_private_under_umask_022(tmp_pat
     }
     assert seen["done"] == database | sidecars | published
     assert seen["closed"] == database | published
+    assert seen["exposed"] == [], "created readable, made private only afterwards"
     assert seen["reopened"] == database | sidecars | published  # recreated sidecars
 
 
@@ -112,6 +131,14 @@ def make(path: Path, mode: int, *, directory: bool = False) -> None:
 def relink(path: Path, target: Path) -> None:
     path.rename(target)
     path.symlink_to(target)
+
+
+def replace(path: Path, mode: int, *, directory: bool = False) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    make(path, mode, directory=directory)
 
 
 # How to make an existing private installation unsafe, and the path chriek must name.
@@ -143,6 +170,16 @@ UNSAFE = {
     "image linked": (
         lambda t, job: relink(t / "images" / job / "0.png", t / "elsewhere.png"),
         "images/{job}/0.png",
+    ),
+    "image root not a directory": (lambda t, job: replace(t / "images", 0o600), "images"),
+    "database dir not a directory": (lambda t, job: replace(t / "db", 0o600), "db"),
+    "database not a regular file": (
+        lambda t, job: replace(t / "db/chriek.db", 0o700, directory=True),
+        "db/chriek.db",
+    ),
+    "wal not a regular file": (
+        lambda t, job: make(t / "db/chriek.db-wal", 0o700, directory=True),
+        "db/chriek.db-wal",
     ),
 }
 
@@ -179,14 +216,146 @@ def test_store_and_worker_refuse_unsafe_storage_when_used_directly(tmp_path):
         store.close()
 
 
-def test_storage_owned_by_another_user_is_refused(tmp_path, monkeypatch):
+def report_owned_by_another_user(monkeypatch, target: Path) -> int:
+    """Make stat and lstat report `target` as owned by another UID; returns that UID."""
+    foreign = os.geteuid() + 1
+    for name in ("stat", "lstat"):
+        real = getattr(os, name)
+
+        def fake(path, *args, _real=real, **kwargs):
+            info = _real(path, *args, **kwargs)
+            if isinstance(path, str | Path) and Path(path) == target:
+                return os.stat_result((*info[:4], foreign, *info[5:10]))
+            return info
+
+        monkeypatch.setattr(os, name, fake)
+    return foreign
+
+
+def test_an_ancestor_owned_by_another_user_is_refused(tmp_path, monkeypatch):
     installed(tmp_path)
     before = tree_state(tmp_path)
-    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+    foreign = report_owned_by_another_user(monkeypatch, tmp_path)
 
-    with pytest.raises(StorageError, match=rf"owned by uid {os.getuid()}"), running(tmp_path):
+    with pytest.raises(StorageError) as error, running(tmp_path):
+        pass
+    monkeypatch.undo()
+    assert str(error.value).startswith(f"{tmp_path} is an ancestor owned by uid {foreign}.")
+    assert tree_state(tmp_path) == before
+
+
+@pytest.mark.parametrize(
+    "culprit",
+    ["images", "images/{job}", "images/{job}/0.png", "db", "db/chriek.db", "db/chriek.db-wal"],
+)
+def test_storage_owned_by_another_user_is_refused(tmp_path, monkeypatch, culprit):
+    job = installed(tmp_path)
+    make(tmp_path / "db/chriek.db-wal", 0o600)
+    culprit = tmp_path / culprit.format(job=job)
+    before = tree_state(tmp_path)
+    foreign = report_owned_by_another_user(monkeypatch, culprit)
+
+    with pytest.raises(StorageError) as error, running(tmp_path):
+        pass
+    monkeypatch.undo()
+    assert str(error.value).startswith(f"{culprit} is owned by uid {foreign}, not the service")
+    assert tree_state(tmp_path) == before
+
+
+# Each case: an unsafe side plus a missing side; neither may be created before the refusal.
+PARTLY_MISSING = {
+    "unsafe database root, images missing inside it": (
+        lambda t: (make(t / "data", 0o755, directory=True), make(t / "data/chriek.db", 0o644)),
+        {"CHRIEK_DB_PATH": "data/chriek.db", "CHRIEK_STORAGE_DIR": "data/images"},
+    ),
+    "unsafe database root, images missing elsewhere": (
+        lambda t: make(t / "db", 0o755, directory=True),
+        {"CHRIEK_DB_PATH": "db/chriek.db", "CHRIEK_STORAGE_DIR": "new/images"},
+    ),
+    "unsafe image root, database missing": (
+        lambda t: make(t / "images", 0o755, directory=True),
+        {"CHRIEK_DB_PATH": "new/chriek.db", "CHRIEK_STORAGE_DIR": "images"},
+    ),
+}
+
+
+@pytest.mark.parametrize(("setup", "paths"), PARTLY_MISSING.values(), ids=PARTLY_MISSING.keys())
+def test_one_unsafe_side_stops_startup_before_the_other_is_created(tmp_path, setup, paths):
+    setup(tmp_path)
+    before = tree_state(tmp_path)
+    env = {name: str(tmp_path / path) for name, path in paths.items()}
+
+    with pytest.raises(StorageError), running(tmp_path, **env):
         pass
     assert tree_state(tmp_path) == before
+
+
+@pytest.mark.parametrize("inject", ["directory", "symlink"])
+def test_a_level_appearing_while_chriek_creates_it_is_refused(tmp_path, monkeypatch, inject):
+    """Stand-in for another user racing chriek in a sticky world-writable directory."""
+    sticky = tmp_path / "sticky"
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    (tmp_path / "elsewhere").mkdir(mode=0o700)
+    level = sticky / "chriek-data"
+    real_stat = os.stat
+    injected = {}
+
+    def racing_stat(path, *args, **kwargs):
+        # The ancestor walk stats "/" last: inject after every check, before any creation.
+        if not injected and isinstance(path, str | Path) and Path(path) == Path("/"):
+            if inject == "directory":
+                os.mkdir(level, 0o777)
+                level.chmod(0o777)
+            else:
+                level.symlink_to(tmp_path / "elsewhere")
+            injected.update(tree_state(tmp_path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", racing_stat)
+    with pytest.raises(StorageError) as error:
+        JobStore(level / "db" / "chriek.db")
+    monkeypatch.undo()
+    assert str(error.value).startswith(f"{level} ")
+    assert tree_state(tmp_path) == injected, "nothing may be created in or below the newcomer"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
+def test_an_image_directory_chriek_cannot_list_is_refused(tmp_path):
+    job = installed(tmp_path)
+    (tmp_path / "images" / job / "0.png").chmod(0o644)
+    before = tree_state(tmp_path)
+    (tmp_path / "images" / job).chmod(0o300)  # entries can't be listed, so not checked
+
+    try:
+        with pytest.raises(StorageError) as error, running(tmp_path):
+            pass
+    finally:
+        (tmp_path / "images" / job).chmod(0o700)
+    assert str(error.value).startswith(f"{tmp_path / 'images' / job} ")
+    assert tree_state(tmp_path) == before
+
+
+def test_a_linked_ancestor_is_followed_to_its_private_target(tmp_path):
+    """Like macOS's /var -> /private/var: links above the configured paths are fine."""
+    (tmp_path / "real").mkdir(mode=0o700)
+    (tmp_path / "alias").symlink_to(tmp_path / "real")
+    env = {
+        "CHRIEK_DB_PATH": str(tmp_path / "alias/chriek/db/chriek.db"),
+        "CHRIEK_STORAGE_DIR": str(tmp_path / "alias/chriek/images"),
+    }
+    with running(tmp_path, **env) as client:
+        job = wait_for(client, submit(client, width=16, height=16)["id"])
+        assert client.get(job["images"][0]["url"]).status_code == 200
+
+    assert modes(tmp_path / "real") == {
+        "chriek": 0o700,
+        "chriek/db": 0o700,
+        "chriek/db/chriek.db": 0o600,
+        "chriek/images": 0o700,
+        f"chriek/images/{job['id']}": 0o700,
+        f"chriek/images/{job['id']}/0.png": 0o600,
+    }
 
 
 def shared_install(tmp_path: Path, mode: int) -> tuple[Path, dict[str, str]]:

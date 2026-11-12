@@ -64,14 +64,17 @@ Relative paths resolve against the working directory. The database schema is cre
 
 Jobs and images are private to the user chriek runs as (the service user) on POSIX filesystems. The database's directory (the parent of `CHRIEK_DB_PATH`) and `CHRIEK_STORAGE_DIR` must be dedicated to chriek and owned by the service user; the defaults (`chriek-data/` and `chriek-data/images/`) are. chriek creates missing directories with mode `0700`, the database with `0600` (SQLite gives its `-wal` and `-shm` sidecars the database's mode, also when it recreates them) and every PNG with `0600` from its first byte, including while a job is still rendering. This holds whatever the process umask is, for `chriek serve` and for code that embeds chriek's app, store or worker.
 
-Before the database is opened or any job runs, chriek checks, and refuses to start if any check fails (`chriek serve` prints `chriek: storage error: <path> <problem>` and exits with status 2 without listening):
+Before the database is opened, any job runs or any missing directory is created, chriek checks both configured storage sides and refuses to start if any check fails (`chriek serve` prints `chriek: storage error: <path> <problem>. <guidance>` and exits with status 2 without listening):
 
-- The database's directory and `CHRIEK_STORAGE_DIR`: a directory, not a symbolic link, owned by the service user (effective UID), no group or other permission bits (`mode & 077 == 0`).
-- Every existing ancestor of those two directories, after resolving symbolic links: owned by root or the service user, and not writable by group or others unless the sticky bit is set (as on `/tmp`). Links in ancestors, such as macOS's `/var`, are fine.
-- The database file and any existing `-wal`, `-shm` or `-journal` sidecar: a regular file, not a symbolic link, owned by the service user, no group or other permission bits.
-- Every file and directory below `CHRIEK_STORAGE_DIR`: not a symbolic link, owned by the service user, no group or other permission bits.
+- The database's directory and `CHRIEK_STORAGE_DIR`, if they exist: a directory, not a symbolic link, owned by the service user (effective UID), no group or other permission bits (`mode & 077 == 0`).
+- Every existing ancestor of those two directories, after resolving symbolic links: a directory, owned by root or the service user, and not writable by group or others unless the sticky bit is set (as on `/tmp`). Links in ancestors, such as macOS's `/var`, are resolved once at startup and chriek uses the real path from then on, so the configured paths, including any links in them, must be trusted.
+- Every file and directory below `CHRIEK_STORAGE_DIR`: not a symbolic link, owned by the service user, no group or other permission bits. A directory chriek can't list fails the check.
+
+A path chriek can't check or create (for example below a regular file or a directory it can't write) is reported the same way. If a missing directory appears while chriek is creating it, chriek refuses it rather than using a directory it didn't create.
 
 chriek never changes permissions or ownership of anything that already exists: not your data, not the directories above it. A bare filename such as `CHRIEK_DB_PATH=chriek.db` puts the database in the working directory, which is usually shared (`0755`) and is refused; point it into a dedicated directory such as `chriek-data/chriek.db` instead. With `CHRIEK_DB_PATH=:memory:` there is no database file, and `CHRIEK_STORAGE_DIR` is checked and protected the same way.
+
+A group-writable ancestor is refused even when the group is private to you: mode bits can't tell a private group from a shared one. Under umask `002` (the default for user-private groups on some Linux distributions) your own project directory is `0775`, so chriek refuses the default `chriek-data/` inside it. Configure dedicated paths under an ancestor only you or root can write, such as a directory in your home created with `mkdir -m 700`, or remove group write from your own directory (`chmod g-w <dir>`) if no one else relies on it.
 
 **Migrating an existing installation.** Earlier versions created directories `0755` and files `0644`, so chriek refuses to start on their data. Stop chriek, then as the service user make only chriek's dedicated directories private and restart:
 
@@ -80,13 +83,17 @@ chriek never changes permissions or ownership of anything that already exists: n
 chmod -R go= chriek-data
 ```
 
-If the database sits in a shared directory, move it with its sidecars into a new dedicated directory and set `CHRIEK_DB_PATH` to the new location:
+If the database sits in a shared directory, stop every process that uses it, then move it together with each of its sidecars that exists into a new dedicated directory and set `CHRIEK_DB_PATH` to the new location. A `-wal` file left by an unclean stop holds jobs not yet in `chriek.db`, so it must move with it:
 
 ```sh
+# Every chriek process stopped; run as the service user in the shared directory.
 mkdir -m 700 chriek-db
-mv chriek.db chriek-db/            # plus chriek.db-wal / chriek.db-shm if present
-chmod go= chriek-db/chriek.db*
+for file in chriek.db chriek.db-wal chriek.db-shm chriek.db-journal; do
+  if [ -e "$file" ]; then mv "$file" chriek-db/ && chmod go= "chriek-db/$file"; fi
+done
 ```
+
+The names are exact on purpose: a pattern such as `chriek.db*` would also move unrelated files like backups.
 
 A configured path that is a symbolic link is refused; configure its real target instead. Data owned by another user must be copied or `chown`ed by an administrator before chriek will use it.
 

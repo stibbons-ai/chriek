@@ -5,6 +5,8 @@ Existing paths are checked, never repaired: chriek refuses to start rather than 
 
 import os
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import NoReturn
 
@@ -23,39 +25,20 @@ class StorageError(RuntimeError):
     """Configured storage is not private to the service user; nothing existing was changed."""
 
 
-def private_dir(path: Path) -> Path:
-    """Check or create a dedicated private directory and return its real path.
-
-    Missing levels are created 0700; existing ancestors are only checked, never modified.
-    """
-    path = Path(os.path.abspath(path))
-    if path.is_symlink():
-        _reject(path, "is a symbolic link")
-    real = path.resolve()
-    missing = [real]
-    for parent in real.parents:
-        if not parent.exists():
-            missing.append(parent)
-            continue
-        info = os.stat(parent)
-        if info.st_uid not in (0, os.geteuid()):
-            _reject(parent, f"is an ancestor owned by uid {info.st_uid}")
-        if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
-            _reject(parent, "is an ancestor that other users can modify")
-    for directory in reversed(missing):
-        if not directory.exists():
-            os.mkdir(directory, PRIVATE_DIR_MODE)
-    if not stat.S_ISDIR(_check_private(real).st_mode):
-        _reject(real, "is not a directory")
-    return real
-
-
 def private_image_root(path: Path) -> Path:
-    """`private_dir` plus a check of every stored entry below it."""
-    root = private_dir(path)
-    for entry in root.rglob("*"):  # yields links without following them
-        _check_private(entry)
+    """Check the image root and everything below it; create it 0700 if missing; return real path."""
+    with _os_errors(path):
+        root, missing = _checked_dir(path)
+        if not missing:
+            _check_tree(root)
+        _create(missing)
     return root
+
+
+def check_database(db_path: Path) -> None:
+    """Every check `private_database` makes, without creating anything."""
+    with _os_errors(db_path):
+        _checked_database(db_path)
 
 
 def private_database(db_path: Path) -> Path:
@@ -63,12 +46,11 @@ def private_database(db_path: Path) -> Path:
 
     SQLite creates its sidecars with the database file's mode, so they stay private too.
     """
-    db_path = private_dir(db_path.parent) / db_path.name
-    for path in (db_path, *(Path(f"{db_path}{suffix}") for suffix in _SQLITE_SIDECARS)):
-        if path.exists(follow_symlinks=False) and not stat.S_ISREG(_check_private(path).st_mode):
-            _reject(path, "is not a regular file")
-    if not db_path.exists():
-        write_private(db_path, b"")
+    with _os_errors(db_path):
+        db_path, missing = _checked_database(db_path)
+        _create(missing)
+        if not db_path.exists():
+            write_private(db_path, b"")
     return db_path
 
 
@@ -77,6 +59,63 @@ def write_private(path: Path, data: bytes) -> None:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, _PRIVATE_FILE_MODE)
     with open(fd, "wb") as file:
         file.write(data)
+
+
+def _checked_database(db_path: Path) -> tuple[Path, list[Path]]:
+    parent, missing = _checked_dir(db_path.parent)
+    db_path = parent / db_path.name
+    for path in (db_path, *(Path(f"{db_path}{suffix}") for suffix in _SQLITE_SIDECARS)):
+        if path.exists(follow_symlinks=False) and not stat.S_ISREG(_check_private(path).st_mode):
+            _reject(path, "is not a regular file")
+    return db_path, missing
+
+
+def _checked_dir(path: Path) -> tuple[Path, list[Path]]:
+    """Check a dedicated directory and its ancestors without creating anything.
+
+    Returns the real path and its missing levels, outermost first.
+    """
+    path = Path(os.path.abspath(path))
+    if path.is_symlink():
+        _reject(path, "is a symbolic link")
+    real = path.resolve()
+    missing = []
+    if real.exists(follow_symlinks=False):
+        if not stat.S_ISDIR(_check_private(real).st_mode):
+            _reject(real, "is not a directory")
+    else:
+        missing.append(real)
+    for parent in real.parents:
+        if not parent.exists():
+            missing.append(parent)
+            continue
+        info = os.stat(parent)
+        if not stat.S_ISDIR(info.st_mode):
+            _reject(parent, "is an ancestor that is not a directory")
+        if info.st_uid not in (0, os.geteuid()):
+            _reject(parent, f"is an ancestor owned by uid {info.st_uid}")
+        if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+            _reject(parent, "is an ancestor that other users can modify")
+    return real, missing[::-1]
+
+
+def _create(missing: list[Path]) -> None:
+    for directory in missing:
+        try:
+            os.mkdir(directory, PRIVATE_DIR_MODE)
+        except FileExistsError:
+            # Created by someone else after the checks: never adopt or create below it.
+            _reject(directory, "appeared while chriek was creating it")
+
+
+def _check_tree(root: Path) -> None:
+    def fail(error: OSError) -> NoReturn:
+        raise error
+
+    # os.walk doesn't follow links; `fail` stops it skipping directories it can't list.
+    for directory, dirs, files in os.walk(root, onerror=fail):
+        for name in dirs + files:
+            _check_private(Path(directory, name))
 
 
 def _check_private(path: Path) -> os.stat_result:
@@ -88,6 +127,16 @@ def _check_private(path: Path) -> os.stat_result:
     if info.st_mode & 0o077:
         _reject(path, f"is accessible to other users (mode {stat.S_IMODE(info.st_mode):04o})")
     return info
+
+
+@contextmanager
+def _os_errors(path: Path) -> Iterator[None]:
+    try:
+        yield
+    except OSError as error:
+        culprit = error.filename or path
+        problem = error.strerror or error
+        raise StorageError(f"{culprit} cannot be used ({problem}). {_GUIDANCE}") from error
 
 
 def _reject(path: Path, problem: str) -> NoReturn:

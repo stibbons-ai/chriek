@@ -235,3 +235,40 @@ def test_chriek_serve_refuses_a_shared_database_directory_without_changing_it(tm
     )
     assert "Uvicorn running on" not in output
     assert tree_state(shared) == before
+
+
+def regular_file(tmp_path: Path) -> Path:
+    (tmp_path / "file").write_text("x")
+    return tmp_path / "file"
+
+
+def read_only_directory(tmp_path: Path) -> Path:
+    (tmp_path / "read-only").mkdir(mode=0o500)
+    return tmp_path / "read-only"
+
+
+@pytest.mark.parametrize(
+    ("variable", "below"),
+    [
+        pytest.param("CHRIEK_DB_PATH", regular_file, id="database below a regular file"),
+        pytest.param("CHRIEK_STORAGE_DIR", regular_file, id="images below a regular file"),
+        pytest.param(
+            "CHRIEK_STORAGE_DIR",
+            read_only_directory,
+            id="images below a read-only directory",
+            marks=pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes"),
+        ),
+    ],
+)
+def test_chriek_serve_reports_an_unusable_storage_path_without_a_traceback(
+    tmp_path, variable, below
+):
+    env = base_env(tmp_path) | {variable: str(below(tmp_path) / "chriek" / "data")}
+    before = tree_state(tmp_path)
+    process = serve(env)
+    output, _ = process.communicate(timeout=30)
+
+    assert process.returncode == 2, output
+    assert output.startswith("chriek: storage error: "), output
+    assert "Traceback" not in output
+    assert tree_state(tmp_path) == before, "no database or directory may be created"

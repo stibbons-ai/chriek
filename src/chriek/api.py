@@ -21,8 +21,8 @@ from chriek.auth import ApiKeyAuth
 from chriek.backend import FakeBackend, ImageBackend
 from chriek.config import Limits, Settings
 from chriek.signing import UrlSigner
-from chriek.storage import private_image_root
-from chriek.store import SUCCEEDED, Job, JobStore
+from chriek.storage import check_database, private_image_root
+from chriek.store import MEMORY_DATABASE, SUCCEEDED, Job, JobStore
 from chriek.worker import Worker, image_path
 
 MAX_SEED = 2**32 - 1
@@ -69,7 +69,11 @@ def create_app(
     clock: Callable[[], float] = time.time,
 ) -> FastAPI:
     """Build the home-mode app. `backend` and `clock` are test seams; `chriek serve` omits them."""
-    # Every storage check runs before JobStore creates or migrates the database.
+    # Both storage sides are checked before either is created: the database side here without
+    # creating anything, then the image side by private_image_root. JobStore and Worker check
+    # their own side again, so they stay safe when used without the app.
+    if str(settings.db_path) != MEMORY_DATABASE:
+        check_database(settings.db_path)
     storage_dir = private_image_root(settings.storage_dir)
     store = JobStore(settings.db_path)
     try:
