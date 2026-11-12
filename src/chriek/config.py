@@ -44,11 +44,15 @@ class Settings:
         )
         if limits.max_dimension % 16:
             raise ConfigError("CHRIEK_MAX_DIMENSION must be a multiple of 16")
+        api_keys = _api_keys(env.get("CHRIEK_API_KEYS", ""))
+        signing_secret = _signing_secret(env.get("CHRIEK_SIGNING_SECRET", ""))
+        if signing_secret in api_keys.values():
+            raise ConfigError("CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS key")
         return cls(
             db_path=Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db")),
             storage_dir=Path(env.get("CHRIEK_STORAGE_DIR", "chriek-data/images")),
-            api_keys=_api_keys(env.get("CHRIEK_API_KEYS", "")),
-            signing_secret=_signing_secret(env.get("CHRIEK_SIGNING_SECRET", "")),
+            api_keys=api_keys,
+            signing_secret=signing_secret,
             url_ttl_seconds=_int(env, "CHRIEK_URL_TTL_SECONDS", 900, 1, 7 * 24 * 3600),
             limits=limits,
             host=env.get("CHRIEK_HOST", "127.0.0.1"),

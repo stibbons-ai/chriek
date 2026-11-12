@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx2
 import pytest
-from conftest import ALICE, ALICE_KEY, SIGNING_SECRET, base_env, submit, wait_for
+from conftest import ALICE, ALICE_KEY, BOB_KEY, SIGNING_SECRET, base_env, submit, wait_for
 from PIL import Image
 
 CHRIEK = Path(sys.executable).parent / "chriek"
@@ -55,6 +55,14 @@ CONTROL_KEY = ALICE_KEY + "\x07"
         ),
         ({"CHRIEK_SIGNING_SECRET": ""}, "CHRIEK_SIGNING_SECRET must be at least 32"),
         ({"CHRIEK_SIGNING_SECRET": "short-signing-secret"}, "CHRIEK_SIGNING_SECRET"),
+        (
+            {"CHRIEK_SIGNING_SECRET": ALICE_KEY},
+            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS key",
+        ),
+        (
+            {"CHRIEK_SIGNING_SECRET": BOB_KEY},
+            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS key",
+        ),
         ({"CHRIEK_URL_TTL_SECONDS": "0"}, "CHRIEK_URL_TTL_SECONDS must be between"),
         ({"CHRIEK_URL_TTL_SECONDS": "soon"}, "CHRIEK_URL_TTL_SECONDS must be an integer"),
         ({"CHRIEK_MAX_DIMENSION": "1000"}, "CHRIEK_MAX_DIMENSION must be a multiple of 16"),
@@ -70,7 +78,7 @@ def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrid
     assert process.returncode == 2
     assert output.startswith("chriek: configuration error: ")
     assert message in output
-    for secret in (ALICE_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
+    for secret in (ALICE_KEY, BOB_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
         assert secret not in output
     for secret in (EMOJI_KEY, LATIN1_KEY):
         assert secret[:2] not in output
@@ -118,8 +126,10 @@ def served(env: dict[str, str], **kwargs) -> Iterator[httpx2.Client]:
         yield client
 
 
-def test_chriek_serve_round_trip(tmp_path):
-    with served(base_env(tmp_path)) as client:
+# A non-ASCII signing secret stays valid: only API keys travel in headers.
+@pytest.mark.parametrize("signing_secret", [SIGNING_SECRET, EMOJI_KEY])
+def test_chriek_serve_round_trip(tmp_path, signing_secret):
+    with served(base_env(tmp_path) | {"CHRIEK_SIGNING_SECRET": signing_secret}) as client:
         body = wait_for(client, submit(client, prompt="otter", image_count=2, seed=1)["id"])
 
         assert body["status"] == "succeeded", body
