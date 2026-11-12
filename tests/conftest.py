@@ -19,6 +19,11 @@ SIGNING_SECRET = "signing-secret-0123456789abcdefghijklmnop"
 ALICE = {"Authorization": f"Bearer {ALICE_KEY}"}
 BOB = {"Authorization": f"Bearer {BOB_KEY}"}
 TERMINAL = {"succeeded", "failed"}
+# Text a backend exception could carry (paths, credentials, signed URLs); never public.
+BACKEND_SECRET = (
+    "injected backend failure at /srv/secret-weights/model.bin "
+    "token=hf_SENTINEL0123 https://user:p4ss@example.invalid/x?sig=SENTINEL"
+)
 
 
 def base_env(tmp_path: Path) -> dict[str, str]:
@@ -80,7 +85,7 @@ class FailingBackend(FakeBackend):
     def render(self, prompt, width, height, seed):
         self.renders += 1
         if self.renders - 1 == self.fail_index:
-            raise RuntimeError("injected backend failure")
+            raise RuntimeError(BACKEND_SECRET) from OSError(f"cause: {BACKEND_SECRET}")
         return super().render(prompt, width, height, seed)
 
 

@@ -85,11 +85,12 @@ class Worker:
                 )
                 (partial / f"{index}.png").write_bytes(png)
             partial.rename(final)
-        except Exception as exc:
+        except Exception:
             # Any image failure fails the whole job; already rendered images are discarded.
+            # The traceback stays in the server log; the public error never carries exception text.
             log.exception("job %s failed at image %d", job.id, index)
             shutil.rmtree(partial, ignore_errors=True)
-            error = f"image {index + 1} of {job.image_count} failed: {exc}"[:500]
+            error = f"image {index + 1} of {job.image_count} failed"
             self._store.fail(job.id, error, self._run_record(started), self._clock())
             return
         if not self._store.succeed(job.id, self._run_record(started), self._clock()):
