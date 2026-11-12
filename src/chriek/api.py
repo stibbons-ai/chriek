@@ -131,6 +131,9 @@ def create_app(
         errors = _limit_errors(body, settings.limits)
         if errors:
             raise RequestValidationError(errors)
+        # Observed-state check only: a result write failing after this point still admits.
+        if worker.stopped_on_error:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, WORKER_STOPPED)
         seed = body.seed
         if seed is None:
             seed = secrets.randbelow(MAX_SEED - body.image_count + 2)

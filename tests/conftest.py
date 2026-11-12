@@ -1,9 +1,10 @@
 """Shared HTTP test helpers. Tests talk to chriek only through its HTTP API (and CLI)."""
 
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,15 @@ def base_env(tmp_path: Path) -> dict[str, str]:
         "CHRIEK_API_KEYS": f"alice:{ALICE_KEY},bob:{BOB_KEY}",
         "CHRIEK_SIGNING_SECRET": SIGNING_SECRET,
     }
+
+
+def connect_db(tmp_path: Path) -> closing[sqlite3.Connection]:
+    return closing(sqlite3.connect(base_env(tmp_path)["CHRIEK_DB_PATH"]))
+
+
+def db_dump(tmp_path: Path) -> str:
+    with connect_db(tmp_path) as db:
+        return "\n".join(db.iterdump())
 
 
 class FakeClock:
