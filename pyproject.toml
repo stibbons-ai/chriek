@@ -8,6 +8,7 @@ requires-python = ">=3.14"
 dependencies = [
     "fastapi>=0.162.4",
     "pillow>=13.0.0",
+    "python-multipart>=0.0.33",
     "sqlalchemy>=2.1.8",
     "uvicorn>=0.54.0",
 ]

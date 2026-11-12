@@ -1,14 +1,14 @@
 # chriek — design
 
-Standalone, self-hostable image generation server for FLUX 3 Image Klein. Extracted from the fabula-mia PoC runtime (`runtime/flux-local/` at tag `poc-final-20261110T105632Z`). Repo: `stibbons-ai/chriek` (public, MIT). Named after Otto Chriek, Discworld's iconographer.
+Standalone, self-hostable image generation server for FLUX 3 Image Klein. Extracted from an origin PoC runtime. Repo: `stibbons-ai/chriek` (public, MIT). Named after Otto Chriek, Discworld's iconographer.
 
-Drafted in the fabula-mia design session on 2026-11-11 and moved here. Spec: #1. Decisions: ADR-0001.
+Spec: #1. Decisions: ADR-0001.
 
 ## Intent
 
-- fabula-mia (first consumer): character reference sheets (text-to-image) and story panels (edit conditioned on the reference images of all characters in a scene), as in the PoC.
+- First consumer: character reference sheets (text-to-image) and story panels (edit conditioned on the reference images of all characters in a scene), as in the PoC.
 - Ikonograf (second consumer): LinkedIn profile picture from a few reference photos of a real person.
-- Runs on Apple Silicon (Metal, as in the PoC) and NVIDIA GPUs: serverless hosted GPUs with scale-to-zero for fabula-mia production (idle GPU cost is unacceptable), consumer cards (3090/4090/5090) for home/hobby use.
+- Runs on Apple Silicon (Metal, as in the PoC) and NVIDIA GPUs: serverless hosted GPUs with scale-to-zero for the first consumer's production deployment (idle GPU cost is unacceptable), consumer cards (3090/4090/5090) for home/hobby use.
 - Reachable over the network and safe without a reverse proxy; also deployable behind one.
 - MVP, not a big project.
 
@@ -60,7 +60,7 @@ Drafted in the fabula-mia design session on 2026-11-11 and moved here. Spec: #1.
   - Worker's invocation interface is a plain HTTP endpoint (job ID in, status out), so the image stays provider-neutral; provider-specific bits are limited to dispatch config (endpoint URL, credentials, extra headers).
   - Deploying to a specific provider is the consuming project's job, not chriek's. Worker exposes `GET /health`; weights cached on a persistent volume via `HF_HOME`.
   - A job killed mid-run (e.g. scale-down SIGTERM) ends up `failed` via the running-timeout.
-  - Reference consumer setup (fabula-mia, guidance only): Verda Serverless Containers, continuous deployment, min replicas 0, async requests (`Prefer: respond-async`), not Batch jobs (a fresh replica per job = cold load + 10-minute billing chunk per panel). Docs checked 2026-11-11. Open with Verda: max request TTL, result retention, FIN-only pinning, cold-start time.
+  - Reference consumer setup (guidance only): Verda Serverless Containers, continuous deployment, min replicas 0, async requests (`Prefer: respond-async`), not Batch jobs (a fresh replica per job = cold load + 10-minute billing chunk per panel). Docs checked 2026-11-11. Open with Verda: max request TTL, result retention, FIN-only pinning, cold-start time.
   - Cold start (loading ~20 GB weights) adds latency to the first job after idle; accepted. Weights come from the image or a provider volume, never downloaded from HF per start.
 
 ### API

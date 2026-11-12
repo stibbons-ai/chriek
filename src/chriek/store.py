@@ -1,6 +1,5 @@
 """SQLite job store. Status changes are conditional updates; a stale writer can't override them."""
 
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +49,11 @@ class Job(Base):
     error: Mapped[str | None] = mapped_column(Text)
     run_record: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     images: Mapped[list[Image]] = relationship(order_by="Image.index", lazy="selectin")
+    references: Mapped[list[Reference]] = relationship(order_by="Reference.index", lazy="selectin")
+
+    @property
+    def reference_count(self) -> int:
+        return len(self.references)
 
 
 class Image(Base):
@@ -60,6 +64,15 @@ class Image(Base):
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), primary_key=True)
     index: Mapped[int] = mapped_column(primary_key=True)
     seed: Mapped[int]
+
+
+class Reference(Base):
+    """An uploaded reference image associated with an edit job in submission order."""
+
+    __tablename__ = "references"
+
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), primary_key=True)
+    index: Mapped[int] = mapped_column(primary_key=True)
 
 
 class JobStore:
@@ -75,16 +88,18 @@ class JobStore:
     def create(
         self,
         *,
+        job_id: str,
         owner: str,
         prompt: str,
         image_count: int,
         width: int,
         height: int,
         seed: int,
+        reference_count: int = 0,
         now: float,
     ) -> Job:
         job = Job(
-            id=str(uuid.uuid7()),
+            id=job_id,
             owner=owner,
             status=QUEUED,
             prompt=prompt,
@@ -94,6 +109,7 @@ class JobStore:
             seed=seed,
             created_at=now,
             images=[],
+            references=[Reference(job_id=job_id, index=i) for i in range(reference_count)],
         )
         with self._session.begin() as session:
             session.add(job)
