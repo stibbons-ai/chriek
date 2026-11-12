@@ -2,7 +2,9 @@
 
 import io
 import logging
+import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -12,6 +14,8 @@ from conftest import (
     CountingBackend,
     FailingBackend,
     GatedBackend,
+    connect_db,
+    db_dump,
     running,
     submit,
     wait_for,
@@ -19,7 +23,9 @@ from conftest import (
 from PIL import Image
 from sqlalchemy.exc import OperationalError
 
+from chriek.api import WORKER_STOPPED
 from chriek.store import JobStore
+from chriek.worker import Worker
 
 
 def status(client, job_id, headers=ALICE):
@@ -172,39 +178,71 @@ def test_memory_database_keeps_every_write_under_concurrent_polling(tmp_path):
     [("succeed", False), ("fail", True)],
     ids=["success-write-fails", "failure-write-fails"],
 )
-def test_unsaved_job_result_stops_the_worker_until_restart(
+def test_unsaved_job_result_stops_the_worker_and_rejects_jobs_until_restart(
     tmp_path, monkeypatch, caplog, store_method, first_render_fails
 ):
     # Arrange: the first final-state write raises, as if SQLite were locked or the disk full.
+    # It waits until the second job is queued, so that job is admitted before the failure.
     original = getattr(JobStore, store_method)
     calls = []
+    second_queued = threading.Event()
 
     def broken_once(self, *args, **kwargs):
         calls.append(args)
         if len(calls) == 1:
+            assert second_queued.wait(10), "second job never queued"
             raise OperationalError("COMMIT", {}, RuntimeError("database is locked"))
         return original(self, *args, **kwargs)
 
+    notifies = []
+    original_notify = Worker.notify
+
+    def counting_notify(self):
+        notifies.append(self)
+        original_notify(self)
+
     monkeypatch.setattr(JobStore, store_method, broken_once)
+    monkeypatch.setattr(Worker, "notify", counting_notify)
     backend = FailingBackend(fail_index=0) if first_render_fails else CountingBackend()
+    job = {"prompt": "rejected", "width": 16, "height": 16}
 
     with running(tmp_path, backend=backend) as before:
         first = submit(before, prompt="first", width=16, height=16)
         second = submit(before, prompt="second", width=16, height=16)
+        second_queued.set()
 
         deadline = time.monotonic() + 10
         while (health := before.get("/health")).status_code != 503:
             assert time.monotonic() < deadline, "worker never reported its failure"
             time.sleep(0.01)
-        assert health.json() == {
-            "status": "error",
-            "detail": "worker stopped: a job result could not be saved; restart chriek",
-        }
+        stopped = {"status": "error", "detail": WORKER_STOPPED}
+        assert health.json() == stopped
         stuck = before.get(f"/jobs/{first['id']}", headers=ALICE).json()
         assert (stuck["status"], stuck["images"], stuck["error"]) == ("running", [], None)
         assert status(before, second["id"]) == "queued"
-        third = submit(before, prompt="third", width=16, height=16)
-        assert status(before, third["id"]) == "queued"
+        persisted, notified = db_dump(tmp_path), len(notifies)
+
+        # Act/assert: valid submissions from any owner are refused with nothing stored.
+        for headers in (ALICE, BOB):
+            rejected = before.post("/jobs", headers=headers, json=job)
+            assert rejected.status_code == 503
+            assert rejected.json() == {"detail": WORKER_STOPPED}
+            assert "location" not in rejected.headers
+        # Authentication, validation and owner isolation keep their precedence.
+        for headers in ({}, {"Authorization": "Bearer nope"}):
+            assert before.post("/jobs", headers=headers, json=job).status_code == 401
+        for invalid in ({"width": 15}, {"image_count": True}):
+            assert before.post("/jobs", headers=ALICE, json=job | invalid).status_code == 422
+        json_headers = ALICE | {"Content-Type": "application/json"}
+        assert (
+            before.post("/jobs", headers=json_headers, content=b'{"x": "\xff"}').status_code == 400
+        )
+        other_owner = before.get(f"/jobs/{second['id']}", headers=BOB)
+        missing = before.get(f"/jobs/{uuid.uuid7()}", headers=BOB)
+        assert (other_owner.status_code, other_owner.json()) == (404, missing.json())
+
+        assert (db_dump(tmp_path), len(notifies)) == (persisted, notified)
+        assert before.get("/health").json() == stopped
         assert backend.renders == 1, "no job may run after an unsaved result"
 
     assert any(
@@ -213,11 +251,15 @@ def test_unsaved_job_result_stops_the_worker_until_restart(
         if record.levelno == logging.ERROR and record.exc_info
     ), "the original database error must be logged"
 
-    with running(tmp_path) as after:
+    restarted = CountingBackend()
+    with running(tmp_path, backend=restarted) as after:
         assert after.get("/health").json() == {"status": "ok"}
         interrupted = after.get(f"/jobs/{first['id']}", headers=ALICE).json()
         assert interrupted["status"] == "failed"
         assert interrupted["error"] == "interrupted: the server stopped while this job was running"
         assert (interrupted["images"], interrupted["run"]) == ([], None)
         assert wait_for(after, second["id"])["status"] == "succeeded"
-        assert wait_for(after, third["id"])["status"] == "succeeded"
+    assert restarted.renders == 1
+    with connect_db(tmp_path) as db:
+        stored = db.execute("SELECT id FROM jobs ORDER BY seq").fetchall()
+    assert stored == [(first["id"],), (second["id"],)], "a rejected job was persisted"
