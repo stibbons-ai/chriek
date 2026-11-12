@@ -146,6 +146,9 @@ ADVERSARIAL_422 = {
     "surrogate-key": '{"prompt": "a", "' + "\\ud800" * 300_000 + '": 1}',
     "surrogate-prompt": '{"prompt": "' + "\\udc00" * 300_000 + '"}',
     "many-unknown-fields": json.dumps({"prompt": "a"} | {f"{i:0>200}": 1 for i in range(9000)}),
+    "many-multibyte-keys": json.dumps(
+        {"prompt": "a"} | {f"{i:\U0001f600>200}": 1 for i in range(2000)}, ensure_ascii=False
+    ),
     "broad-list": json.dumps({"prompt": "a", "seed": [1.5] * 300_000}),
     "deep-nesting": '{"prompt": ' + '{"a": ' * 100_000 + "0" + "}" * 100_000 + "}",
     "nonfinite-many": "{" + ",".join(f'"f{i}": NaN' for i in range(100_000)) + "}",
