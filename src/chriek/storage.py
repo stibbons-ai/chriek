@@ -65,7 +65,7 @@ def _checked_database(db_path: Path) -> tuple[Path, list[Path]]:
     parent, missing = _checked_dir(db_path.parent)
     db_path = parent / db_path.name
     for path in (db_path, *(Path(f"{db_path}{suffix}") for suffix in _SQLITE_SIDECARS)):
-        if path.exists(follow_symlinks=False) and not stat.S_ISREG(_check_private(path).st_mode):
+        if _stat(path) and not stat.S_ISREG(_check_private(path).st_mode):
             _reject(path, "is not a regular file")
     return db_path, missing
 
@@ -76,27 +76,37 @@ def _checked_dir(path: Path) -> tuple[Path, list[Path]]:
     Returns the real path and its missing levels, outermost first.
     """
     path = Path(os.path.abspath(path))
-    if path.is_symlink():
-        _reject(path, "is a symbolic link")
     real = path.resolve()
     missing = []
-    if real.exists(follow_symlinks=False):
-        if not stat.S_ISDIR(_check_private(real).st_mode):
-            _reject(real, "is not a directory")
-    else:
-        missing.append(real)
-    for parent in real.parents:
-        if not parent.exists():
+    # Outermost first: a level counts as missing only below an existing checked directory, so
+    # a non-directory ancestor is named before anything below it fails with "Not a directory".
+    for parent in reversed(real.parents):
+        info = None if missing else _stat(parent)  # a link here appeared after resolving: refused
+        if info is None:
             missing.append(parent)
             continue
-        info = os.stat(parent)
         if not stat.S_ISDIR(info.st_mode):
             _reject(parent, "is an ancestor that is not a directory")
         if info.st_uid not in (0, os.geteuid()):
             _reject(parent, f"is an ancestor owned by uid {info.st_uid}")
         if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
             _reject(parent, "is an ancestor that other users can modify")
-    return real, missing[::-1]
+    info = None if missing else _stat(path)
+    if info is None:
+        missing.append(real)
+    elif stat.S_ISLNK(info.st_mode):
+        _reject(path, "is a symbolic link")
+    elif not stat.S_ISDIR(_check_private(real).st_mode):
+        _reject(real, "is not a directory")
+    return real, missing
+
+
+def _stat(path: Path) -> os.stat_result | None:
+    """lstat, or None only if `path` is missing; no access, link loops and other errors raise."""
+    try:
+        return os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
 
 
 def _create(missing: list[Path]) -> None:

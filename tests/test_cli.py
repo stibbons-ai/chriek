@@ -272,3 +272,19 @@ def test_chriek_serve_reports_an_unusable_storage_path_without_a_traceback(
     assert output.startswith("chriek: storage error: "), output
     assert "Traceback" not in output
     assert tree_state(tmp_path) == before, "no database or directory may be created"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+def test_chriek_serve_reports_a_database_it_cannot_create_without_a_traceback(tmp_path):
+    # Both preflights pass (the read-only directory is private); creating the database fails.
+    read_only = read_only_directory(tmp_path)
+    env = base_env(tmp_path) | {"CHRIEK_DB_PATH": str(read_only / "chriek" / "chriek.db")}
+    process = serve(env)
+    output, _ = process.communicate(timeout=30)
+
+    assert process.returncode == 2, output
+    assert output.startswith(f"chriek: storage error: {read_only / 'chriek'} cannot be used ("), (
+        output
+    )
+    assert "Traceback" not in output
+    assert list(read_only.iterdir()) == [], "nothing may be created below the read-only directory"

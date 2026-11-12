@@ -128,9 +128,11 @@ def make(path: Path, mode: int, *, directory: bool = False) -> None:
     path.chmod(mode)
 
 
-def relink(path: Path, target: Path) -> None:
+def relink(path: Path, target: Path) -> str:
+    """Replace `path` by a link to `target`; returns the refusal reason chriek must give."""
     path.rename(target)
     path.symlink_to(target)
+    return "is a symbolic link."
 
 
 def replace(path: Path, mode: int, *, directory: bool = False) -> None:
@@ -157,9 +159,19 @@ UNSAFE = {
         lambda t, job: (t / "images" / job / "0.png").chmod(0o644),
         "images/{job}/0.png",
     ),
+    "database group-writable": (lambda t, job: (t / "db/chriek.db").chmod(0o620), "db/chriek.db"),
+    "database other-writable": (lambda t, job: (t / "db/chriek.db").chmod(0o602), "db/chriek.db"),
     "partial dir traversable": (
         lambda t, job: make(t / "images" / f"{job}.partial", 0o711, directory=True),
         "images/{job}.partial",
+    ),
+    "image group-writable": (
+        lambda t, job: (t / "images" / job / "0.png").chmod(0o620),
+        "images/{job}/0.png",
+    ),
+    "image other-writable": (
+        lambda t, job: (t / "images" / job / "0.png").chmod(0o602),
+        "images/{job}/0.png",
     ),
     "image root linked": (lambda t, job: relink(t / "images", t / "real-images"), "images"),
     "database dir linked": (lambda t, job: relink(t / "db", t / "real-db"), "db"),
@@ -187,7 +199,7 @@ UNSAFE = {
 @pytest.mark.parametrize(("make_unsafe", "culprit"), UNSAFE.values(), ids=UNSAFE.keys())
 def test_unsafe_existing_storage_is_refused_before_anything_changes(tmp_path, make_unsafe, culprit):
     job = installed(tmp_path)
-    make_unsafe(tmp_path, job)
+    problem = make_unsafe(tmp_path, job) or ""  # links must be refused as links, whatever mode
     before = tree_state(tmp_path)
 
     with (
@@ -196,7 +208,7 @@ def test_unsafe_existing_storage_is_refused_before_anything_changes(tmp_path, ma
     ):
         pass
 
-    assert str(error.value).startswith(f"{tmp_path / culprit.format(job=job)} ")
+    assert str(error.value).startswith(f"{tmp_path / culprit.format(job=job)} {problem}")
     assert tree_state(tmp_path) == before, "refused storage must stay byte-for-byte unchanged"
 
 
@@ -232,12 +244,13 @@ def report_owned_by_another_user(monkeypatch, target: Path) -> int:
     return foreign
 
 
-def test_an_ancestor_owned_by_another_user_is_refused(tmp_path, monkeypatch):
-    installed(tmp_path)
+@pytest.mark.parametrize("install", ["", "mine"], ids=["parent", "above a private parent"])
+def test_an_ancestor_owned_by_another_user_is_refused(tmp_path, monkeypatch, install):
+    installed(tmp_path / install)
     before = tree_state(tmp_path)
     foreign = report_owned_by_another_user(monkeypatch, tmp_path)
 
-    with pytest.raises(StorageError) as error, running(tmp_path):
+    with pytest.raises(StorageError) as error, running(tmp_path / install):
         pass
     monkeypatch.undo()
     assert str(error.value).startswith(f"{tmp_path} is an ancestor owned by uid {foreign}.")
@@ -302,8 +315,9 @@ def test_a_level_appearing_while_chriek_creates_it_is_refused(tmp_path, monkeypa
     injected = {}
 
     def racing_stat(path, *args, **kwargs):
-        # The ancestor walk stats "/" last: inject after every check, before any creation.
-        if not injected and isinstance(path, str | Path) and Path(path) == Path("/"):
+        # The journal sidecar is the last path checked: inject after every check, before any
+        # creation.
+        if not injected and str(path).endswith("-journal"):
             if inject == "directory":
                 os.mkdir(level, 0o777)
                 level.chmod(0o777)
@@ -336,6 +350,29 @@ def test_an_image_directory_chriek_cannot_list_is_refused(tmp_path):
     assert tree_state(tmp_path) == before
 
 
+@pytest.mark.parametrize("blocked", ["looped", "unsearchable"])
+def test_a_database_path_chriek_cannot_inspect_is_refused_before_anything_is_created(
+    tmp_path, blocked
+):
+    if blocked == "looped":
+        (tmp_path / blocked).symlink_to(blocked)
+    elif os.geteuid() == 0:
+        pytest.skip("root searches every directory")
+    else:
+        (tmp_path / blocked).mkdir(mode=0o600)  # private, but chriek can't look inside
+    env = {
+        "CHRIEK_DB_PATH": str(tmp_path / blocked / "db" / "chriek.db"),
+        "CHRIEK_STORAGE_DIR": str(tmp_path / "images"),
+    }
+    before = tree_state(tmp_path)
+
+    with pytest.raises(StorageError) as error, running(tmp_path, **env):
+        pass
+    assert str(error.value).startswith(f"{tmp_path / blocked}")
+    assert "appeared while chriek was creating it" not in str(error.value)
+    assert tree_state(tmp_path) == before, "images must not be created before the refusal"
+
+
 def test_a_linked_ancestor_is_followed_to_its_private_target(tmp_path):
     """Like macOS's /var -> /private/var: links above the configured paths are fine."""
     (tmp_path / "real").mkdir(mode=0o700)
@@ -358,15 +395,20 @@ def test_a_linked_ancestor_is_followed_to_its_private_target(tmp_path):
     }
 
 
-def shared_install(tmp_path: Path, mode: int) -> tuple[Path, dict[str, str]]:
-    """A caller-owned shared directory with dedicated chriek directories configured inside."""
+def shared_install(tmp_path: Path, mode: int, below: str = "") -> tuple[Path, dict[str, str]]:
+    """A caller-owned shared directory with dedicated chriek directories configured inside.
+
+    `below` names a private directory between the shared one and chriek's directories.
+    """
     shared = tmp_path / "shared"
     shared.mkdir()
     (shared / "notes.txt").write_text("keep me")
+    if below:
+        (shared / below).mkdir(mode=0o700)
     shared.chmod(mode)
     env = {
-        "CHRIEK_DB_PATH": str(shared / "chriek" / "db" / "chriek.db"),
-        "CHRIEK_STORAGE_DIR": str(shared / "chriek" / "images"),
+        "CHRIEK_DB_PATH": str(shared / below / "chriek" / "db" / "chriek.db"),
+        "CHRIEK_STORAGE_DIR": str(shared / below / "chriek" / "images"),
     }
     return shared, env
 
@@ -389,14 +431,17 @@ def test_dedicated_directories_under_a_shared_ancestor_leave_it_untouched(tmp_pa
     }
 
 
-@pytest.mark.parametrize("mode", [0o777, 0o775], ids=["world-writable", "group-writable"])
-def test_an_ancestor_other_users_can_modify_is_refused_without_creating_anything(tmp_path, mode):
-    shared, env = shared_install(tmp_path, mode)
+@pytest.mark.parametrize("below", ["", "mine"], ids=["parent", "above a private parent"])
+@pytest.mark.parametrize(
+    "mode", [0o777, 0o775, 0o757], ids=["world-writable", "group-writable", "other-writable"]
+)
+def test_an_ancestor_other_users_can_modify_is_refused_without_creating_anything(
+    tmp_path, mode, below
+):
+    shared, env = shared_install(tmp_path, mode, below)
     before = tree_state(shared)
 
-    with (
-        pytest.raises(StorageError, match="is an ancestor that other users can modify"),
-        running(tmp_path, **env),
-    ):
+    with pytest.raises(StorageError) as error, running(tmp_path, **env):
         pass
+    assert str(error.value).startswith(f"{shared} is an ancestor that other users can modify.")
     assert tree_state(shared) == before

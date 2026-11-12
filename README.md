@@ -67,10 +67,11 @@ Jobs and images are private to the user chriek runs as (the service user) on POS
 Before the database is opened, any job runs or any missing directory is created, chriek checks both configured storage sides and refuses to start if any check fails (`chriek serve` prints `chriek: storage error: <path> <problem>. <guidance>` and exits with status 2 without listening):
 
 - The database's directory and `CHRIEK_STORAGE_DIR`, if they exist: a directory, not a symbolic link, owned by the service user (effective UID), no group or other permission bits (`mode & 077 == 0`).
+- The database file and its `-wal`, `-shm` and `-journal` sidecars, if they exist: a regular file, not a symbolic link, owned by the service user, no group or other permission bits. Other files in the database's directory are not checked.
 - Every existing ancestor of those two directories, after resolving symbolic links: a directory, owned by root or the service user, and not writable by group or others unless the sticky bit is set (as on `/tmp`). Links in ancestors, such as macOS's `/var`, are resolved once at startup and chriek uses the real path from then on, so the configured paths, including any links in them, must be trusted.
 - Every file and directory below `CHRIEK_STORAGE_DIR`: not a symbolic link, owned by the service user, no group or other permission bits. A directory chriek can't list fails the check.
 
-A path chriek can't check or create (for example below a regular file or a directory it can't write) is reported the same way. If a missing directory appears while chriek is creating it, chriek refuses it rather than using a directory it didn't create.
+A path chriek can't check or create (for example below a regular file, inside a directory it can't search or write, or through a symbolic link loop) is reported the same way. If a missing directory appears while chriek is creating it, chriek refuses it rather than using a directory it didn't create.
 
 chriek never changes permissions or ownership of anything that already exists: not your data, not the directories above it. A bare filename such as `CHRIEK_DB_PATH=chriek.db` puts the database in the working directory, which is usually shared (`0755`) and is refused; point it into a dedicated directory such as `chriek-data/chriek.db` instead. With `CHRIEK_DB_PATH=:memory:` there is no database file, and `CHRIEK_STORAGE_DIR` is checked and protected the same way.
 
