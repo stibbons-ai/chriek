@@ -59,6 +59,8 @@ HOSTILE_ORIGINS = [
         ("https://images.example/chriek/", "https://images.example/chriek"),
         ("https://images.example/chriek//", "https://images.example/chriek"),
         ("https://192.0.2.10:8443/chriek/", "https://192.0.2.10:8443/chriek"),
+        ("http://192.0.2.10:1", "http://192.0.2.10:1"),
+        ("https://images.example:65535/", "https://images.example:65535"),
         ("https://[2001:db8::1]:8443/v%2E1/", "https://[2001:db8::1]:8443/v%2E1"),
         ("HTTPS://Images.Example.:443///", "HTTPS://Images.Example.:443"),
     ],

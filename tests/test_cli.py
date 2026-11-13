@@ -107,12 +107,15 @@ PRINTABLE = "CHRIEK_PUBLIC_URL must contain only printable ASCII"
         ({"CHRIEK_PUBLIC_URL": "https:images.example"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https:///images.example"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://images.example:"}, URL_FORM),
-        ({"CHRIEK_PUBLIC_URL": "https://images.example:0"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": f"https://images.example:0/{MARKER}"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://images.example:65536"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://images.example:8x"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://images.example:-1"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://images.example:80:80"}, URL_FORM),
-        ({"CHRIEK_PUBLIC_URL": "https://[::1"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": f"https://[::1/{MARKER}"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": f"https://alice:{MARKER}@[::1"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://[v1.fe]"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://[fe80::1%25eth0]"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://[not:an:ipv6]"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://images..example"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://ima<ges.example"}, URL_FORM),
@@ -120,17 +123,20 @@ PRINTABLE = "CHRIEK_PUBLIC_URL must contain only printable ASCII"
         ({"CHRIEK_PUBLIC_URL": f"https://images.example/{MARKER}\t"}, PRINTABLE),
         ({"CHRIEK_PUBLIC_URL": f"https://images.\nexample/{MARKER}"}, PRINTABLE),
         ({"CHRIEK_PUBLIC_URL": f"https://images.example\x07/{MARKER}"}, PRINTABLE),
+        ({"CHRIEK_PUBLIC_URL": f"https://images.example\x7f/{MARKER}"}, PRINTABLE),
         ({"CHRIEK_PUBLIC_URL": f"https://b\u00fccher.example/{MARKER}"}, PRINTABLE),
         # Numeric hosts that clients reinterpret as a different IPv4 address, or reject.
-        ({"CHRIEK_PUBLIC_URL": "https://017.0.0.1"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": f"https://017.0.0.1/{MARKER}"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://2130706433"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://0x7f.1/chriek"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://1."}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://images.0x1"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.0X1"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.0x"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://999.999.999.999"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://1.2.3.4.5"}, URL_FORM),
         # Prefixes that clients normalize into a different path.
-        ({"CHRIEK_PUBLIC_URL": "https://images.example/chriek/.."}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": f"https://images.example/{MARKER}/.."}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://images.example/chriek/%2e%2E/"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://images.example/chriek/./x"}, URL_FORM),
         ({"CHRIEK_PUBLIC_URL": "https://images.example/%2E/chriek"}, URL_FORM),
@@ -148,8 +154,14 @@ def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrid
     for secret in (ALICE_KEY, BOB_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
         assert secret not in output
     assert MARKER not in output
-    if overrides.get("CHRIEK_PUBLIC_URL"):
-        assert overrides["CHRIEK_PUBLIC_URL"].strip() not in output
+    if value := overrides.get("CHRIEK_PUBLIC_URL"):
+        assert value.strip() not in output
+        # Nor the host alone: some branches see only the host, which may name an internal machine.
+        try:
+            host = urlsplit(value.strip()).hostname
+        except ValueError:
+            host = None
+        assert not host or host not in output.lower()
     for secret in (EMOJI_KEY, LATIN1_KEY):
         assert secret[:2] not in output
     assert not (tmp_path / "db").exists(), "nothing may start on invalid configuration"
