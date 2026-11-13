@@ -269,6 +269,7 @@ def test_chriek_serve_refuses_a_shared_database_directory_without_changing_it(tm
         f"chriek: storage error: {shared} is accessible to other users (mode 0755). "
         "chriek needs dedicated directories" in output
     )
+    assert "never a shared parent" in output, "the remedy must not be chmodding the shared tree"
     assert "Uvicorn running on" not in output
     assert tree_state(shared) == before
 

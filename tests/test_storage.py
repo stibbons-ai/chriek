@@ -211,18 +211,52 @@ def test_unsafe_existing_storage_is_refused_before_anything_changes(tmp_path, ma
     assert tree_state(tmp_path) == before, "refused storage must stay byte-for-byte unchanged"
 
 
-def test_store_and_worker_refuse_unsafe_storage_when_used_directly(tmp_path):
-    installed(tmp_path)
-    (tmp_path / "db/chriek.db").chmod(0o644)
-    with pytest.raises(StorageError, match=r"chriek\.db is accessible to other users \(mode 0644"):
-        JobStore(tmp_path / "db/chriek.db")
+# Used directly, without `create_app` checking both sides first: each refusal must come before
+# SQLite opens the database or the worker creates any directory.
+DIRECT_STORE_UNSAFE = {
+    "database readable": lambda t: (t / "db/chriek.db").chmod(0o644),
+    "stale wal readable": lambda t: make(t / "db/chriek.db-wal", 0o644),
+    "stale wal other-writable": lambda t: make(t / "db/chriek.db-wal", 0o646),
+    "database linked to another database": lambda t: relink(t / "db/chriek.db", t / "other.db"),
+}
 
-    (tmp_path / "db/chriek.db").chmod(0o600)
-    (tmp_path / "images").chmod(0o755)
+
+@pytest.mark.parametrize(
+    "make_unsafe", DIRECT_STORE_UNSAFE.values(), ids=DIRECT_STORE_UNSAFE.keys()
+)
+def test_a_store_used_directly_refuses_unsafe_storage_before_touching_it(tmp_path, make_unsafe):
+    installed(tmp_path)
+    make_unsafe(tmp_path)
+    before = tree_state(tmp_path)
+
+    with pytest.raises(StorageError, match="never changes existing permissions"):
+        JobStore(tmp_path / "db/chriek.db")
+    assert tree_state(tmp_path) == before, "the database, its sidecars and link target unchanged"
+
+
+DIRECT_WORKER_UNSAFE = {
+    "image root readable": (lambda t: (t / "images").chmod(0o755), "images"),
+    "image root missing below a shared ancestor": (
+        lambda t: make(t / "shared", 0o777, directory=True),
+        "shared/a/b/images",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("make_unsafe", "images"), DIRECT_WORKER_UNSAFE.values(), ids=DIRECT_WORKER_UNSAFE.keys()
+)
+def test_a_worker_used_directly_refuses_unsafe_storage_before_touching_it(
+    tmp_path, make_unsafe, images
+):
+    installed(tmp_path)
+    make_unsafe(tmp_path)
     store = JobStore(tmp_path / "db/chriek.db")
     try:
-        with pytest.raises(StorageError, match=r"images is accessible to other users"):
-            Worker(store, FakeBackend(), tmp_path / "images", lambda: 0.0)
+        before = tree_state(tmp_path)
+        with pytest.raises(StorageError, match="never changes existing permissions"):
+            Worker(store, FakeBackend(), tmp_path / images, lambda: 0.0)
+        assert tree_state(tmp_path) == before, "nothing created or changed"
     finally:
         store.close()
 
@@ -610,6 +644,29 @@ def test_an_ancestor_other_users_can_modify_is_refused_without_creating_anything
     with pytest.raises(StorageError) as error, running(tmp_path, **env):
         pass
     assert str(error.value).startswith(f"{shared} is an ancestor that other users can modify.")
+    assert tree_state(shared) == before
+
+
+@pytest.mark.parametrize(
+    ("mode", "uid", "problem"),
+    [
+        (0o775, 0, "is an ancestor that other users can modify."),
+        (0o1777, os.geteuid() + 1, f"is an ancestor owned by uid {os.geteuid() + 1}."),
+    ],
+    ids=["root-owned group-writable", "foreign-owned sticky"],
+)
+def test_an_ancestors_owner_and_sticky_bit_never_excuse_the_other_rule(
+    tmp_path, monkeypatch, mode, uid, problem
+):
+    """Root ownership doesn't excuse write access; a sticky bit doesn't excuse a foreign owner."""
+    shared, env = shared_install(tmp_path, mode)
+    before = tree_state(shared)
+    report_owned_by_another_user(monkeypatch, shared, uid=uid)
+
+    with pytest.raises(StorageError) as error, running(tmp_path, **env):
+        pass
+    monkeypatch.undo()
+    assert str(error.value).startswith(f"{shared} {problem}")
     assert tree_state(shared) == before
 
 
