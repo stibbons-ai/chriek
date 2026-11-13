@@ -147,6 +147,10 @@ def replace(path: Path, mode: int, *, directory: bool = False) -> None:
 UNSAFE = {
     "image root readable": (lambda t, job: (t / "images").chmod(0o755), "images"),
     "database dir readable": (lambda t, job: (t / "db").chmod(0o750), "db"),
+    "image root traversable by others": (lambda t, job: (t / "images").chmod(0o701), "images"),
+    "image root traversable by group": (lambda t, job: (t / "images").chmod(0o710), "images"),
+    "database dir traversable by others": (lambda t, job: (t / "db").chmod(0o701), "db"),
+    "database dir traversable by group": (lambda t, job: (t / "db").chmod(0o710), "db"),
     "database readable": (lambda t, job: (t / "db/chriek.db").chmod(0o644), "db/chriek.db"),
     "wal readable": (lambda t, job: make(t / "db/chriek.db-wal", 0o644), "db/chriek.db-wal"),
     "shm readable": (lambda t, job: make(t / "db/chriek.db-shm", 0o604), "db/chriek.db-shm"),
@@ -332,6 +336,43 @@ def test_a_level_appearing_while_chriek_creates_it_is_refused(tmp_path, monkeypa
     monkeypatch.undo()
     assert str(error.value).startswith(f"{level} ")
     assert tree_state(tmp_path) == injected, "nothing may be created in or below the newcomer"
+
+
+@pytest.mark.parametrize("side", ["images", "db"])
+def test_a_configured_link_to_a_target_below_a_missing_directory_is_refused(tmp_path, side):
+    (tmp_path / side).symlink_to(tmp_path / "elsewhere" / "deep")  # `elsewhere` doesn't exist
+    before = tree_state(tmp_path)
+
+    with pytest.raises(StorageError) as error, running(tmp_path):
+        pass
+    assert str(error.value).startswith(f"{tmp_path / side} is a symbolic link.")
+    assert tree_state(tmp_path) == before, "nothing may be created at the target or other side"
+
+
+def test_an_ancestor_linked_after_resolving_is_refused(tmp_path, monkeypatch):
+    """Stand-in for another user filling a missing level in a sticky directory with a link."""
+    sticky = tmp_path / "sticky"
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    (tmp_path / "target").mkdir(mode=0o700)
+    level = sticky / "chriek-data"
+    real_resolve = Path.resolve
+    injected = {}
+
+    def racing_resolve(self, *args, **kwargs):
+        resolved = real_resolve(self, *args, **kwargs)
+        if not injected and self == level / "db":
+            level.symlink_to(tmp_path / "target")
+            injected.update(tree_state(tmp_path))
+        return resolved
+
+    monkeypatch.setattr(Path, "resolve", racing_resolve)
+    with pytest.raises(StorageError) as error:
+        JobStore(level / "db" / "chriek.db")
+    monkeypatch.undo()
+    assert injected, "the link was never planted"
+    assert str(error.value).startswith(f"{level} is an ancestor that is not a directory.")
+    assert tree_state(tmp_path) == injected, "nothing may be created through the link"
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")

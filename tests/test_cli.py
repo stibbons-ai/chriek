@@ -276,7 +276,8 @@ def test_chriek_serve_reports_an_unusable_storage_path_without_a_traceback(
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
 def test_chriek_serve_reports_a_database_it_cannot_create_without_a_traceback(tmp_path):
-    # Both preflights pass (the read-only directory is private); creating the database fails.
+    # Both preflights pass (the read-only directory is service-owned and not group- or
+    # other-writable); creating the database fails.
     read_only = read_only_directory(tmp_path)
     env = base_env(tmp_path) | {"CHRIEK_DB_PATH": str(read_only / "chriek" / "chriek.db")}
     process = serve(env)

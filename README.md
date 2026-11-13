@@ -69,9 +69,9 @@ Before the database is opened, any job runs or any missing directory is created,
 - The database's directory and `CHRIEK_STORAGE_DIR`, if they exist: a directory, not a symbolic link, owned by the service user (effective UID), no group or other permission bits (`mode & 077 == 0`).
 - The database file and its `-wal`, `-shm` and `-journal` sidecars, if they exist: a regular file, not a symbolic link, owned by the service user, no group or other permission bits. Other files in the database's directory are not checked.
 - Every existing ancestor of those two directories, after resolving symbolic links: a directory, owned by root or the service user, and not writable by group or others unless the sticky bit is set (as on `/tmp`). Links in ancestors, such as macOS's `/var`, are resolved once at startup and chriek uses the real path from then on, so the configured paths, including any links in them, must be trusted.
-- Every file and directory below `CHRIEK_STORAGE_DIR`: not a symbolic link, owned by the service user, no group or other permission bits. A directory chriek can't list fails the check.
+- Every file and directory below `CHRIEK_STORAGE_DIR`: not a symbolic link, owned by the service user, no group or other permission bits. A directory chriek can't list fails the check. This includes files chriek didn't write, such as a `.DS_Store`: with chriek stopped, delete that file or remove its group and other permissions (`chmod go= <file>`).
 
-A path chriek can't check or create (for example below a regular file, inside a directory it can't search or write, or through a symbolic link loop) is reported the same way. If a missing directory appears while chriek is creating it, chriek refuses it rather than using a directory it didn't create.
+A path chriek can't check or create (for example below a regular file, inside a directory it can't search or write, or through a symbolic link loop) is reported the same way. If a missing directory appears while chriek is creating it, chriek refuses it rather than using a directory it didn't create. The checks cover what already exists, not every way creating the missing parts can fail: an error found only while creating them (for example a database file name too long for the filesystem) is reported the same way but can leave the empty private directories chriek created so far; remove them or fix the configuration and restart.
 
 chriek never changes permissions or ownership of anything that already exists: not your data, not the directories above it. A bare filename such as `CHRIEK_DB_PATH=chriek.db` puts the database in the working directory, which is usually shared (`0755`) and is refused; point it into a dedicated directory such as `chriek-data/chriek.db` instead. With `CHRIEK_DB_PATH=:memory:` there is no database file, and `CHRIEK_STORAGE_DIR` is checked and protected the same way.
 
@@ -96,7 +96,9 @@ done
 
 The names are exact on purpose: a pattern such as `chriek.db*` would also move unrelated files like backups.
 
-A configured path that is a symbolic link is refused; configure its real target instead. Data owned by another user must be copied or `chown`ed by an administrator before chriek will use it.
+A configured path that is a symbolic link is refused, also when its target doesn't exist yet; configure its real target instead. Data owned by another user must be copied or `chown`ed by an administrator before chriek will use it.
+
+chriek removes `..` from `CHRIEK_STORAGE_DIR` before following links in it, so `alias/../images` names `images` beside `alias`, while earlier versions followed `alias` first and used `images` beside its target. Before upgrading with such a path, set `CHRIEK_STORAGE_DIR` to the real directory the existing images are in, so they stay where they are.
 
 **Limits.** Mode bits keep other local users out; they don't protect against root, against other processes running as the same user, or against access granted separately through ACLs (chriek neither inspects nor manages ACLs, and mode bits don't revoke them). Checks run at startup; chriek doesn't watch for permission changes made while it runs. Only POSIX filesystems with real ownership and modes are supported: on FAT/exFAT, some network or FUSE mounts, or other filesystems that synthesize modes, the checks can pass without protecting anything.
 

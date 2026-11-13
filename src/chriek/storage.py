@@ -91,7 +91,7 @@ def _checked_dir(path: Path) -> tuple[Path, list[Path]]:
             _reject(parent, f"is an ancestor owned by uid {info.st_uid}")
         if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
             _reject(parent, "is an ancestor that other users can modify")
-    info = None if missing else _stat(path)
+    info = _stat(path)  # also below missing levels: a dangling configured link is still a link
     if info is None:
         missing.append(real)
     elif stat.S_ISLNK(info.st_mode):
@@ -102,7 +102,8 @@ def _checked_dir(path: Path) -> tuple[Path, list[Path]]:
 
 
 def _stat(path: Path) -> os.stat_result | None:
-    """lstat, or None only if `path` is missing; no access, link loops and other errors raise."""
+    """lstat, or None only if `path` is missing; every other error (no access, a path through a
+    link loop) raises."""
     try:
         return os.stat(path, follow_symlinks=False)
     except FileNotFoundError:
