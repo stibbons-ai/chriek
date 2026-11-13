@@ -669,9 +669,9 @@ def test_repointing_a_trusted_alias_after_startup_never_moves_storage(tmp_path):
         alias.unlink()
         alias.symlink_to(second)
         body = wait_for(client, submit(client, width=16, height=16)["id"])
+        assert body["status"] == "succeeded", body
         download = client.get(body["images"][0]["url"])
 
-    assert body["status"] == "succeeded"
     assert download.status_code == 200
     assert download.content == (first / "chriek/images" / body["id"] / "0.png").read_bytes()
     assert download.content.startswith(b"\x89PNG")
