@@ -218,7 +218,7 @@ The full check, also run by CI (`.github/workflows/ci.yml`):
 uv sync --locked && uv run --locked pre-commit run jscpd --all-files && uv run ruff check . && uv run ruff format --check . && uv run pytest && uv run --locked python scripts/audit_dependencies.py
 ```
 
-Application tests drive chriek only through its HTTP API and the installed `chriek` command, with the fake backend. `tests/test_dependency_audit.py` checks the dependency-audit gate's boundaries offline: injected pip-audit reports, and the real pinned pip-audit with only its HTTP transport answering canned PyPI responses.
+Application tests drive chriek through its HTTP API and the installed `chriek` command, with the fake backend, plus direct store, worker and app entry-point checks where storage privacy must hold without the CLI. `tests/test_dependency_audit.py` checks the dependency-audit gate's boundaries offline: injected pip-audit reports, and the real pinned pip-audit with only its HTTP transport answering canned PyPI responses.
 
 ### Dependency audit
 

@@ -490,6 +490,31 @@ def test_paths_through_a_linked_level_and_dotdot_are_used_where_they_point(tmp_p
     assert tree_state(real) == before, "nothing may be created or changed below the link target"
 
 
+def test_the_app_serves_images_from_the_checked_root_of_a_linked_dotdot_path(tmp_path):
+    """Downloads read the same canonical `alias/../images` the worker wrote, never the target's."""
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    for directory in (real / "sub", real / "images"):
+        make(directory, 0o777, directory=True)  # unchecked shared directories chriek must ignore
+    (tmp_path / "alias").symlink_to(real / "sub")
+    before = tree_state(real)
+
+    with running(tmp_path, CHRIEK_STORAGE_DIR=str(tmp_path / "alias/../images")) as client:
+        job = wait_for(client, submit(client, width=16, height=16)["id"])
+        assert job["status"] == "succeeded"
+        assert modes(tmp_path / "images") == {job["id"]: 0o700, f"{job['id']}/0.png": 0o600}
+        assert tree_state(real) == before, "nothing may be created or changed below the link target"
+        decoy = real / "images" / job["id"] / "0.png"
+        decoy.parent.mkdir()
+        decoy.write_bytes(b"planted bytes from an unchecked directory")
+
+        response = client.get(job["images"][0]["url"])
+
+    assert response.status_code == 200
+    assert response.content == (tmp_path / "images" / job["id"] / "0.png").read_bytes()
+    assert response.content.startswith(b"\x89PNG")
+
+
 def shared_install(tmp_path: Path, mode: int, below: str = "") -> tuple[Path, dict[str, str]]:
     """A caller-owned shared directory with dedicated chriek directories configured inside.
 
