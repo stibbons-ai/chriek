@@ -9,6 +9,7 @@ from pathlib import Path
 
 from chriek.backend import ImageBackend
 from chriek.png import encode_png
+from chriek.storage import PRIVATE_DIR_MODE, private_image_root, write_private
 from chriek.store import Job, JobStore
 
 log = logging.getLogger(__name__)
@@ -29,7 +30,7 @@ class Worker:
     ) -> None:
         self._store = store
         self._backend = backend
-        self._storage_dir = storage_dir
+        self._storage_dir = private_image_root(storage_dir)
         self._clock = clock
         self._wake = threading.Event()
         self._stopping = False
@@ -76,14 +77,14 @@ class Worker:
         index = 0
         try:
             shutil.rmtree(partial, ignore_errors=True)
-            partial.mkdir(parents=True)
+            partial.mkdir(mode=PRIVATE_DIR_MODE)
             for index in range(job.image_count):
                 seed = job.seed + index
                 image = self._backend.render(job.prompt, job.width, job.height, seed)
                 png = encode_png(
                     image, model=self._backend.model, revision=self._backend.revision, seed=seed
                 )
-                (partial / f"{index}.png").write_bytes(png)
+                write_private(partial / f"{index}.png", png)
             partial.rename(final)
         except Exception:
             # Any image failure fails the whole job; already rendered images are discarded.

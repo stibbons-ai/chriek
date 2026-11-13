@@ -1,6 +1,9 @@
-"""Shared HTTP test helpers. Tests talk to chriek only through its HTTP API (and CLI)."""
+"""Shared HTTP test helpers. Tests talk to chriek through its HTTP API and CLI, plus the direct
+store, worker and app entry points where storage privacy must hold without the CLI."""
 
+import os
 import sqlite3
+import stat
 import threading
 import time
 from collections.abc import Iterator
@@ -45,6 +48,24 @@ def db_dump(tmp_path: Path) -> str:
         return "\n".join(db.iterdump())
 
 
+def modes(root: Path) -> dict[str, int]:
+    """Permission bits of every path below `root`, by relative path; links are not followed."""
+    return {str(p.relative_to(root)): stat.S_IMODE(p.lstat().st_mode) for p in root.rglob("*")}
+
+
+def tree_state(root: Path) -> dict[str, tuple]:
+    """Mode, owner and content (or link target) of `root` and everything below it."""
+    state = {}
+    for path in [root, *root.rglob("*")]:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            content = os.readlink(path)
+        else:
+            content = path.read_bytes() if stat.S_ISREG(info.st_mode) else None
+        state[str(path.relative_to(root))] = (info.st_mode, info.st_uid, content)
+    return state
+
+
 class FakeClock:
     def __init__(self, start: float = 1_800_000_000.0) -> None:
         self.now = start
@@ -82,6 +103,21 @@ class GatedBackend(FakeBackend):
         finally:
             with self._lock:
                 self.active -= 1
+
+
+class PausingBackend(FakeBackend):
+    """Fake backend that waits for `resume` before rendering seed 1: in a seed-0 job, the
+    second image, once the first is on disk."""
+
+    def __init__(self) -> None:
+        self.paused = threading.Event()
+        self.resume = threading.Event()
+
+    def render(self, prompt, width, height, seed):
+        if seed == 1:
+            self.paused.set()
+            assert self.resume.wait(10), "paused render never resumed"
+        return super().render(prompt, width, height, seed)
 
 
 class FailingBackend(FakeBackend):
