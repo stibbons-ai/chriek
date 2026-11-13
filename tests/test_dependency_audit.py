@@ -470,6 +470,20 @@ def test_the_vulnerable_fixture_fails_through_the_real_auditor(
     assert "DEPENDENCY AUDIT FAILED: 1 known vulnerabilities" in err
 
 
+def test_an_advisory_in_an_unvalidated_response_stays_unconfirmed_through_the_real_auditor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert pypi_serves(monkeypatch, tmp_path, 203, payload(ADVISORY)) == audit.EXIT_OPERATIONAL
+    out = capsys.readouterr()
+    assert "PASSED" not in out.out + out.err
+    assert "DEPENDENCY AUDIT ERROR (operational, nothing proven)" in out.err
+    assert "not validated for exactly the locked packages: missing iniconfig==2.3.1" in out.err
+    assert "UNCONFIRMED iniconfig==2.3.1: PYSEC-9 aliases [CVE-9] fixed in [2.3.2]" in out.err
+    assert "Found 1 known vulnerability in 1 package" in out.err  # real pip-audit stderr
+    assert "VULNERABLE" not in out.err
+    assert "DEPENDENCY AUDIT FAILED" not in out.err
+
+
 @pytest.mark.parametrize(
     ("status", "body", "message"),
     [
