@@ -709,11 +709,12 @@ def test_a_link_another_user_owns_in_a_sticky_directory_is_refused(tmp_path, mon
     assert tree_state(tmp_path) == before, "nothing may be created at the link's target"
 
 
+@pytest.mark.parametrize("mode", [0o1777, 0o1775, 0o1757])
 @pytest.mark.parametrize("owner", ["root", "service user"])
-def test_a_trusted_link_in_a_sticky_directory_is_refused(tmp_path, monkeypatch, owner):
+def test_a_trusted_link_in_a_sticky_directory_is_refused(tmp_path, monkeypatch, owner, mode):
     """Anyone can hard-link a root-owned link into /tmp (macOS), so its owner proves nothing."""
     sticky = tmp_path / "sticky"
-    make(sticky, 0o1777, directory=True)
+    make(sticky, mode, directory=True)
     (tmp_path / "home").mkdir(mode=0o700)
     link = sticky / "chriek-data"
     link.symlink_to(tmp_path / "home" / "chosen")
