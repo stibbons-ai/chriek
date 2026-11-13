@@ -189,7 +189,7 @@ It audits every third-party package locked in `uv.lock` against PyPI's vulnerabi
 |---|---|
 | 0 | `DEPENDENCY AUDIT PASSED`: every locked package audited, no known advisory |
 | 1 | `DEPENDENCY AUDIT FAILED`: each `VULNERABLE name==version: ID aliases [...] fixed in [...]` |
-| 2 | `DEPENDENCY AUDIT ERROR (operational, nothing proven)`: stale lock, network or service failure, malformed PyPI response, skipped or missing packages, malformed report, or a pip-audit exit code that contradicts its report. Advisories already parsed from the report when a later check fails (such as a package whose PyPI response was never validated) follow as `UNCONFIRMED name==version: ID aliases [...] fixed in [...]`: worth a look, but not proven by validated responses, so the run stays exit 2, never 1 |
+| 2 | `DEPENDENCY AUDIT ERROR (operational, nothing proven)`: stale lock, network or service failure, malformed PyPI response, skipped or missing packages, malformed report, or a pip-audit exit code that contradicts its report. When report evaluation succeeds but subsequent PyPI-response validation fails, the report's advisories follow as `UNCONFIRMED name==version: ID aliases [...] fixed in [...]`: worth a look, but not proven by validated responses, so the run stays exit 2, never 1 |
 
 Only exit 0 passes. There is no ignore list, severity threshold or fallback; a vulnerability without a compatible fix blocks the build until a person decides. `pip-audit` exits 1 both for findings and for its own errors, so the gate never reads its exit code alone.
 
