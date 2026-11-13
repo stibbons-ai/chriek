@@ -32,6 +32,8 @@ EXIT_CLEAN = 0
 EXIT_VULNERABLE = 1
 EXIT_OPERATIONAL = 2
 SERVICE = "pypi"
+# `-s pypi` audits by name and version on PyPI, so only packages locked from PyPI qualify.
+PYPI_REGISTRY = "https://pypi.org/simple"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # pip-audit with PyPI responses validated before its lossy parsing; see that script.
 PIP_AUDIT = Path(__file__).with_name("pip_audit_checked.py")
@@ -98,8 +100,13 @@ def parse_lock(text: str) -> Inventory:
     inventory: Inventory = {}
     for package in packages:
         name, source = package["name"], package["source"]
-        if "registry" in source:
+        if source.get("registry") == PYPI_REGISTRY:
             _add(inventory, name, _version(name, package.get("version")), "uv.lock")
+        elif "registry" in source:
+            raise AuditError(
+                f"uv.lock: {name} is locked from registry {source['registry']}; "
+                f"only {PYPI_REGISTRY} can be audited against PyPI"
+            )
         elif source.get("editable") != "." and source.get("virtual") != ".":
             raise AuditError(f"uv.lock: {name} is not from a package registry ({source})")
     return inventory

@@ -85,8 +85,9 @@ def _check_payload(payload: object) -> str | None:
 
 def validating_hook(record: Path):
     def check(response: requests.Response, *args: object, **kwargs: object) -> None:
-        # Non-200 responses are pip-audit's to handle: 404 is a skip (fatal under --strict),
-        # any other error status a ServiceError.
+        # Only 200 bodies are validated and recorded. pip-audit raises 4xx/5xx itself (404 is
+        # a skip, fatal under --strict); any other status, such as 203 or an unfollowed 3xx, is
+        # parsed unvalidated and fails the gate only because its record line is missing.
         if response.status_code != 200:
             return
         url = PYPI_URL.fullmatch(response.url)

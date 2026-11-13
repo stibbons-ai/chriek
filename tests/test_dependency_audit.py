@@ -54,6 +54,7 @@ def dep(name: str, version: str, *vulns: dict) -> dict:
 VULN = {"id": "PYSEC-1", "aliases": ["CVE-1"], "fix_versions": ["0.4.7"], "description": ""}
 CLEAN = report(dep("colorama", "0.4.6"), dep("typing-extensions", "4.16.0"))
 FIXTURE_CLEAN = ROOT / "tests" / "fixtures" / "dependency_audit" / "clean"
+FIXTURE_VULNERABLE = FIXTURE_CLEAN.with_name("vulnerable")
 
 
 def test_inventory_covers_marker_guarded_packages_and_excludes_only_the_project() -> None:
@@ -76,6 +77,11 @@ def test_inventory_covers_marker_guarded_packages_and_excludes_only_the_project(
             EXPORT,
             LOCK + '[[package]]\nname = "lib"\nversion = "1"\nsource = { git = "https://x" }\n',
             "not from a package registry",
+        ),
+        (
+            EXPORT,
+            LOCK.replace("https://pypi.org/simple", "https://pypi.internal.example/simple", 1),
+            "colorama is locked from registry https://pypi.internal.example/simple; only",
         ),
         ("", '[[package]]\nname = "app"\nversion = "0"\nsource = { virtual = "." }\n', "no third"),
     ],
@@ -155,6 +161,27 @@ def test_missing_lock_is_an_operational_failure_and_nothing_is_resolved(
     assert audit.main(["--project", str(project)]) == audit.EXIT_OPERATIONAL
     assert "uv export --locked failed" in capsys.readouterr().err
     assert not (project / "uv.lock").exists()
+
+
+def test_vulnerable_fixture_still_locks_exactly_the_documented_package() -> None:
+    lock = (FIXTURE_VULNERABLE / "uv.lock").read_text()
+    inventory = audit.collect_inventory(audit._export_requirements(FIXTURE_VULNERABLE), lock)
+
+    assert {name: str(v) for name, v in inventory.items()} == {"urllib3": "1.26.4"}
+
+
+def test_an_unexpected_crash_is_operational_not_vulnerable(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def crash(project: Path) -> list:
+        raise RuntimeError("bug in the gate")
+
+    monkeypatch.setattr(audit, "audit", crash)
+
+    assert audit.main(["--project", str(FIXTURE_CLEAN)]) == audit.EXIT_OPERATIONAL
+    out = capsys.readouterr()
+    assert "PASSED" not in out.out
+    assert "DEPENDENCY AUDIT ERROR (operational, nothing proven): crashed" in out.err
 
 
 _real_run = subprocess.run
@@ -403,6 +430,10 @@ def test_a_clean_answer_from_an_earlier_run_never_hides_a_new_advisory(
         (200, json.dumps([]), "vulnerabilities is not a list"),
         (200, "<html>maintenance</html>", "not JSON"),
         (503, "", "ServiceError"),
+        # pip-audit parses a 203 unvalidated as clean; only the missing record catches it.
+        (203, json.dumps({"vulnerabilities": {}}), "not validated for exactly the locked"),
+        # 404 is a skip, which --strict turns fatal.
+        (404, "", "Dependency not found on PyPI and could not be audited: iniconfig (2.3.1)"),
     ],
 )
 def test_malformed_or_failed_pypi_responses_are_operational_errors(
