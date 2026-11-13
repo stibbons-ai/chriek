@@ -243,7 +243,7 @@ def test_limits_come_from_configuration(tmp_path):
         CHRIEK_MAX_PIXELS="2048",
         CHRIEK_MAX_PROMPT_CHARS="5",
     ) as client:
-        accepted = {"prompt": "short", "image_count": 2, "width": 64, "height": 32}
+        accepted = {"prompt": "ééééé", "image_count": 2, "width": 64, "height": 32}
         assert client.post("/jobs", headers=ALICE, json=accepted).status_code == 202
         for rejected in (
             {"image_count": 3},

@@ -30,7 +30,8 @@ INDEX_PATTERN = re.compile(r"[0-9]{1,6}")
 EXPIRES_PATTERN = re.compile(r"[0-9]{1,12}")  # bounded: int() of huge digit strings raises
 WORKER_STOPPED = "worker stopped: a job result could not be saved; restart chriek"
 # Fixed wire budgets, not configuration: a 100,000-character prompt fits the body budget even
-# fully JSON-escaped, and every 422 response fits the error budget whatever the request held.
+# fully JSON-escaped in UTF-8, and every 422 response fits the error budget whatever the request
+# held.
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_ERROR_BYTES = 16 * 1024
 # Per-entry caps keep one worst-case 422 entry within MAX_ERROR_BYTES, so the first error always

@@ -72,10 +72,11 @@ def asgi_request(
 
 
 @ROUTES
-def test_declared_oversize_is_413_without_reading_the_body(tmp_path, method, path):
+@pytest.mark.parametrize("content_type", ["application/json", "text/plain"])
+def test_declared_oversize_is_413_without_reading_the_body(tmp_path, method, path, content_type):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
-        headers = JSON_ALICE | {"Content-Length": str(MAX_BODY_BYTES + 1)}
+        headers = ALICE | {"Content-Type": content_type, "Content-Length": str(MAX_BODY_BYTES + 1)}
         chunks = [padded(MAX_BODY_BYTES + 1)]
 
         assert asgi_request(client.app, chunks, headers, method, path)[:2] == (413, 0)
@@ -166,7 +167,7 @@ ADVERSARIAL_422 = {
         {"prompt": "a"} | {f"{i:\U0001f600>200}": 1 for i in range(2000)}, ensure_ascii=False
     ),
     "broad-list": json.dumps({"prompt": "a", "seed": [1.5] * 300_000}),
-    "deep-nesting": '{"prompt": ' + '{"a": ' * 100_000 + "0" + "}" * 100_000 + "}",
+    "deep-nesting": '{"prompt": ' + '{"a": ' * 970 + "0" + "}" * 970 + "}",
     "nonfinite-many": "{" + ",".join(f'"f{i}": NaN' for i in range(100_000)) + "}",
     "malformed": "{" + " " * (MAX_BODY_BYTES - 10),
 }
@@ -242,6 +243,14 @@ def test_ordinary_errors_stay_actionable(client):
             }
         ]
     }
+
+
+def test_422_clips_field_names_to_200_characters(client):
+    response = client.post("/jobs", headers=ALICE, json={"prompt": "a", "k" * 201: 1})
+
+    assert response.status_code == 422
+    [error] = response.json()["detail"]
+    assert error["loc"] == ["body", "k" * 200]
 
 
 def test_422_omits_the_rejected_value_and_validation_context(client):

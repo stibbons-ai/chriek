@@ -86,7 +86,7 @@ Two fixed byte budgets apply; neither is configurable:
 
 An early rejection can leave the request body unread. Clients that finish uploading before reading the response may see a broken pipe or connection reset instead of the `401` or `413` response.
 
-Once the worker has [stopped on an unsaved result](#job-behaviour), a request that passes authentication and validation returns `503 {"detail": "worker stopped: a job result could not be saved; restart chriek"}` instead of `202`: no `Location` header, no job stored, nothing run. Authentication (`401`) and validation (`422`, `400`) are checked first and keep their answers. The check sees the worker state at the time of the request, so a job accepted just before a result fails to save stays `queued` until restart. chriek has no queue cap; if one is added, this `503` takes precedence over a full-queue answer.
+Once the worker has [stopped on an unsaved result](#job-behaviour), a request that passes authentication, the body-size limit and validation returns `503 {"detail": "worker stopped: a job result could not be saved; restart chriek"}` instead of `202`: no `Location` header, no job stored, nothing run. Authentication (`401`), the body-size limit (`413`) and validation (`422`, `400`) are checked first and keep their answers. The check sees the worker state at the time of the request, so a job accepted just before a result fails to save stays `queued` until restart. chriek has no queue cap; if one is added, this `503` takes precedence over a full-queue answer.
 
 ### `GET /jobs/{id}`
 
