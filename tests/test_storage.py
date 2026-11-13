@@ -227,20 +227,19 @@ def test_store_and_worker_refuse_unsafe_storage_when_used_directly(tmp_path):
         store.close()
 
 
-def report_owned_by_another_user(monkeypatch, target: Path) -> int:
-    """Make stat and lstat report `target` as owned by another UID; returns that UID."""
-    foreign = os.geteuid() + 1
+def report_owned_by_another_user(monkeypatch, target: Path, uid: int = os.geteuid() + 1) -> int:
+    """Make stat and lstat report `target` as owned by `uid`; returns that UID."""
     for name in ("stat", "lstat"):
         real = getattr(os, name)
 
         def fake(path, *args, _real=real, **kwargs):
             info = _real(path, *args, **kwargs)
             if isinstance(path, str | Path) and Path(path) == target:
-                return os.stat_result((*info[:4], foreign, *info[5:10]))
+                return os.stat_result((*info[:4], uid, *info[5:10]))
             return info
 
         monkeypatch.setattr(os, name, fake)
-    return foreign
+    return uid
 
 
 @pytest.mark.parametrize("install", ["", "mine"], ids=["parent", "above a private parent"])
@@ -650,10 +649,31 @@ def nested_relative_alias(tmp_path: Path) -> Path:
     return tmp_path / "deep" / "up"
 
 
+def unsafe_target(tmp_path: Path) -> Path:
+    """`entry` -> `public`, a world-writable directory that isn't sticky."""
+    make(tmp_path / "public", 0o777, directory=True)
+    (tmp_path / "entry").symlink_to(tmp_path / "public")
+    return tmp_path / "entry"
+
+
+def relative_unsafe_target(tmp_path: Path) -> Path:
+    """`entry` -> `public` as in `unsafe_target`, written relative."""
+    make(tmp_path / "public", 0o777, directory=True)
+    (tmp_path / "entry").symlink_to("public")
+    return tmp_path / "entry"
+
+
 @pytest.mark.parametrize(
     "alias",
-    [public_alias, chained_alias, relative_alias, nested_relative_alias],
-    ids=["direct", "chained", "relative", "nested relative"],
+    [
+        public_alias,
+        chained_alias,
+        relative_alias,
+        nested_relative_alias,
+        unsafe_target,
+        relative_unsafe_target,
+    ],
+    ids=["direct", "chained", "relative", "nested relative", "unsafe target", "relative unsafe"],
 )
 def test_a_link_in_an_ancestor_other_users_can_modify_is_refused(tmp_path, alias):
     """Anyone could re-point `public/alias` and choose where chriek's data goes."""
@@ -686,6 +706,27 @@ def test_a_link_another_user_owns_in_a_sticky_directory_is_refused(tmp_path, mon
         JobStore(link / "db" / "chriek.db")
     monkeypatch.undo()
     assert str(error.value).startswith(f"{link} is a symbolic link owned by uid {foreign}.")
+    assert tree_state(tmp_path) == before, "nothing may be created at the link's target"
+
+
+@pytest.mark.parametrize("owner", ["root", "service user"])
+def test_a_trusted_link_in_a_sticky_directory_is_refused(tmp_path, monkeypatch, owner):
+    """Anyone can hard-link a root-owned link into /tmp (macOS), so its owner proves nothing."""
+    sticky = tmp_path / "sticky"
+    make(sticky, 0o1777, directory=True)
+    (tmp_path / "home").mkdir(mode=0o700)
+    link = sticky / "chriek-data"
+    link.symlink_to(tmp_path / "home" / "chosen")
+    before = tree_state(tmp_path)
+    if owner == "root":
+        report_owned_by_another_user(monkeypatch, link, uid=0)
+
+    with pytest.raises(StorageError) as error:
+        JobStore(link / "db" / "chriek.db")
+    monkeypatch.undo()
+    assert str(error.value).startswith(
+        f"{link} is a symbolic link in a directory other users can write to."
+    )
     assert tree_state(tmp_path) == before, "nothing may be created at the link's target"
 
 

@@ -92,20 +92,23 @@ def _checked_dir(path: Path) -> tuple[Path, list[Path]]:
 
 
 def _walk(path: Path) -> tuple[Path, list[Path]]:
-    """Resolve absolute `path` like the kernel, checking every directory and link it follows.
+    """Resolve absolute `path`, following links, checking every directory and link it follows.
 
     Returns the real path and its missing levels, outermost first. This is the only walk that
     follows links: missing levels are later created with mkdir, which refuses anything that
     appeared meanwhile, so no link is ever followed unchecked. A link another user owns, or one
-    in a directory they can modify, could choose where chriek's directories end up.
+    in a directory they can write to (even a sticky one, where they can hard-link a link root
+    owns), could choose where chriek's directories end up.
     """
     pending = list(reversed(path.parts[1:]))
-    current, links = Path(path.anchor), 0
+    # `holder_mode`: the last directory checked, so the one holding a link when one turns up.
+    current, links, holder_mode = Path(path.anchor), 0, 0o777
     while (info := _stat(current)) is not None:
         if stat.S_ISLNK(info.st_mode):
-            # The directory holding the link was checked on the way in.
             if info.st_uid not in (0, os.geteuid()):
                 _reject(current, f"is a symbolic link owned by uid {info.st_uid}")
+            if holder_mode & 0o022:
+                _reject(current, "is a symbolic link in a directory other users can write to")
             links += 1
             if links > 40:
                 raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(current))
@@ -114,6 +117,7 @@ def _walk(path: Path) -> tuple[Path, list[Path]]:
             current = Path(target.anchor) if target.is_absolute() else current.parent
             continue
         _check_ancestor(current, info)
+        holder_mode = info.st_mode
         if not pending:
             return current, []
         part = pending.pop()
@@ -137,8 +141,7 @@ def _check_ancestor(path: Path, info: os.stat_result) -> None:
 
 
 def _stat(path: Path) -> os.stat_result | None:
-    """lstat, or None only if `path` is missing; every other error (no access, a path through a
-    link loop) raises."""
+    """lstat, or None only if `path` is missing; every other error (such as no access) raises."""
     try:
         return os.stat(path, follow_symlinks=False)
     except FileNotFoundError:
