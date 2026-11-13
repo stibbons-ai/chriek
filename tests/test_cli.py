@@ -13,7 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx2
 import pytest
-from conftest import ALICE, ALICE_KEY, SIGNING_SECRET, base_env, submit, wait_for
+from conftest import ALICE, ALICE_KEY, BOB_KEY, SIGNING_SECRET, base_env, submit, wait_for
 from PIL import Image
 
 CHRIEK = Path(sys.executable).parent / "chriek"
@@ -39,22 +39,52 @@ CONTROL_KEY = ALICE_KEY + "\x07"
     ("overrides", "message"),
     [
         ({"CHRIEK_API_KEYS": ""}, "CHRIEK_API_KEYS must name at least one key"),
-        ({"CHRIEK_API_KEYS": "alice:short-secret-key"}, "at least 32 printable ASCII"),
-        ({"CHRIEK_API_KEYS": f"alice:{EMOJI_KEY}"}, "at least 32 printable ASCII"),
-        ({"CHRIEK_API_KEYS": f"alice:{LATIN1_KEY}"}, "at least 32 printable ASCII"),
-        ({"CHRIEK_API_KEYS": f"alice:{CONTROL_KEY}"}, "at least 32 printable ASCII"),
-        ({"CHRIEK_API_KEYS": ALICE_KEY}, "must be name:key"),
-        ({"CHRIEK_API_KEYS": f"bad name:{ALICE_KEY}"}, "must be name:key"),
+        ({"CHRIEK_API_KEYS": "alice:short-secret-key"}, "entry 1 key must be at least 32"),
+        ({"CHRIEK_API_KEYS": f"alice:{EMOJI_KEY}"}, "entry 1 key must be at least 32"),
+        ({"CHRIEK_API_KEYS": f"alice:{LATIN1_KEY}"}, "entry 1 key must be at least 32"),
+        ({"CHRIEK_API_KEYS": f"alice:{CONTROL_KEY}"}, "entry 1 key must be at least 32"),
+        (
+            {"CHRIEK_API_KEYS": f"alice:{ALICE_KEY},bob:short-secret-key"},
+            "entry 2 key must be at least 32",
+        ),
+        ({"CHRIEK_API_KEYS": ALICE_KEY}, "entry 1 must be name:key"),
+        ({"CHRIEK_API_KEYS": f"bad name:{ALICE_KEY}"}, "entry 1 must be name:key"),
         (
             {"CHRIEK_API_KEYS": f"alice:{ALICE_KEY},alice:{ALICE_KEY}z"},
-            "names 'alice' more than once",
+            "entry 2 repeats an earlier name",
+        ),
+        # Names may equal secrets; errors must not echo them. base_env signs with SIGNING_SECRET.
+        (
+            {"CHRIEK_API_KEYS": f"{SIGNING_SECRET}:{SIGNING_SECRET},{SIGNING_SECRET}:{ALICE_KEY}"},
+            "entry 2 repeats an earlier name",
+        ),
+        ({"CHRIEK_API_KEYS": f"{BOB_KEY}:short-secret-key"}, "entry 1 key must be at least 32"),
+        (
+            {"CHRIEK_API_KEYS": f"alice:{ALICE_KEY},{BOB_KEY}:{ALICE_KEY}"},
+            "entry 2 key is shared with another name",
         ),
         (
             {"CHRIEK_API_KEYS": f"alice:{ALICE_KEY},bob:{ALICE_KEY}"},
-            "shared with another name",
+            "entry 2 key is shared with another name",
         ),
         ({"CHRIEK_SIGNING_SECRET": ""}, "CHRIEK_SIGNING_SECRET must be at least 32"),
         ({"CHRIEK_SIGNING_SECRET": "short-signing-secret"}, "CHRIEK_SIGNING_SECRET"),
+        (
+            {"CHRIEK_SIGNING_SECRET": ALICE_KEY},
+            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS",
+        ),
+        (
+            {"CHRIEK_SIGNING_SECRET": BOB_KEY},
+            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS",
+        ),
+        (
+            {"CHRIEK_API_KEYS": f"{SIGNING_SECRET}:{ALICE_KEY}"},
+            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS",
+        ),
+        (
+            {"CHRIEK_API_KEYS": f"alice:{ALICE_KEY},{SIGNING_SECRET}:{BOB_KEY}"},
+            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS",
+        ),
         ({"CHRIEK_URL_TTL_SECONDS": "0"}, "CHRIEK_URL_TTL_SECONDS must be between"),
         ({"CHRIEK_URL_TTL_SECONDS": "soon"}, "CHRIEK_URL_TTL_SECONDS must be an integer"),
         ({"CHRIEK_MAX_DIMENSION": "1000"}, "CHRIEK_MAX_DIMENSION must be a multiple of 16"),
@@ -70,7 +100,7 @@ def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrid
     assert process.returncode == 2
     assert output.startswith("chriek: configuration error: ")
     assert message in output
-    for secret in (ALICE_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
+    for secret in (ALICE_KEY, BOB_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
         assert secret not in output
     for secret in (EMOJI_KEY, LATIN1_KEY):
         assert secret[:2] not in output
@@ -118,8 +148,10 @@ def served(env: dict[str, str], **kwargs) -> Iterator[httpx2.Client]:
         yield client
 
 
-def test_chriek_serve_round_trip(tmp_path):
-    with served(base_env(tmp_path)) as client:
+# A non-ASCII signing secret stays valid: only API keys travel in headers.
+@pytest.mark.parametrize("signing_secret", [SIGNING_SECRET, EMOJI_KEY])
+def test_chriek_serve_round_trip(tmp_path, signing_secret):
+    with served(base_env(tmp_path) | {"CHRIEK_SIGNING_SECRET": signing_secret}) as client:
         body = wait_for(client, submit(client, prompt="otter", image_count=2, seed=1)["id"])
 
         assert body["status"] == "succeeded", body

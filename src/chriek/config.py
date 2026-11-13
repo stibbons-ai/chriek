@@ -44,11 +44,17 @@ class Settings:
         )
         if limits.max_dimension % 16:
             raise ConfigError("CHRIEK_MAX_DIMENSION must be a multiple of 16")
+        api_keys = _api_keys(env.get("CHRIEK_API_KEYS", ""))
+        signing_secret = _signing_secret(env.get("CHRIEK_SIGNING_SECRET", ""))
+        if signing_secret in api_keys or signing_secret in api_keys.values():
+            raise ConfigError(
+                "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS name and key"
+            )
         return cls(
             db_path=Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db")),
             storage_dir=Path(env.get("CHRIEK_STORAGE_DIR", "chriek-data/images")),
-            api_keys=_api_keys(env.get("CHRIEK_API_KEYS", "")),
-            signing_secret=_signing_secret(env.get("CHRIEK_SIGNING_SECRET", "")),
+            api_keys=api_keys,
+            signing_secret=signing_secret,
             url_ttl_seconds=_int(env, "CHRIEK_URL_TTL_SECONDS", 900, 1, 7 * 24 * 3600),
             limits=limits,
             host=env.get("CHRIEK_HOST", "127.0.0.1"),
@@ -85,15 +91,16 @@ def _api_keys(raw: str) -> dict[str, str]:
             )
         # Starlette decodes headers as Latin-1, and clients differ in how they encode
         # anything beyond ASCII: only printable ASCII keys reliably authenticate.
+        # Errors name the entry position, never the name: a name may equal a secret.
         if len(key) < MIN_SECRET_LENGTH or not all("!" <= c <= "~" for c in key):
             raise ConfigError(
-                f"CHRIEK_API_KEYS key for {name!r} must be at least "
+                f"CHRIEK_API_KEYS entry {position} key must be at least "
                 f"{MIN_SECRET_LENGTH} printable ASCII characters without whitespace"
             )
         if name in keys:
-            raise ConfigError(f"CHRIEK_API_KEYS names {name!r} more than once")
+            raise ConfigError(f"CHRIEK_API_KEYS entry {position} repeats an earlier name")
         if key in keys.values():
-            raise ConfigError(f"CHRIEK_API_KEYS key for {name!r} is shared with another name")
+            raise ConfigError(f"CHRIEK_API_KEYS entry {position} key is shared with another name")
         keys[name] = key
     if not keys:
         raise ConfigError("CHRIEK_API_KEYS must name at least one key")
