@@ -104,7 +104,7 @@ The names are exact on purpose: a pattern such as `chriek.db*` would also move u
 
 Changing modes or moving a file doesn't revoke descriptors opened earlier: a process of another user that opened `chriek.db` or a sidecar before the migration can keep reading it, including jobs stored afterwards, until it closes the file. Only new private files keep future writes away from such a process; chriek doesn't detect old descriptors or create those files for you.
 
-If old descriptors are a concern, after the steps above keep every process using the database stopped and, as the service user, create a new private directory (`mkdir -m 700 <new-directory>`). Copy the database and each existing sidecar named in the loop above into it as new files (not moves or hard links), then remove group and other permissions from those copies before setting `CHRIEK_DB_PATH` to the copied database. Copy the images the same way into a new private image root and make the copies private, never a shared parent:
+If old descriptors are a concern, after the permission steps above and before restarting, keep every process using the database stopped and, as the service user, create a new private directory (`mkdir -m 700 <new-directory>`). Copy the database and each existing sidecar named in the loop above into it as new files (not moves or hard links), then remove group and other permissions from those copies before setting `CHRIEK_DB_PATH` to the copied database. Copy the images the same way into a new private image root and make the copies private, never a shared parent:
 
 ```sh
 mkdir -m 700 <new-image-root>
@@ -112,7 +112,7 @@ cp -R <old-image-root>/. <new-image-root>/
 chmod -R go= <new-image-root>
 ```
 
-Then set `CHRIEK_STORAGE_DIR` to the new root and restart. Never resume writes to the old files. This keeps WAL-only data with its database while future writes use new inodes; it cannot retract data already read. Once chriek has started on the copies and your jobs and downloads are there, delete the old database files (by their exact names, as in the loop above) and the old image root, so they don't stay readable to whoever kept them open.
+Then set `CHRIEK_STORAGE_DIR` to the new root and restart. Never resume writes to the old files. This keeps WAL-only data with its database while future writes use new inodes; it cannot retract data already read. Once chriek has started on the copies and your jobs and downloads are there, delete the old database files (by their exact names, as in the loop above) and the old image root to remove the obsolete paths. Deleting them does not revoke descriptors already open on the old files.
 
 A configured path that is a symbolic link is refused, also when its target doesn't exist yet; configure its real target instead. Data owned by another user must be copied or `chown`ed by an administrator before chriek will use it.
 
