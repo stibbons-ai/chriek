@@ -3,7 +3,16 @@
 import uuid
 
 import pytest
-from conftest import ALICE, ALICE_KEY, BOB, CountingBackend, running, submit, wait_for
+from conftest import (
+    ALICE,
+    ALICE_KEY,
+    BOB,
+    CountingBackend,
+    assert_nothing_queued,
+    running,
+    submit,
+    wait_for,
+)
 
 VALID_JOB = {"prompt": "a lighthouse"}
 
@@ -75,9 +84,7 @@ def test_unparseable_body_without_valid_key_is_401_and_never_executes(tmp_path, 
         assert response.status_code == 401
         assert response.headers["www-authenticate"] == "Bearer"
         assert response.json() == {"detail": "missing or invalid API key"}
-        valid = submit(client, width=16, height=16)
-        assert wait_for(client, valid["id"])["status"] == "succeeded"
-        assert backend.renders == 1
+        assert_nothing_queued(client, backend)
 
 
 def test_any_printable_ascii_key_authenticates(tmp_path):

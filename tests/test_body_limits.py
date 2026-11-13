@@ -3,15 +3,23 @@
 import asyncio
 import itertools
 import json
+import uuid
 
 import pytest
-from conftest import ALICE, ALICE_KEY, CountingBackend, running, submit, wait_for
+from conftest import ALICE, ALICE_KEY, CountingBackend, assert_nothing_queued, running, wait_for
 
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_ERROR_BYTES = 16 * 1024
 MIB = 1024 * 1024
 VALID = b'{"prompt": "a lighthouse", "width": 16, "height": 16}'
 JSON_ALICE = {"Authorization": f"Bearer {ALICE_KEY}", "Content-Type": "application/json"}
+BODY_TOO_LARGE = {"detail": f"request body must be at most {MAX_BODY_BYTES} bytes"}
+# Any job ID: the key and length checks answer before the job is looked up.
+ROUTES = pytest.mark.parametrize(
+    ("method", "path"),
+    [("POST", "/jobs"), ("GET", f"/jobs/{uuid.UUID(int=0)}")],
+    ids=["post", "get"],
+)
 
 
 def padded(size: int) -> bytes:
@@ -19,19 +27,21 @@ def padded(size: int) -> bytes:
     return VALID[:-1] + b" " * (size - len(VALID)) + b"}"
 
 
-def post_asgi(app, chunks: list[bytes], headers: dict[str, str]) -> tuple[int, int]:
-    """POST /jobs straight through ASGI, one receive message per chunk.
+def asgi_request(
+    app, chunks: list[bytes], headers: dict[str, str], method="POST", path="/jobs"
+) -> tuple[int, int, dict[bytes, bytes], bytes]:
+    """Request straight through ASGI, one receive message per chunk.
 
     TestClient delivers bytes content in a single receive message; this harness can stream chunks,
     understate or omit the length, and count how many chunks the app pulled.
-    Returns (status, receive calls).
+    Returns (status, receive calls, response headers, response body).
     """
     messages = [
         {"type": "http.request", "body": chunk, "more_body": index < len(chunks) - 1}
         for index, chunk in enumerate(chunks)
     ]
     calls = 0
-    statuses = []
+    sent = []
 
     async def receive():
         nonlocal calls
@@ -39,17 +49,16 @@ def post_asgi(app, chunks: list[bytes], headers: dict[str, str]) -> tuple[int, i
         return messages[calls - 1]
 
     async def send(message):
-        if message["type"] == "http.response.start":
-            statuses.append(message["status"])
+        sent.append(message)
 
     scope = {
         "type": "http",
         "asgi": {"version": "3.0"},
         "http_version": "1.1",
-        "method": "POST",
+        "method": method,
         "scheme": "http",
-        "path": "/jobs",
-        "raw_path": b"/jobs",
+        "path": path,
+        "raw_path": path.encode(),
         "root_path": "",
         "query_string": b"",
         "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
@@ -57,22 +66,19 @@ def post_asgi(app, chunks: list[bytes], headers: dict[str, str]) -> tuple[int, i
         "server": ("testserver", 80),
     }
     asyncio.run(app(scope, receive, send))
-    return statuses[0], calls
+    start = sent[0]
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return start["status"], calls, dict(start["headers"]), body
 
 
-def assert_nothing_queued(client, backend: CountingBackend) -> None:
-    """A valid job submitted afterwards is the first and only one the worker renders."""
-    valid = submit(client, width=16, height=16)
-    assert wait_for(client, valid["id"])["status"] == "succeeded"
-    assert backend.renders == 1
-
-
-def test_declared_oversize_is_413_without_reading_the_body(tmp_path):
+@ROUTES
+def test_declared_oversize_is_413_without_reading_the_body(tmp_path, method, path):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
         headers = JSON_ALICE | {"Content-Length": str(MAX_BODY_BYTES + 1)}
+        chunks = [padded(MAX_BODY_BYTES + 1)]
 
-        assert post_asgi(client.app, [padded(MAX_BODY_BYTES + 1)], headers) == (413, 0)
+        assert asgi_request(client.app, chunks, headers, method, path)[:2] == (413, 0)
         assert_nothing_queued(client, backend)
 
 
@@ -88,20 +94,24 @@ def test_streamed_overflow_stops_at_the_first_overflowing_chunk(tmp_path, length
         # 1 MiB + 1 MiB is exactly the cap; the third chunk overflows; two more stay unread.
         chunks = [b" " * MIB] * 5
 
-        assert post_asgi(client.app, chunks, headers) == (413, 3)
+        assert asgi_request(client.app, chunks, headers)[:2] == (413, 3)
         assert_nothing_queued(client, backend)
 
 
 def test_streamed_valid_job_overflow_is_413_and_never_queued(tmp_path):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
-        # A valid job followed by whitespace: every prefix up to the cap would be admitted.
+        # A valid job followed by whitespace: each chunk boundary within the cap ends a valid job,
+        # so only the byte count can reject it.
         chunks = [VALID] + [b" " * MIB] * 4
         totals = itertools.accumulate(map(len, chunks))
         first_overflow = next(i for i, total in enumerate(totals, 1) if total > MAX_BODY_BYTES)
         assert first_overflow < len(chunks)
 
-        assert post_asgi(client.app, chunks, JSON_ALICE) == (413, first_overflow)
+        status, calls, response_headers, body = asgi_request(client.app, chunks, JSON_ALICE)
+        assert (status, calls) == (413, first_overflow)
+        assert response_headers[b"content-type"] == b"application/json"
+        assert json.loads(body) == BODY_TOO_LARGE
         assert_nothing_queued(client, backend)
 
 
@@ -111,32 +121,36 @@ def test_exact_limit_is_admitted_and_one_more_byte_is_413(tmp_path):
         over = padded(MAX_BODY_BYTES + 1)
         response = client.post("/jobs", headers=JSON_ALICE, content=over)
         assert response.status_code == 413
-        assert response.json() == {"detail": f"request body must be at most {MAX_BODY_BYTES} bytes"}
+        assert response.json() == BODY_TOO_LARGE
         # Streamed without Content-Length, split mid-body: received bytes decide.
-        assert post_asgi(client.app, [over[:MIB], over[MIB:]], JSON_ALICE)[0] == 413
+        assert asgi_request(client.app, [over[:MIB], over[MIB:]], JSON_ALICE)[0] == 413
         assert_nothing_queued(client, backend)
 
         exact = padded(MAX_BODY_BYTES)
         response = client.post("/jobs", headers=JSON_ALICE, content=exact)
         assert response.status_code == 202, response.text
         assert wait_for(client, response.json()["id"])["status"] == "succeeded"
-        assert post_asgi(client.app, [exact[:MIB], exact[MIB:]], JSON_ALICE)[0] == 202
+        assert asgi_request(client.app, [exact[:MIB], exact[MIB:]], JSON_ALICE)[0] == 202
 
 
+@ROUTES
 @pytest.mark.parametrize(
     "auth", [{}, {"Authorization": "Bearer invalid"}], ids=["missing", "invalid"]
 )
 @pytest.mark.parametrize(
     "length", [None, str(MAX_BODY_BYTES + 1)], ids=["no-length", "oversized-length"]
 )
-def test_missing_or_invalid_key_is_401_before_reading_any_body(tmp_path, auth, length):
+def test_missing_or_invalid_key_is_401_before_reading_any_body(
+    tmp_path, auth, length, method, path
+):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
         headers = auth | {"Content-Type": "application/json"}
         if length is not None:
             headers["Content-Length"] = length
 
-        assert post_asgi(client.app, [b"{", b" " * MIB], headers) == (401, 0)
+        chunks = [b"{", b" " * MIB]
+        assert asgi_request(client.app, chunks, headers, method, path)[:2] == (401, 0)
         assert_nothing_queued(client, backend)
 
 

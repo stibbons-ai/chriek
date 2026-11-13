@@ -33,10 +33,20 @@ WORKER_STOPPED = "worker stopped: a job result could not be saved; restart chrie
 # fully JSON-escaped, and every 422 response fits the error budget whatever the request held.
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_ERROR_BYTES = 16 * 1024
-# Per-entry caps keep one worst-case 422 entry (10 clipped strings, each escaping to
-# at most 7 bytes per character) within MAX_ERROR_BYTES, so the first error always fits.
+# Per-entry caps keep one worst-case 422 entry within MAX_ERROR_BYTES, so the first error always
+# fits: type, msg and MAX_ERROR_LOC loc parts are each clipped to MAX_ERROR_TEXT characters, and a
+# character JSON-encodes to at most 7 bytes (a lone surrogate becomes `\udXXX` text whose
+# backslash is escaped again), plus 2 quotes per string, punctuation and the response envelope.
+# Integer loc parts are not clipped; counting them as strings holds because the capped body only
+# yields small ones (field indexes, JSON error offsets below MAX_BODY_BYTES), not giant integers.
 MAX_ERROR_TEXT = 200
 MAX_ERROR_LOC = 8
+_WORST_ERROR_BYTES = (
+    len(b'{"detail":[{"type":,"loc":[],"msg":}]}')
+    + (MAX_ERROR_LOC - 1)  # commas between loc parts
+    + (2 + MAX_ERROR_LOC) * (2 + 7 * MAX_ERROR_TEXT)
+)
+assert _WORST_ERROR_BYTES <= MAX_ERROR_BYTES, "a worst-case first 422 entry must fit"
 BODY_TOO_LARGE = f"request body must be at most {MAX_BODY_BYTES} bytes"
 
 
