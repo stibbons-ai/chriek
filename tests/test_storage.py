@@ -290,6 +290,29 @@ PARTLY_MISSING = {
 }
 
 
+def unsafe_database(t: Path) -> None:
+    make(t / "db", 0o700, directory=True)
+    make(t / "db/chriek.db", 0o644)
+
+
+def unsafe_wal(t: Path) -> None:
+    make(t / "db", 0o700, directory=True)
+    make(t / "db/chriek.db", 0o600)
+    make(t / "db/chriek.db-wal", 0o644)
+
+
+# A private database directory holding an unsafe file: the file check, not only the directory
+# check, must run before the missing image root is created.
+PARTLY_MISSING |= {
+    f"private database root, {name}, images missing {where}": (
+        setup,
+        {"CHRIEK_DB_PATH": "db/chriek.db", "CHRIEK_STORAGE_DIR": images},
+    )
+    for name, setup in {"unsafe database": unsafe_database, "unsafe wal": unsafe_wal}.items()
+    for where, images in {"inside it": "db/images", "elsewhere": "new/images"}.items()
+}
+
+
 @pytest.mark.parametrize(("setup", "paths"), PARTLY_MISSING.values(), ids=PARTLY_MISSING.keys())
 def test_one_unsafe_side_stops_startup_before_the_other_is_created(tmp_path, setup, paths):
     setup(tmp_path)
@@ -731,6 +754,37 @@ def test_a_trusted_link_in_a_sticky_directory_is_refused(tmp_path, monkeypatch, 
     assert tree_state(tmp_path) == before, "nothing may be created at the link's target"
 
 
+@pytest.mark.parametrize(
+    ("holder_mode", "target", "foreign", "problem"),
+    [
+        (0o1777, "{home}/chosen", False, "is a symbolic link in a directory other users can"),
+        (0o1777, "../home/chosen", False, "is a symbolic link in a directory other users can"),
+        (0o755, "{home}/chosen", True, "is a symbolic link owned by uid"),
+    ],
+    ids=["sticky holder", "relative target in sticky holder", "foreign owner"],
+)
+def test_a_later_link_in_a_chain_is_checked_like_the_first(
+    tmp_path, monkeypatch, holder_mode, target, foreign, problem
+):
+    """`safe/alias` -> `holder` is trusted; `holder/chriek-data`, followed second, is not."""
+    make(tmp_path / "safe", 0o755, directory=True)
+    holder = tmp_path / "holder"
+    make(holder, holder_mode, directory=True)
+    (tmp_path / "safe" / "alias").symlink_to(holder)
+    (tmp_path / "home").mkdir(mode=0o700)
+    link = holder / "chriek-data"
+    link.symlink_to(target.format(home=tmp_path / "home"))
+    before = tree_state(tmp_path)
+    if foreign:
+        report_owned_by_another_user(monkeypatch, link)
+
+    with pytest.raises(StorageError) as error:
+        JobStore(tmp_path / "safe" / "alias" / "chriek-data" / "db" / "chriek.db")
+    monkeypatch.undo()
+    assert str(error.value).startswith(f"{link} {problem}")
+    assert tree_state(tmp_path) == before, "nothing may be created at the link's target"
+
+
 @pytest.mark.skipif(not Path("/var").is_symlink(), reason="needs macOS's root-owned /var link")
 def test_a_root_owned_system_alias_is_followed(tmp_path):
     if not tmp_path.is_relative_to("/private/var"):
@@ -746,7 +800,7 @@ def test_a_root_owned_system_alias_is_followed(tmp_path):
     assert modes(tmp_path)["images"] == 0o700
 
 
-def test_repointing_a_trusted_alias_after_startup_never_moves_storage(tmp_path):
+def test_repointing_a_trusted_alias_after_startup_never_moves_storage(tmp_path, monkeypatch):
     """Pins the documented contract: links above the configured paths resolve once, at startup."""
     first, second = tmp_path / "first", tmp_path / "second"
     first.mkdir(mode=0o700)
@@ -757,9 +811,14 @@ def test_repointing_a_trusted_alias_after_startup_never_moves_storage(tmp_path):
         "CHRIEK_DB_PATH": str(alias / "chriek" / "db" / "chriek.db"),
         "CHRIEK_STORAGE_DIR": str(alias / "chriek" / "images"),
     }
+    stores = []
+    monkeypatch.setattr(
+        "chriek.api.JobStore", lambda path: stores.append(JobStore(path)) or stores[-1]
+    )
     with running(tmp_path, **env) as client:
         alias.unlink()
         alias.symlink_to(second)
+        stores[0].close()  # every later query opens a new connection, by the path the store kept
         body = wait_for(client, submit(client, width=16, height=16)["id"])
         assert body["status"] == "succeeded", body
         download = client.get(body["images"][0]["url"])
@@ -771,3 +830,12 @@ def test_repointing_a_trusted_alias_after_startup_never_moves_storage(tmp_path):
     with closing(sqlite3.connect(first / "chriek/db/chriek.db")) as db:
         statuses = db.execute("SELECT status FROM jobs WHERE id = ?", (body["id"],)).fetchall()
     assert statuses == [("succeeded",)]
+
+
+def test_an_image_root_removed_while_running_is_never_recreated(tmp_path):
+    with running(tmp_path) as client:
+        (tmp_path / "images").rmdir()
+        body = wait_for(client, submit(client, width=16, height=16)["id"])
+
+    assert body["status"] == "failed"
+    assert not (tmp_path / "images").exists(), "only startup may create the image root"
