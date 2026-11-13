@@ -46,8 +46,10 @@ class Settings:
             raise ConfigError("CHRIEK_MAX_DIMENSION must be a multiple of 16")
         api_keys = _api_keys(env.get("CHRIEK_API_KEYS", ""))
         signing_secret = _signing_secret(env.get("CHRIEK_SIGNING_SECRET", ""))
-        if signing_secret in api_keys.values():
-            raise ConfigError("CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS key")
+        if signing_secret in api_keys or signing_secret in api_keys.values():
+            raise ConfigError(
+                "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS name and key"
+            )
         return cls(
             db_path=Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db")),
             storage_dir=Path(env.get("CHRIEK_STORAGE_DIR", "chriek-data/images")),

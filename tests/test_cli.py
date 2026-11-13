@@ -67,11 +67,19 @@ CONTROL_KEY = ALICE_KEY + "\x07"
         ({"CHRIEK_SIGNING_SECRET": "short-signing-secret"}, "CHRIEK_SIGNING_SECRET"),
         (
             {"CHRIEK_SIGNING_SECRET": ALICE_KEY},
-            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS key",
+            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS",
         ),
         (
             {"CHRIEK_SIGNING_SECRET": BOB_KEY},
-            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS key",
+            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS",
+        ),
+        (
+            {"CHRIEK_API_KEYS": f"{SIGNING_SECRET}:{ALICE_KEY}"},
+            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS",
+        ),
+        (
+            {"CHRIEK_API_KEYS": f"alice:{ALICE_KEY},{SIGNING_SECRET}:{BOB_KEY}"},
+            "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS",
         ),
         ({"CHRIEK_URL_TTL_SECONDS": "0"}, "CHRIEK_URL_TTL_SECONDS must be between"),
         ({"CHRIEK_URL_TTL_SECONDS": "soon"}, "CHRIEK_URL_TTL_SECONDS must be an integer"),
