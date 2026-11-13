@@ -53,6 +53,13 @@ class Finding:
     aliases: tuple[str, ...]
     fix_versions: tuple[str, ...]
 
+    def describe(self) -> str:
+        return (
+            f"{self.name}=={self.version}: {self.id}"
+            f" aliases [{', '.join(self.aliases)}]"
+            f" fixed in [{', '.join(self.fix_versions)}]"
+        )
+
 
 def _version(name: str, raw: object) -> Version:
     if not isinstance(raw, str):
@@ -92,13 +99,25 @@ def parse_export(text: str) -> Inventory:
 
 
 def parse_lock(text: str) -> Inventory:
-    """Every third-party package in uv.lock; only the local project at `.` is excluded."""
+    """Every third-party package in uv.lock, each of which must be locked from PyPI.
+
+    Only the local project at `.` is excluded. A package from another registry, a git, URL or
+    path source, or a malformed entry raises AuditError.
+    """
     try:
         packages = tomllib.loads(text)["package"]
     except (tomllib.TOMLDecodeError, KeyError) as exc:
         raise AuditError(f"uv.lock: unreadable: {exc}") from exc
+    if not isinstance(packages, list):
+        raise AuditError(f"uv.lock: package is not a list of tables: {packages!r}")
     inventory: Inventory = {}
     for package in packages:
+        if not (
+            isinstance(package, dict)
+            and isinstance(package.get("name"), str)
+            and isinstance(package.get("source"), dict)
+        ):
+            raise AuditError(f"uv.lock: malformed package entry {package!r}")
         name, source = package["name"], package["source"]
         if source.get("registry") == PYPI_REGISTRY:
             _add(inventory, name, _version(name, package.get("version")), "uv.lock")
@@ -115,17 +134,16 @@ def parse_lock(text: str) -> Inventory:
 def collect_inventory(export_text: str, lock_text: str) -> Inventory:
     """The exported inventory, proven to cover exactly the lock's third-party packages."""
     exported = parse_export(export_text)
-    locked = parse_lock(lock_text)
-    if exported != locked:
-        raise AuditError(
-            "uv export does not match uv.lock: " + _describe_mismatch(locked, exported)
-        )
+    _require_same("uv export does not match uv.lock", parse_lock(lock_text), exported)
     if not exported:
         raise AuditError("no third-party packages to audit")
     return exported
 
 
-def _describe_mismatch(expected: Inventory, actual: Inventory) -> str:
+def _require_same(label: str, expected: Inventory, actual: Inventory) -> None:
+    """AuditError naming every difference unless `actual` holds exactly `expected`."""
+    if actual == expected:
+        return
     problems = [f"missing {name}=={expected[name]}" for name in sorted(expected.keys() - actual)]
     problems += [f"unexpected {name}=={actual[name]}" for name in sorted(actual.keys() - expected)]
     problems += [
@@ -133,7 +151,7 @@ def _describe_mismatch(expected: Inventory, actual: Inventory) -> str:
         for name in sorted(expected.keys() & actual.keys())
         if expected[name] != actual[name]
     ]
-    return "; ".join(problems)
+    raise AuditError(f"{label}: {'; '.join(problems)}")
 
 
 def _strings(owner: str, field: str, value: object) -> tuple[str, ...]:
@@ -184,11 +202,7 @@ def evaluate(inventory: Inventory, returncode: int, report_text: str | None) -> 
 
     if skipped:
         raise AuditError("pip-audit skipped packages: " + "; ".join(skipped))
-    if audited != inventory:
-        raise AuditError(
-            "pip-audit did not audit exactly the locked packages: "
-            + _describe_mismatch(inventory, audited)
-        )
+    _require_same("pip-audit did not audit exactly the locked packages", inventory, audited)
     # pip-audit's own exit codes: 1 when it reports vulnerabilities, 0 when it reports none.
     if returncode != (1 if findings else 0):
         raise AuditError(
@@ -276,11 +290,9 @@ def check_validated(inventory: Inventory, record_text: str) -> None:
     for line in record_text.splitlines():
         name, _, version = line.partition("==")
         _add(validated, name, _version(name, version), "validated PyPI responses")
-    if validated != inventory:
-        raise AuditError(
-            "PyPI responses were not validated for exactly the locked packages: "
-            + _describe_mismatch(inventory, validated)
-        )
+    _require_same(
+        "PyPI responses were not validated for exactly the locked packages", inventory, validated
+    )
 
 
 def audit(project: Path) -> list[Finding]:
@@ -292,11 +304,14 @@ def audit(project: Path) -> list[Finding]:
     inventory = collect_inventory(export_text, lock_text)
     print(f"inventory: {len(inventory)} locked third-party packages")
     result, report_text, record_text = _run_pip_audit(inventory)
+    findings: list[Finding] = []
     try:
         findings = evaluate(inventory, result.returncode, report_text)
         check_validated(inventory, record_text)
     except AuditError as exc:
-        raise AuditError(f"{exc}\npip-audit stderr:\n{result.stderr}") from exc
+        # Findings parsed before validation failed: shown, but not proven by validated responses.
+        unconfirmed = "".join(f"\nUNCONFIRMED {f.describe()}" for f in findings)
+        raise AuditError(f"{exc}{unconfirmed}\npip-audit stderr:\n{result.stderr}") from exc
     return findings
 
 
@@ -326,12 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_OPERATIONAL
     if findings:
         for finding in findings:
-            print(
-                f"VULNERABLE {finding.name}=={finding.version}: {finding.id}"
-                f" aliases [{', '.join(finding.aliases)}]"
-                f" fixed in [{', '.join(finding.fix_versions)}]",
-                file=sys.stderr,
-            )
+            print(f"VULNERABLE {finding.describe()}", file=sys.stderr)
         print(f"DEPENDENCY AUDIT FAILED: {len(findings)} known vulnerabilities", file=sys.stderr)
         return EXIT_VULNERABLE
     print("DEPENDENCY AUDIT PASSED: every locked third-party package audited, none vulnerable")

@@ -87,7 +87,8 @@ def validating_hook(record: Path):
     def check(response: requests.Response, *args: object, **kwargs: object) -> None:
         # Only 200 bodies are validated and recorded. pip-audit raises 4xx/5xx itself (404 is
         # a skip, fatal under --strict); any other status, such as 203 or an unfollowed 3xx, is
-        # parsed unvalidated and fails the gate only because its record line is missing.
+        # parsed unvalidated; the missing record line guarantees the gate fails even when that
+        # parse succeeds.
         if response.status_code != 200:
             return
         url = PYPI_URL.fullmatch(response.url)

@@ -41,6 +41,7 @@ source = { registry = "https://pypi.org/simple" }
 """
 EXPORT = "colorama==0.4.6 ; sys_platform == 'win32'\ntyping-extensions==4.16.0\n"
 INVENTORY = audit.collect_inventory(EXPORT, LOCK)
+INTERNAL_LOCK = LOCK.replace(audit.PYPI_REGISTRY, "https://pypi.internal.example/simple", 1)
 
 
 def report(*entries: dict) -> str:
@@ -80,9 +81,22 @@ def test_inventory_covers_marker_guarded_packages_and_excludes_only_the_project(
         ),
         (
             EXPORT,
-            LOCK.replace("https://pypi.org/simple", "https://pypi.internal.example/simple", 1),
+            INTERNAL_LOCK,
             "colorama is locked from registry https://pypi.internal.example/simple; only",
         ),
+        (EXPORT, LOCK + '[[package]]\nname = "lib"\nversion = "1"\n', "malformed package entry"),
+        (
+            EXPORT,
+            LOCK + '[[package]]\nname = 1\nsource = { registry = "https://pypi.org/simple" }\n',
+            "malformed package entry",
+        ),
+        (
+            EXPORT,
+            LOCK + '[[package]]\nname = "lib"\nversion = "1"\nsource = "pypi"\n',
+            "malformed package entry",
+        ),
+        (EXPORT, "package = [1]\n", "malformed package entry 1"),
+        (EXPORT, 'package = "colorama"\n', "package is not a list of tables"),
         ("", '[[package]]\nname = "app"\nversion = "0"\nsource = { virtual = "." }\n', "no third"),
     ],
 )
@@ -182,6 +196,24 @@ def test_an_unexpected_crash_is_operational_not_vulnerable(
     out = capsys.readouterr()
     assert "PASSED" not in out.out
     assert "DEPENDENCY AUDIT ERROR (operational, nothing proven): crashed" in out.err
+    assert "RuntimeError: bug in the gate" in out.err
+
+
+def test_a_non_pypi_lock_fails_before_the_auditor_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "uv.lock").write_text(INTERNAL_LOCK)
+    monkeypatch.setattr(audit, "_export_requirements", lambda project: EXPORT)
+
+    def never(inventory: object) -> None:
+        raise AssertionError("pip-audit ran")
+
+    monkeypatch.setattr(audit, "_run_pip_audit", never)
+
+    assert audit.main(["--project", str(project)]) == audit.EXIT_OPERATIONAL
+    assert "locked from registry https://pypi.internal.example/simple" in capsys.readouterr().err
 
 
 _real_run = subprocess.run
@@ -296,6 +328,20 @@ def test_gate_rejects_a_report_whose_service_responses_were_not_all_validated(
     assert "not validated for exactly the locked packages: missing iniconfig==2.3.1" in out.err
 
 
+def test_findings_from_a_partly_unvalidated_run_stay_visible_and_unconfirmed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    fake_pip_audit(monkeypatch, 1, iniconfig(VULN), stderr="pip-audit said", validated="")
+
+    assert audit.main(["--project", str(FIXTURE_CLEAN)]) == audit.EXIT_OPERATIONAL
+    out = capsys.readouterr()
+    assert "DEPENDENCY AUDIT ERROR (operational, nothing proven)" in out.err
+    assert "UNCONFIRMED iniconfig==2.3.1: PYSEC-1 aliases [CVE-1] fixed in [0.4.7]" in out.err
+    assert "pip-audit said" in out.err
+    assert "VULNERABLE" not in out.err
+    assert "DEPENDENCY AUDIT FAILED" not in out.err
+
+
 # Loaded into the real pip-audit process: replaces only the HTTP transport under pip-audit's
 # own requests session, so its cache layer, PyPI service, CLI and JSON report all run for real.
 # Responses are cacheable and close at EOF like a real socket, which is when the cache stores them.
@@ -347,12 +393,19 @@ ADVISORY = {
 }
 
 
-def pypi_serves(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: int, body: str) -> int:
-    """Run the real gate and pinned pip-audit; PyPI answers iniconfig 2.3.1 with `body`."""
+def pypi_serves(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status: int,
+    body: str,
+    project: Path = FIXTURE_CLEAN,
+    url: str = INICONFIG_URL,
+) -> int:
+    """Run the real gate and pinned pip-audit on `project`; PyPI answers `url` with `body`."""
     (tmp_path / "sitecustomize.py").write_text(TRANSPORT)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
-    monkeypatch.setenv("AUDIT_TEST_PYPI_RESPONSES", json.dumps({INICONFIG_URL: [status, body]}))
-    return audit.main(["--project", str(FIXTURE_CLEAN)])
+    monkeypatch.setenv("AUDIT_TEST_PYPI_RESPONSES", json.dumps({url: [status, body]}))
+    return audit.main(["--project", str(project)])
 
 
 def payload(*vulns: dict) -> str:
@@ -401,6 +454,34 @@ def test_a_clean_answer_from_an_earlier_run_never_hides_a_new_advisory(
 
     assert pypi_serves(monkeypatch, tmp_path, 200, payload(ADVISORY)) == audit.EXIT_VULNERABLE
     assert "VULNERABLE iniconfig==2.3.1: PYSEC-9" in capsys.readouterr().err
+
+
+def test_the_vulnerable_fixture_fails_through_the_real_auditor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    url = "https://pypi.org/pypi/urllib3/1.26.4/json"
+    code = pypi_serves(
+        monkeypatch, tmp_path, 200, payload(ADVISORY), project=FIXTURE_VULNERABLE, url=url
+    )
+
+    assert code == audit.EXIT_VULNERABLE
+    err = capsys.readouterr().err
+    assert "VULNERABLE urllib3==1.26.4: PYSEC-9 aliases [CVE-9] fixed in [2.3.2]" in err
+    assert "DEPENDENCY AUDIT FAILED: 1 known vulnerabilities" in err
+
+
+def test_an_advisory_in_an_unvalidated_response_stays_unconfirmed_through_the_real_auditor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert pypi_serves(monkeypatch, tmp_path, 203, payload(ADVISORY)) == audit.EXIT_OPERATIONAL
+    out = capsys.readouterr()
+    assert "PASSED" not in out.out + out.err
+    assert "DEPENDENCY AUDIT ERROR (operational, nothing proven)" in out.err
+    assert "not validated for exactly the locked packages: missing iniconfig==2.3.1" in out.err
+    assert "UNCONFIRMED iniconfig==2.3.1: PYSEC-9 aliases [CVE-9] fixed in [2.3.2]" in out.err
+    assert "Found 1 known vulnerability in 1 package" in out.err  # real pip-audit stderr
+    assert "VULNERABLE" not in out.err
+    assert "DEPENDENCY AUDIT FAILED" not in out.err
 
 
 @pytest.mark.parametrize(
