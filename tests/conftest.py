@@ -33,6 +33,8 @@ def base_env(tmp_path: Path) -> dict[str, str]:
         "CHRIEK_STORAGE_DIR": str(tmp_path / "images"),
         "CHRIEK_API_KEYS": f"alice:{ALICE_KEY},bob:{BOB_KEY}",
         "CHRIEK_SIGNING_SECRET": SIGNING_SECRET,
+        # TestClient's origin; `chriek serve` tests replace it with the served port.
+        "CHRIEK_PUBLIC_URL": "http://testserver",
     }
 
 

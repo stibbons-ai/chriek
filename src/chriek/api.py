@@ -94,18 +94,17 @@ def create_app(
             media_type="application/json",
         )
 
-    def job_body(job: Job, request: Request) -> dict[str, Any]:
+    def job_body(job: Job) -> dict[str, Any]:
         images = []
         if job.status == SUCCEEDED:
             expires = int(clock()) + settings.url_ttl_seconds
-            base = str(request.base_url)
             for image in job.images:
                 signature = signer.sign(uuid.UUID(job.id), image.index, expires)
                 images.append(
                     {
                         "index": image.index,
                         "seed": image.seed,
-                        "url": f"{base}images/{job.id}/{image.index}.png"
+                        "url": f"{settings.public_url}/images/{job.id}/{image.index}.png"
                         f"?expires={expires}&sig={signature}",
                         "expires_at": _iso(expires),
                     }
@@ -136,9 +135,7 @@ def create_app(
         return {"status": "ok"}
 
     @jobs.post("/jobs", status_code=status.HTTP_202_ACCEPTED)
-    def submit_job(
-        body: JobRequest, owner: Owner, request: Request, response: Response
-    ) -> dict[str, Any]:
+    def submit_job(body: JobRequest, owner: Owner, response: Response) -> dict[str, Any]:
         errors = _limit_errors(body, settings.limits)
         if errors:
             raise RequestValidationError(errors)
@@ -159,16 +156,16 @@ def create_app(
         )
         worker.notify()
         response.headers["Location"] = f"/jobs/{job.id}"
-        return job_body(job, request)
+        return job_body(job)
 
     @jobs.get("/jobs/{job_id}")
-    def get_job(job_id: str, owner: Owner, request: Request) -> dict[str, Any]:
+    def get_job(job_id: str, owner: Owner) -> dict[str, Any]:
         # Malformed IDs, missing jobs and other owners' jobs all get the same 404.
         job_uuid = _parse_uuid(job_id)
         job = store.get(owner, str(job_uuid)) if job_uuid else None
         if job is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
-        return job_body(job, request)
+        return job_body(job)
 
     @app.get("/images/{job_id}/{index}.png")
     def download_image(job_id: str, index: str, expires: str = "", sig: str = "") -> FileResponse:
