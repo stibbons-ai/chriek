@@ -1,0 +1,30 @@
+name: PR Agent (Claude)
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review]
+  issue_comment:
+jobs:
+  pr_agent_job:
+    # Secret must never reach fork-controlled runs: same-repo PRs, or PR comments by write-level users only.
+    if: >-
+      github.event.sender.type != 'Bot' && (
+        (github.event_name == 'pull_request' &&
+         github.event.pull_request.head.repo.full_name == github.repository) ||
+        (github.event_name == 'issue_comment' &&
+         github.event.issue.pull_request &&
+         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: PR Agent action step
+        uses: the-pr-agent/pr-agent@e673a02076ce09a4726c3d0c3cc85780e59ca52b # v0.50.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ANTHROPIC.KEY: ${{ secrets.PR_AGENT_ANTHROPIC_API_KEY }}
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "true"
+          github_action_config.auto_improve: "true"
