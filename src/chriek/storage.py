@@ -79,19 +79,9 @@ def _checked_dir(path: Path) -> tuple[Path, list[Path]]:
     Returns the real path and its missing levels, outermost first.
     """
     path = Path(os.path.abspath(path))
-    _check_traversal(path.parent)
-    real = path.resolve()
-    missing = []
-    # Outermost first: a level counts as missing only below an existing checked directory, so
-    # a non-directory ancestor is named before anything below it fails with "Not a directory".
-    for parent in reversed(real.parents):
-        # A link here (planted after resolving, or a loop resolve left alone) is not a directory.
-        info = None if missing else _stat(parent)
-        if info is None:
-            missing.append(parent)
-        else:
-            _check_ancestor(parent, info)
-    info = _stat(path)  # also below missing levels: a dangling configured link is still a link
+    parent, missing = _walk(path.parent)
+    real = parent / path.name
+    info = None if missing else _stat(real)
     if info is None:
         missing.append(real)
     elif stat.S_ISLNK(info.st_mode):
@@ -101,12 +91,13 @@ def _checked_dir(path: Path) -> tuple[Path, list[Path]]:
     return real, missing
 
 
-def _check_traversal(path: Path) -> None:
-    """Check every directory and link followed to reach existing levels of absolute `path`.
+def _walk(path: Path) -> tuple[Path, list[Path]]:
+    """Resolve absolute `path` like the kernel, checking every directory and link it follows.
 
-    Follows links like `Path.resolve`, so link targets and chains are checked too: a link
-    another user owns, or one in a directory they can modify, could choose where chriek's
-    directories end up.
+    Returns the real path and its missing levels, outermost first. This is the only walk that
+    follows links: missing levels are later created with mkdir, which refuses anything that
+    appeared meanwhile, so no link is ever followed unchecked. A link another user owns, or one
+    in a directory they can modify, could choose where chriek's directories end up.
     """
     pending = list(reversed(path.parts[1:]))
     current, links = Path(path.anchor), 0
@@ -124,9 +115,16 @@ def _check_traversal(path: Path) -> None:
             continue
         _check_ancestor(current, info)
         if not pending:
-            return
+            return current, []
         part = pending.pop()
         current = current.parent if part == ".." else current / part
+    missing = [current]
+    for part in reversed(pending):
+        if part == "..":
+            # The kernel can't resolve `<missing>/..`; guessing where it leads would be unchecked.
+            _reject(missing[-1], "is missing, so the link target leading through it can't be used")
+        missing.append(missing[-1] / part)
+    return missing[-1], missing
 
 
 def _check_ancestor(path: Path, info: os.stat_result) -> None:

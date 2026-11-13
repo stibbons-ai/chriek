@@ -16,7 +16,7 @@ from conftest import PausingBackend, modes, running, submit, tree_state, wait_fo
 from PIL import Image
 
 from chriek.backend import FakeBackend
-from chriek.storage import StorageError
+from chriek.storage import StorageError, private_image_root
 from chriek.store import JobStore
 from chriek.worker import Worker
 
@@ -344,30 +344,54 @@ def test_a_configured_link_to_a_target_below_a_missing_directory_is_refused(tmp_
     assert tree_state(tmp_path) == before, "nothing may be created at the target or other side"
 
 
-def test_an_ancestor_linked_after_resolving_is_refused(tmp_path, monkeypatch):
+@pytest.mark.parametrize("side", ["images", "db"])
+def test_a_missing_level_linked_right_after_chriek_sees_it_missing_is_refused(
+    tmp_path, monkeypatch, side
+):
     """Stand-in for another user filling a missing level in a sticky directory with a link."""
     sticky = tmp_path / "sticky"
-    sticky.mkdir()
-    sticky.chmod(0o1777)
+    make(sticky, 0o1777, directory=True)
     (tmp_path / "target").mkdir(mode=0o700)
     level = sticky / "chriek-data"
-    real_resolve = Path.resolve
+    real_stat = os.stat
     injected = {}
 
-    def racing_resolve(self, *args, **kwargs):
-        resolved = real_resolve(self, *args, **kwargs)
-        if not injected and self == level / "db":
-            level.symlink_to(tmp_path / "target")
-            injected.update(tree_state(tmp_path))
-        return resolved
+    def racing_stat(path, *args, **kwargs):
+        try:
+            return real_stat(path, *args, **kwargs)
+        except FileNotFoundError:
+            if not injected and Path(path) == level:
+                level.symlink_to(tmp_path / "target")
+                injected.update(tree_state(tmp_path))
+            raise
 
-    monkeypatch.setattr(Path, "resolve", racing_resolve)
+    monkeypatch.setattr(os, "stat", racing_stat)
     with pytest.raises(StorageError) as error:
-        JobStore(level / "db" / "chriek.db")
+        if side == "db":
+            JobStore(level / "db" / "chriek.db")
+        else:
+            private_image_root(level / "images")
     monkeypatch.undo()
     assert injected, "the link was never planted"
-    assert str(error.value).startswith(f"{level} is an ancestor that is not a directory.")
+    assert str(error.value).startswith(f"{level} appeared while chriek was creating it.")
     assert tree_state(tmp_path) == injected, "nothing may be created through the link"
+
+
+@pytest.mark.parametrize("side", ["images", "db"])
+def test_a_trusted_link_through_a_missing_level_and_dotdot_is_refused(tmp_path, side):
+    """`ghost/..` can't be resolved by the kernel, so where it leads was never checked."""
+    (tmp_path / "chosen").mkdir(mode=0o700)
+    (tmp_path / "evil").symlink_to(tmp_path / "chosen")
+    (tmp_path / "link").symlink_to("ghost/../evil")
+    before = tree_state(tmp_path)
+
+    with pytest.raises(StorageError) as error:
+        if side == "db":
+            JobStore(tmp_path / "link" / "db" / "chriek.db")
+        else:
+            private_image_root(tmp_path / "link" / "images")
+    assert str(error.value).startswith(f"{tmp_path / 'ghost'} is missing")
+    assert tree_state(tmp_path) == before, "nothing may be created at the link's target"
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads every directory")
@@ -409,10 +433,15 @@ def test_a_database_path_chriek_cannot_inspect_is_refused_before_anything_is_cre
     assert tree_state(tmp_path) == before, "images must not be created before the refusal"
 
 
-def test_a_linked_ancestor_is_followed_to_its_private_target(tmp_path):
+@pytest.mark.parametrize(
+    "target",
+    ["{tmp}/real", "real", "real/../real"],
+    ids=["absolute", "relative", "relative dotdot"],
+)
+def test_a_linked_ancestor_is_followed_to_its_private_target(tmp_path, target):
     """Like macOS's /var -> /private/var: links above the configured paths are fine."""
     (tmp_path / "real").mkdir(mode=0o700)
-    (tmp_path / "alias").symlink_to(tmp_path / "real")
+    (tmp_path / "alias").symlink_to(target.format(tmp=tmp_path))
     env = {
         "CHRIEK_DB_PATH": str(tmp_path / "alias/chriek/db/chriek.db"),
         "CHRIEK_STORAGE_DIR": str(tmp_path / "alias/chriek/images"),
@@ -604,7 +633,28 @@ def chained_alias(tmp_path: Path) -> Path:
     return tmp_path / "entry"
 
 
-@pytest.mark.parametrize("alias", [public_alias, chained_alias], ids=["direct", "chained"])
+def relative_alias(tmp_path: Path) -> Path:
+    """`entry` -> `public/alias` -> `../private`, all relative, `public` as in `public_alias`."""
+    make(tmp_path / "public", 0o777, directory=True)
+    (tmp_path / "private").mkdir(mode=0o700)
+    (tmp_path / "public" / "alias").symlink_to("../private")
+    (tmp_path / "entry").symlink_to("public/alias")
+    return tmp_path / "entry"
+
+
+def nested_relative_alias(tmp_path: Path) -> Path:
+    """`deep/up` -> `../entry/x`, a relative chain into `relative_alias` from a lower level."""
+    relative_alias(tmp_path)
+    (tmp_path / "deep").mkdir(mode=0o700)
+    (tmp_path / "deep" / "up").symlink_to("../entry/x")
+    return tmp_path / "deep" / "up"
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [public_alias, chained_alias, relative_alias, nested_relative_alias],
+    ids=["direct", "chained", "relative", "nested relative"],
+)
 def test_a_link_in_an_ancestor_other_users_can_modify_is_refused(tmp_path, alias):
     """Anyone could re-point `public/alias` and choose where chriek's data goes."""
     env = {
