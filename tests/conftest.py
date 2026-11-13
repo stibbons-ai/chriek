@@ -132,6 +132,13 @@ def submit(client: TestClient, headers=ALICE, **fields) -> dict:
     return response.json()
 
 
+def assert_nothing_queued(client: TestClient, backend: CountingBackend) -> None:
+    """A valid job submitted afterwards is the first and only one the worker renders."""
+    valid = submit(client, width=16, height=16)
+    assert wait_for(client, valid["id"])["status"] == "succeeded"
+    assert backend.renders == 1
+
+
 @pytest.fixture
 def client(tmp_path: Path) -> Iterator[TestClient]:
     with running(tmp_path) as test_client:

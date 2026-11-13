@@ -8,6 +8,7 @@ from conftest import (
     BACKEND_SECRET,
     CountingBackend,
     FailingBackend,
+    assert_nothing_queued,
     db_dump,
     running,
     submit,
@@ -118,10 +119,7 @@ def test_invalid_requests_are_422_and_never_execute(tmp_path, overrides):
 
         assert response.status_code == 422, response.text
         assert response.json()["detail"]
-        # A valid job submitted afterwards is the first and only one the worker renders.
-        valid = submit(client, width=16, height=16)
-        assert wait_for(client, valid["id"])["status"] == "succeeded"
-        assert backend.renders == 1
+        assert_nothing_queued(client, backend)
 
 
 NUMERIC_FIELDS = ("image_count", "seed", "width", "height")
@@ -144,7 +142,7 @@ RAW_INVALID_BODIES = {
     # Pydantic rejects the whole body when an object key holds a lone surrogate.
     "surrogate-in-unknown-key": (r'{"prompt": "a lighthouse", "\ud800": 1}', ["body"]),
     "surrogate-key-with-infinity": (r'{"\udfff": -Infinity}', ["body"]),
-    # Small bodies nested ~1000 deep: echoing the rejected value must not overflow.
+    # Small bodies nested ~1000 deep: building the 422 must not recurse into the rejected value.
     "deeply-nested-extra": (
         f'{{"prompt": "a lighthouse", "extra": {"[" * 970}0{"]" * 970}}}',
         ["body", "extra"],
@@ -172,9 +170,7 @@ def test_unencodable_input_is_422_and_never_executes(tmp_path, content, loc):
 
         assert response.status_code == 422, response.text
         assert loc in [error["loc"] for error in response.json()["detail"]]
-        valid = submit(client, width=16, height=16)
-        assert wait_for(client, valid["id"])["status"] == "succeeded"
-        assert backend.renders == 1
+        assert_nothing_queued(client, backend)
 
 
 @pytest.mark.parametrize(
@@ -236,9 +232,7 @@ def test_undecodable_body_bytes_are_422_and_never_execute(tmp_path, content_type
 
         assert response.status_code == 422, response.text
         assert isinstance(response.json()["detail"], list)
-        valid = submit(client, width=16, height=16)
-        assert wait_for(client, valid["id"])["status"] == "succeeded"
-        assert backend.renders == 1
+        assert_nothing_queued(client, backend)
 
 
 def test_limits_come_from_configuration(tmp_path):
@@ -249,7 +243,7 @@ def test_limits_come_from_configuration(tmp_path):
         CHRIEK_MAX_PIXELS="2048",
         CHRIEK_MAX_PROMPT_CHARS="5",
     ) as client:
-        accepted = {"prompt": "short", "image_count": 2, "width": 64, "height": 32}
+        accepted = {"prompt": "ééééé", "image_count": 2, "width": 64, "height": 32}
         assert client.post("/jobs", headers=ALICE, json=accepted).status_code == 202
         for rejected in (
             {"image_count": 3},

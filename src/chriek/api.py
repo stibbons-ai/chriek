@@ -1,21 +1,21 @@
 """HTTP API: job submission and polling (API key required), signed image downloads (no key)."""
 
-import math
+import json
 import re
 import secrets
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
-from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
+from starlette.types import Message
 
 from chriek.auth import ApiKeyAuth
 from chriek.backend import FakeBackend, ImageBackend
@@ -29,10 +29,26 @@ WORKER_STOP_TIMEOUT_SECONDS = 30.0
 INDEX_PATTERN = re.compile(r"[0-9]{1,6}")
 EXPIRES_PATTERN = re.compile(r"[0-9]{1,12}")  # bounded: int() of huge digit strings raises
 WORKER_STOPPED = "worker stopped: a job result could not be saved; restart chriek"
-# Rejected input echoed in 422 errors is cut below this nesting depth: JSON encoders
-# recurse once per level, so a small, deeply nested body would otherwise overflow the stack.
-MAX_ECHO_DEPTH = 32
-TOO_DEEP = "<nested too deeply>"
+# Fixed wire budgets, not configuration: a 100,000-character prompt fits the body budget even
+# fully JSON-escaped in UTF-8, and every 422 response fits the error budget whatever the request
+# held.
+MAX_BODY_BYTES = 2 * 1024 * 1024
+MAX_ERROR_BYTES = 16 * 1024
+# Per-entry caps keep one worst-case 422 entry within MAX_ERROR_BYTES, so the first error always
+# fits: type, msg and MAX_ERROR_LOC loc parts are each clipped to MAX_ERROR_TEXT characters, and a
+# character JSON-encodes to at most 7 bytes (a lone surrogate becomes `\udXXX` text whose
+# backslash is escaped again), plus 2 quotes per string, punctuation and the response envelope.
+# Integer loc parts are not clipped; counting them as strings holds because the capped body only
+# yields small ones (field indexes, JSON error offsets below MAX_BODY_BYTES), not giant integers.
+MAX_ERROR_TEXT = 200
+MAX_ERROR_LOC = 8
+_WORST_ERROR_BYTES = (
+    len(b'{"detail":[{"type":,"loc":[],"msg":}]}')
+    + (MAX_ERROR_LOC - 1)  # commas between loc parts
+    + (2 + MAX_ERROR_LOC) * (2 + 7 * MAX_ERROR_TEXT)
+)
+assert _WORST_ERROR_BYTES <= MAX_ERROR_BYTES, "a worst-case first 422 entry must fit"
+BODY_TOO_LARGE = f"request body must be at most {MAX_BODY_BYTES} bytes"
 
 
 class JobRequest(BaseModel):
@@ -71,16 +87,11 @@ def create_app(
     app = FastAPI(title="chriek", lifespan=lifespan)
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
-        # FastAPI's default handler echoes rejected input verbatim; JSON can't encode
-        # nonfinite numbers (NaN, 1e999), lone surrogates or non-UTF-8 bytes (a raw
-        # non-JSON body), which would turn a 422 into a 500.
-        errors = jsonable_encoder(
-            _depth_limited(exc.errors(), MAX_ECHO_DEPTH), custom_encoder={bytes: _decode_lossless}
-        )
-        return JSONResponse(
+    async def validation_error(_request: Request, exc: RequestValidationError) -> Response:
+        return Response(
+            _error_detail(exc.errors()),
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={"detail": _json_safe(errors)},
+            media_type="application/json",
         )
 
     def job_body(job: Job, request: Request) -> dict[str, Any]:
@@ -182,7 +193,7 @@ def create_app(
 
 
 def _authenticated_route(authenticate: ApiKeyAuth) -> type[APIRoute]:
-    """Route class that authenticates before FastAPI reads the body or resolves parameters.
+    """Route class that authenticates, then caps the body, before FastAPI reads or parses it.
 
     FastAPI parses the request body before running dependencies, so a key check as a
     dependency would answer malformed bodies with 400/422 instead of 401.
@@ -194,7 +205,26 @@ def _authenticated_route(authenticate: ApiKeyAuth) -> type[APIRoute]:
 
             async def authenticated(request: Request) -> Response:
                 request.state.owner = authenticate(request)
-                return await handler(request)
+                try:
+                    declared = int(request.headers.get("content-length", 0))
+                except ValueError:
+                    declared = 0  # malformed header: the received-byte count still applies
+                if declared > MAX_BODY_BYTES:
+                    raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, BODY_TOO_LARGE)
+                received = 0
+
+                async def capped_receive() -> Message:
+                    # Raising here drops the overflowing chunk before Starlette's Request.body()
+                    # buffers it; FastAPI re-raises HTTPException from body reading unchanged.
+                    nonlocal received
+                    message = await request.receive()
+                    received += len(message.get("body", b""))
+                    if received > MAX_BODY_BYTES:
+                        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, BODY_TOO_LARGE)
+                    return message
+
+                # Shares the scope, so the owner set in request.state above stays visible.
+                return await handler(Request(request.scope, capped_receive))
 
             return authenticated
 
@@ -210,10 +240,7 @@ def _limit_errors(body: JobRequest, limits: Limits) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
 
     def reject(field: str, message: str) -> None:
-        value = getattr(body, field)
-        errors.append(
-            {"type": "value_error", "loc": ("body", field), "msg": message, "input": value}
-        )
+        errors.append({"type": "value_error", "loc": ("body", field), "msg": message})
 
     if not _is_utf8(body.prompt):
         reject("prompt", "prompt must be valid Unicode text (no unpaired surrogates)")
@@ -249,32 +276,28 @@ def _is_utf8(text: str) -> bool:
     return True
 
 
-def _decode_lossless(data: bytes) -> str:
-    return data.decode("utf-8", "backslashreplace")
+def _error_detail(errors: Sequence[Any]) -> bytes:
+    """Encode `{"detail": [...]}` within MAX_ERROR_BYTES, keeping each error's type, loc and msg.
+
+    Rejected input and validation ctx are never echoed; text is clipped and trailing errors that
+    no longer fit are dropped. The counted bytes are the bytes sent, so the budget is exact.
+    """
+    entries: list[bytes] = []
+    size = len(b'{"detail":[]}')
+    for error in errors:
+        loc = [part if type(part) is int else _clip(part) for part in error["loc"][:MAX_ERROR_LOC]]
+        entry = {"type": _clip(error["type"]), "loc": loc, "msg": _clip(error["msg"])}
+        encoded = json.dumps(entry, ensure_ascii=False, separators=(",", ":")).encode()
+        size += len(encoded) + bool(entries)
+        if size > MAX_ERROR_BYTES:
+            break
+        entries.append(encoded)
+    return b'{"detail":[' + b",".join(entries) + b"]}"
 
 
-def _depth_limited(value: Any, depth: int) -> Any:
-    """Replace containers nested deeper than `depth` with a marker; recursion stops at `depth`."""
-    if not isinstance(value, dict | list | tuple):
-        return value
-    if depth == 0:
-        return TOO_DEEP
-    if isinstance(value, dict):
-        return {key: _depth_limited(item, depth - 1) for key, item in value.items()}
-    return [_depth_limited(item, depth - 1) for item in value]
-
-
-def _json_safe(value: Any) -> Any:
-    """Make decoded request data strictly JSON-serializable without dropping it."""
-    if isinstance(value, float) and not math.isfinite(value):
-        return str(value)
-    if isinstance(value, str):
-        return value.encode("utf-8", "backslashreplace").decode("utf-8")
-    if isinstance(value, dict):
-        return {_json_safe(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return [_json_safe(item) for item in value]
-    return value
+def _clip(value: Any) -> str:
+    """First MAX_ERROR_TEXT characters; unpaired surrogates then become (longer) escape text."""
+    return str(value)[:MAX_ERROR_TEXT].encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def _iso(timestamp: float | None) -> str | None:
