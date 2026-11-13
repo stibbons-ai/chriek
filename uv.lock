@@ -187,6 +187,7 @@ dependencies = [
 dev = [
     { name = "httpx2" },
     { name = "jscpd" },
+    { name = "packaging" },
     { name = "pip-audit" },
     { name = "pre-commit" },
     { name = "pytest" },
@@ -205,6 +206,7 @@ requires-dist = [
 dev = [
     { name = "httpx2", specifier = ">=2.16.0" },
     { name = "jscpd", specifier = "==5.4.3" },
+    { name = "packaging", specifier = ">=26.3" },
     { name = "pip-audit", specifier = "==2.10.1" },
     { name = "pre-commit", specifier = ">=4.7.0" },
     { name = "pytest", specifier = ">=9.2.0" },
