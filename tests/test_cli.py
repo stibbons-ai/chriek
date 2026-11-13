@@ -33,6 +33,9 @@ def serve(env: dict[str, str], **kwargs) -> subprocess.Popen:
 EMOJI_KEY = "\N{OTTER}" * 32
 LATIN1_KEY = "\N{LATIN SMALL LETTER E WITH ACUTE}" * 32
 CONTROL_KEY = ALICE_KEY + "\x07"
+MARKER = "public-url-secret-marker"
+URL_FORM = "CHRIEK_PUBLIC_URL must be an absolute http or https URL"
+PRINTABLE = "CHRIEK_PUBLIC_URL must contain only printable ASCII"
 
 
 @pytest.mark.parametrize(
@@ -90,6 +93,48 @@ CONTROL_KEY = ALICE_KEY + "\x07"
         ({"CHRIEK_MAX_DIMENSION": "1000"}, "CHRIEK_MAX_DIMENSION must be a multiple of 16"),
         ({"CHRIEK_MAX_IMAGES": "0"}, "CHRIEK_MAX_IMAGES must be between"),
         ({"CHRIEK_PORT": "70000"}, "CHRIEK_PORT must be between"),
+        ({"CHRIEK_PUBLIC_URL": ""}, "CHRIEK_PUBLIC_URL is required"),
+        ({"CHRIEK_PUBLIC_URL": f"https://alice:{MARKER}@images.example"}, "credentials"),
+        ({"CHRIEK_PUBLIC_URL": f"https://{MARKER}@images.example"}, "credentials"),
+        ({"CHRIEK_PUBLIC_URL": f"https://images.example/?token={MARKER}"}, "query or fragment"),
+        ({"CHRIEK_PUBLIC_URL": f"https://images.example/#{MARKER}"}, "query or fragment"),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example?"}, "query or fragment"),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example#"}, "query or fragment"),
+        ({"CHRIEK_PUBLIC_URL": f"ftp://images.example/{MARKER}"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": f"images.example/{MARKER}"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": f"/{MARKER}"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https:images.example"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https:///images.example"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example:"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example:0"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example:65536"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example:8x"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example:-1"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example:80:80"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://[::1"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://[not:an:ipv6]"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images..example"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://ima<ges.example"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": f" https://images.example/{MARKER}"}, PRINTABLE),
+        ({"CHRIEK_PUBLIC_URL": f"https://images.example/{MARKER}\t"}, PRINTABLE),
+        ({"CHRIEK_PUBLIC_URL": f"https://images.\nexample/{MARKER}"}, PRINTABLE),
+        ({"CHRIEK_PUBLIC_URL": f"https://images.example\x07/{MARKER}"}, PRINTABLE),
+        ({"CHRIEK_PUBLIC_URL": f"https://b\u00fccher.example/{MARKER}"}, PRINTABLE),
+        # Numeric hosts that clients reinterpret as a different IPv4 address, or reject.
+        ({"CHRIEK_PUBLIC_URL": "https://017.0.0.1"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://2130706433"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://0x7f.1/chriek"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://1."}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.0x1"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://999.999.999.999"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://1.2.3.4.5"}, URL_FORM),
+        # Prefixes that clients normalize into a different path.
+        ({"CHRIEK_PUBLIC_URL": "https://images.example/chriek/.."}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example/chriek/%2e%2E/"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example/chriek/./x"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example/%2E/chriek"}, URL_FORM),
+        ({"CHRIEK_PUBLIC_URL": "https://images.example/a\\b"}, URL_FORM),
     ],
 )
 def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrides, message):
@@ -102,9 +147,23 @@ def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrid
     assert message in output
     for secret in (ALICE_KEY, BOB_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
         assert secret not in output
+    assert MARKER not in output
+    if overrides.get("CHRIEK_PUBLIC_URL"):
+        assert overrides["CHRIEK_PUBLIC_URL"].strip() not in output
     for secret in (EMOJI_KEY, LATIN1_KEY):
         assert secret[:2] not in output
     assert not (tmp_path / "db").exists(), "nothing may start on invalid configuration"
+
+
+def test_missing_public_url_exits_2_without_fallback(tmp_path):
+    env = base_env(tmp_path)
+    del env["CHRIEK_PUBLIC_URL"]
+    process = serve(env)
+    output, _ = process.communicate(timeout=30)
+
+    assert process.returncode == 2
+    assert output.startswith("chriek: configuration error: CHRIEK_PUBLIC_URL is required")
+    assert not (tmp_path / "db").exists(), "nothing may start without a public URL"
 
 
 def free_port() -> int:
@@ -128,11 +187,13 @@ def wait_healthy(process: subprocess.Popen, base: str) -> None:
 
 @contextmanager
 def served_process(
-    env: dict[str, str], **kwargs
+    env: dict[str, str], *, public_url: str | None = None, **kwargs
 ) -> Iterator[tuple[subprocess.Popen, httpx2.Client]]:
     port = free_port()
-    process = serve(env | {"CHRIEK_PORT": str(port)}, **kwargs)
     base = f"http://127.0.0.1:{port}"
+    process = serve(
+        env | {"CHRIEK_PORT": str(port), "CHRIEK_PUBLIC_URL": public_url or base}, **kwargs
+    )
     try:
         wait_healthy(process, base)
         with httpx2.Client(base_url=base) as client:
@@ -192,3 +253,26 @@ def test_chriek_serve_output_never_contains_download_signatures(tmp_path):
     assert "Uvicorn running on" in output, output
     assert query["sig"][0] not in output
     assert f"expires={query['expires'][0]}" not in output
+
+
+def test_chriek_serve_links_ignore_host_and_forwarded_headers(tmp_path):
+    # Host reaches the request scope directly; uvicorn applies X-Forwarded-Proto from 127.0.0.1
+    # by default, turning this http request into https. Forwarded is not interpreted.
+    hostile = ALICE | {
+        "Host": "evil.example",
+        "X-Forwarded-Host": "evil.example",
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-For": "192.0.2.1",
+        "Forwarded": "for=192.0.2.1;host=evil.example;proto=https",
+    }
+    origin = "http://images.example/chriek"
+    with served(base_env(tmp_path), public_url=f"{origin}/") as client:
+        job_id = submit(client, headers=hostile, width=16, height=16)["id"]
+        body = wait_for(client, job_id, headers=hostile)
+        url = body["images"][0]["url"]
+
+        assert url.startswith(f"{origin}/images/{job_id}/0.png?expires="), url
+        # The operator's proxy serves `origin` and strips `/chriek` before forwarding.
+        download = client.get(url.removeprefix(origin))
+        assert download.status_code == 200
+        assert Image.open(io.BytesIO(download.content)).size == (16, 16)

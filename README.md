@@ -15,12 +15,13 @@ uv sync --locked
 
 export CHRIEK_API_KEYS="fabula:$(openssl rand -hex 32),ikonograf:$(openssl rand -hex 32)"
 export CHRIEK_SIGNING_SECRET="$(openssl rand -hex 32)"
+export CHRIEK_PUBLIC_URL="http://127.0.0.1:8000"
 uv run chriek serve
 ```
 
 Generate every API key and the signing secret independently from a cryptographically secure random source, as above. chriek only checks lengths, characters and that no value is reused; it can't tell a guessable value from a random one.
 
-`chriek serve` runs the API and the in-process worker in one process (home mode). It listens on `127.0.0.1:8000` by default. A setting rejected by configuration validation (see the ranges and formats in [Configuration](#configuration)) stops it before it opens the database or a port, with exit code 2 and a message that names the variable but never prints secret values. Values that aren't validated, such as an unresolvable `CHRIEK_HOST`, fail later, when the server binds.
+`chriek serve` runs the API and the in-process worker in one process (home mode). It listens on `127.0.0.1:8000` by default. A missing setting that has no default, such as `CHRIEK_PUBLIC_URL`, or a setting rejected by configuration validation (see the ranges and formats in [Configuration](#configuration)) stops it before it opens the database or a port, with exit code 2 and a message that names the variable but never prints secret values or the rejected `CHRIEK_PUBLIC_URL`. Values that aren't validated, such as an unresolvable `CHRIEK_HOST`, fail later, when the server binds.
 
 Logs go to standard output/error: startup, shutdown and errors. There is no HTTP access log, because download URLs carry their signature, which works like a password until it expires; put any access logging you need in a reverse proxy and strip the query string there.
 
@@ -44,6 +45,7 @@ All configuration comes from environment variables.
 |---|---|---|
 | `CHRIEK_API_KEYS` | required | Named static API keys, `name:key,name:key`. The name is the owner of the jobs created with that key. Names: 1–64 characters from `A-Z a-z 0-9 _ . -`, unique. Names are not secret: each job stores its owner's name in plain text, so never use a key or the signing secret as a name. Keys: at least 32 printable ASCII characters (`!` to `~`; no spaces, control or non-ASCII characters, no commas), unique. Keys travel in an HTTP header, so other characters are rejected at startup. Startup errors identify an invalid entry by its position, never by its name or key. |
 | `CHRIEK_SIGNING_SECRET` | required | HMAC secret for download URLs, at least 32 characters. Changing it invalidates every issued URL (polling the job again mints new ones). Anyone who knows it can sign download URLs, so it must not be one of the API keys: startup rejects a signing secret equal to any key or name in `CHRIEK_API_KEYS`. |
+| `CHRIEK_PUBLIC_URL` | required | Public base URL of download links, `http(s)://host[:port][/prefix]`, for example `https://images.example/chriek`. Final `/` characters are optional and ignored. The host is a DNS name, a dotted-decimal IPv4 address such as `192.0.2.10` or a bracketed IPv6 address; a port must be 1–65535. Hosts that browsers would read as a different IPv4 address (`017.0.0.1`, `2130706433`, `0x7f.1`) or as an invalid one (`1.2.3.4.5`) are rejected. The prefix must not contain `\`, `.` or `..` segments (also percent-encoded as `%2e`), which clients rewrite. Only printable ASCII is accepted (no whitespace or control characters; write internationalized host names in punycode), with no user name or password, query (`?`) or fragment (`#`). See [Public URL and reverse proxies](#public-url-and-reverse-proxies). |
 | `CHRIEK_URL_TTL_SECONDS` | `900` | Lifetime of a download URL, 1–604800 seconds. |
 | `CHRIEK_DB_PATH` | `chriek-data/chriek.db` | SQLite database file, used literally (`?` and `%20` are ordinary filename characters); parent directories are created. Put it on a volume to keep jobs across restarts. The exact value `:memory:` (or `./:memory:`) selects an ephemeral in-memory database instead; see [In-memory database](#in-memory-database). |
 | `CHRIEK_STORAGE_DIR` | `chriek-data/images` | Directory for generated PNGs, one subdirectory per job. |
@@ -59,6 +61,14 @@ Relative paths resolve against the working directory. The database schema is cre
 ### In-memory database
 
 `CHRIEK_DB_PATH=:memory:` keeps the job database in memory, meant for tests and local development. No database file is written. The database lives exactly as long as one `chriek serve` process: submissions, the worker and polling share it while the process runs, and every restart starts empty, so job IDs from an earlier run return `404` and their download URLs stop working. The restart guarantees in [Job behaviour](#job-behaviour) (queued jobs survive, running jobs fail as interrupted) hold only for a database file. PNGs still go to `CHRIEK_STORAGE_DIR` on disk and aren't deleted on restart.
+
+### Public URL and reverse proxies
+
+Every download URL chriek returns is `CHRIEK_PUBLIC_URL` followed by `/images/{id}/{index}.png?expires=…&sig=…`; `https://images.example/chriek/` yields `https://images.example/chriek/images/…`. Nothing from the request goes into it: not the `Host` header, `Forwarded`, `X-Forwarded-Host`, `X-Forwarded-Proto`, nor the scheme or port the client connected with. Whatever proxy-header trust the server applies to client addresses, the link origin stays the configured one.
+
+- **Upgrading.** `CHRIEK_PUBLIC_URL` is new and has no default. Earlier versions built links from the host the client used; a deployment upgraded without setting it no longer starts (exit 2, `CHRIEK_PUBLIC_URL is required`). There is no fallback to the request host. Set it to the address clients use to reach chriek, for example the `http://127.0.0.1:8000` of the [install example](#install-and-run-uv) for local use. No data migration is needed.
+- **Scheme.** `http://` suits local use on one machine. For anything reached over a network, use an `https://` URL served by a TLS-terminating proxy: download URLs are bearer credentials until they expire.
+- **Path prefix.** chriek always serves downloads at `/images/…` on its own listener; it does not strip or know about any prefix. With a prefix such as `/chriek`, your proxy must route `https://images.example/chriek/images/…` to chriek's `/images/…`, removing `/chriek` and keeping the query string unchanged. Without that mapping the links return the proxy's error, not the image.
 
 ## API
 
@@ -120,7 +130,7 @@ curl -s http://127.0.0.1:8000/jobs/$JOB_ID -H "Authorization: Bearer $KEY"
 
 ### `GET /images/{id}/{index}.png?expires=…&sig=…`
 
-Downloads one PNG without any API key: the HMAC signature covers exactly that job, image index and expiry. A wrong or missing signature returns `403 invalid signature`; an expired URL returns `403 link expired; poll the job again`. URLs are built from the host the client used to reach chriek.
+Downloads one PNG without any API key: the HMAC signature covers exactly that job, image index and expiry. A wrong or missing signature returns `403 invalid signature`; an expired URL returns `403 link expired; poll the job again`. URLs start with `CHRIEK_PUBLIC_URL`, never with the host the request came in on; see [Public URL and reverse proxies](#public-url-and-reverse-proxies).
 
 ```sh
 curl -s -o image0.png "$URL"

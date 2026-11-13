@@ -1,12 +1,26 @@
 """Environment-variable configuration. Every name and default is documented in README.md."""
 
+import ipaddress
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 MIN_SECRET_LENGTH = 32
 KEY_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+# Host is a DNS name, an IPv4 address or a bracketed IPv6 literal; port is optional digits.
+# The bracket class excludes IPvFuture and zone IDs; urlsplit rejects other invalid literals.
+AUTHORITY_PATTERN = re.compile(
+    r"(?:(?P<name>[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)\.?|\[[0-9A-Fa-f:.]+\])"
+    r"(?::(?P<port>[0-9]{1,5}))?"
+)
+# WHATWG clients parse a host whose last label is numeric as IPv4 (017.0.0.1 -> 15.0.0.1).
+NUMERIC_LABEL = re.compile(r"[0-9]+|0[xX][0-9A-Fa-f]*")
+PUBLIC_URL_FORM = (
+    "CHRIEK_PUBLIC_URL must be an absolute http or https URL with a host, an optional port "
+    "1-65535 and an optional path prefix"
+)
 
 
 class ConfigError(ValueError):
@@ -24,6 +38,7 @@ class Limits:
 @dataclass(frozen=True)
 class Settings:
     db_path: Path
+    public_url: str  # scheme://authority[/prefix], no trailing slash
     storage_dir: Path
     api_keys: Mapping[str, str]  # owner name -> key
     signing_secret: str
@@ -51,6 +66,7 @@ class Settings:
                 "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS name and key"
             )
         return cls(
+            public_url=_public_url(env.get("CHRIEK_PUBLIC_URL", "")),
             db_path=Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db")),
             storage_dir=Path(env.get("CHRIEK_STORAGE_DIR", "chriek-data/images")),
             api_keys=api_keys,
@@ -111,3 +127,39 @@ def _signing_secret(raw: str) -> str:
     if len(raw) < MIN_SECRET_LENGTH:
         raise ConfigError(f"CHRIEK_SIGNING_SECRET must be at least {MIN_SECRET_LENGTH} characters")
     return raw
+
+
+def _public_url(raw: str) -> str:
+    """Validate the operator-chosen download origin. Errors never echo the value: it may hold
+    credentials or tokens pasted by mistake."""
+    if not raw:
+        raise ConfigError("CHRIEK_PUBLIC_URL is required: the public base URL of download links")
+    # urlsplit silently strips some whitespace and control characters; reject them first.
+    if not all("!" <= c <= "~" for c in raw):
+        raise ConfigError(
+            "CHRIEK_PUBLIC_URL must contain only printable ASCII characters without whitespace"
+        )
+    if "?" in raw or "#" in raw:
+        raise ConfigError("CHRIEK_PUBLIC_URL must not contain a query or fragment")
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        raise ConfigError(PUBLIC_URL_FORM) from None
+    if parts.scheme not in ("http", "https"):
+        raise ConfigError(PUBLIC_URL_FORM)
+    if "@" in parts.netloc:
+        raise ConfigError("CHRIEK_PUBLIC_URL must not contain credentials")
+    authority = AUTHORITY_PATTERN.fullmatch(parts.netloc)
+    if authority is None or (authority["port"] and not 1 <= int(authority["port"]) <= 65535):
+        raise ConfigError(PUBLIC_URL_FORM)
+    name = authority["name"]
+    if name and NUMERIC_LABEL.fullmatch(name.rpartition(".")[2]):
+        try:
+            ipaddress.IPv4Address(name)  # rejects leading zeros, short and hex forms
+        except ValueError:
+            raise ConfigError(PUBLIC_URL_FORM) from None
+    # Clients normalize backslashes and dot segments, which would change the prefix.
+    segments = parts.path.lower().replace("%2e", ".").split("/")
+    if "\\" in parts.path or "." in segments or ".." in segments:
+        raise ConfigError(PUBLIC_URL_FORM)
+    return raw.rstrip("/")
