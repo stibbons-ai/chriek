@@ -3,6 +3,7 @@
 import io
 import os
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -183,6 +184,41 @@ def test_chriek_serve_round_trip(tmp_path, signing_secret):
             f"images/{job}/0.png": 0o600,
             f"images/{job}/1.png": 0o600,
         }
+
+
+def test_chriek_serve_shipped_defaults_keep_jobs_private_across_restart(tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    project.chmod(0o755)  # an ordinary checkout; the database directory holds the image root
+    env = {
+        name: value
+        for name, value in base_env(tmp_path).items()
+        if name not in ("CHRIEK_DB_PATH", "CHRIEK_STORAGE_DIR")
+    }
+    with served(env, cwd=project) as client:
+        body = wait_for(client, submit(client, width=16, height=16, seed=7)["id"])
+        assert body["status"] == "succeeded", body
+        first = client.get(body["images"][0]["url"]).content
+
+    with served(env, cwd=project) as client:
+        again = client.get(f"/jobs/{body['id']}", headers=ALICE).json()
+        assert again["status"] == "succeeded"
+        download = client.get(again["images"][0]["url"])
+        job = body["id"]
+        assert modes(project) == {
+            "chriek-data": 0o700,
+            "chriek-data/chriek.db": 0o600,
+            "chriek-data/chriek.db-wal": 0o600,
+            "chriek-data/chriek.db-shm": 0o600,
+            "chriek-data/images": 0o700,
+            f"chriek-data/images/{job}": 0o700,
+            f"chriek-data/images/{job}/0.png": 0o600,
+        }
+
+    assert download.status_code == 200
+    assert download.content == first
+    assert Image.open(io.BytesIO(first)).text["Seed"] == "7"
+    assert stat.S_IMODE(project.stat().st_mode) == 0o755
 
 
 def test_chriek_serve_memory_database_runs_jobs_and_resets_on_restart(tmp_path):

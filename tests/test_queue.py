@@ -18,6 +18,7 @@ from conftest import (
     db_dump,
     running,
     submit,
+    tree_state,
     wait_for,
 )
 from PIL import Image
@@ -123,7 +124,12 @@ def test_database_path_is_used_literally_across_restart(tmp_path, filename):
 
 @pytest.mark.parametrize("sentinel", [":memory:", "./:memory:"])
 def test_memory_database_serves_one_lifetime_and_resets_on_restart(tmp_path, monkeypatch, sentinel):
-    monkeypatch.chdir(tmp_path)
+    # A shared (0755) working directory: the database checks must skip it, not refuse it.
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    cwd.chmod(0o755)
+    before_cwd = tree_state(cwd)
+    monkeypatch.chdir(cwd)
     with running(tmp_path, CHRIEK_DB_PATH=sentinel) as before:
         body = wait_for(before, submit(before, image_count=2, seed=4, width=16, height=16)["id"])
         assert body["status"] == "succeeded"
@@ -138,7 +144,8 @@ def test_memory_database_serves_one_lifetime_and_resets_on_restart(tmp_path, mon
         assert after.get(body["images"][1]["url"]).status_code == 404
         assert wait_for(after, submit(after, width=16, height=16)["id"])["status"] == "succeeded"
 
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["images"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["cwd", "images"]
+    assert tree_state(cwd) == before_cwd
 
 
 def test_memory_database_keeps_every_write_under_concurrent_polling(tmp_path):

@@ -105,6 +105,21 @@ class GatedBackend(FakeBackend):
                 self.active -= 1
 
 
+class PausingBackend(FakeBackend):
+    """Fake backend that waits for `resume` before rendering seed 1: in a seed-0 job, the
+    second image, once the first is on disk."""
+
+    def __init__(self) -> None:
+        self.paused = threading.Event()
+        self.resume = threading.Event()
+
+    def render(self, prompt, width, height, seed):
+        if seed == 1:
+            self.paused.set()
+            assert self.resume.wait(10), "paused render never resumed"
+        return super().render(prompt, width, height, seed)
+
+
 class FailingBackend(FakeBackend):
     """Fake backend that fails only render number `fail_index` (0-based, counted across all
     jobs, never reset); counts renders. Jobs rendered after that one failure succeed."""

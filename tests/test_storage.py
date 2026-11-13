@@ -1,15 +1,19 @@
 """Storage privacy at the store, worker and app boundaries, without the CLI."""
 
+import io
 import json
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
-from conftest import modes, running, submit, tree_state, wait_for
+from conftest import PausingBackend, modes, running, submit, tree_state, wait_for
+from PIL import Image
 
 from chriek.backend import FakeBackend
 from chriek.storage import StorageError
@@ -18,17 +22,15 @@ from chriek.worker import Worker
 
 # Runs in a child process so its umask never leaks into other tests.
 DIRECT_ENTRY_POINTS = """
-import json, sys, threading, time
+import json, sys, time
 from pathlib import Path
 
-from conftest import modes
-from chriek.backend import FakeBackend
+from conftest import PausingBackend, modes
 from chriek.store import SUCCEEDED, JobStore
 from chriek.worker import Worker
 
 root = Path(sys.argv[1])
 db_path = root / "data" / "db" / "chriek.db"
-paused, resume = threading.Event(), threading.Event()
 exposed = set()
 
 
@@ -47,22 +49,14 @@ def watch(event, args):
 
 sys.addaudithook(watch)
 
-
-class PausingBackend(FakeBackend):
-    def render(self, prompt, width, height, seed):
-        if seed == 1:  # the second image: the first one is already on disk
-            paused.set()
-            resume.wait(10)
-        return super().render(prompt, width, height, seed)
-
-
 store = JobStore(db_path)
 job = store.create(owner="alice", prompt="p", image_count=2, width=16, height=16, seed=0, now=0.0)
-worker = Worker(store, PausingBackend(), root / "data" / "images", time.time)
+backend = PausingBackend()
+worker = Worker(store, backend, root / "data" / "images", time.time)
 worker.start()
-assert paused.wait(10)
+assert backend.paused.wait(10)
 seen = {"job": job.id, "paused": modes(root)}
-resume.set()
+backend.resume.set()
 deadline = time.monotonic() + 10
 while store.get("alice", job.id).status != SUCCEEDED:
     assert time.monotonic() < deadline
@@ -79,14 +73,15 @@ print(json.dumps(seen | {"exposed": sorted(exposed)}))
 """
 
 
-def test_direct_store_and_worker_keep_everything_private_under_umask_022(tmp_path):
+@pytest.mark.parametrize("umask", [0o000, 0o022], ids=["umask 000", "umask 022"])
+def test_direct_store_and_worker_keep_everything_private_whatever_the_umask(tmp_path, umask):
     result = subprocess.run(
         [sys.executable, "-c", DIRECT_ENTRY_POINTS, str(tmp_path)],
         cwd=Path(__file__).parent,
         capture_output=True,
         text=True,
         timeout=60,
-        umask=0o022,
+        umask=umask,
         check=False,
     )
     assert result.returncode == 0, result.stderr
@@ -565,3 +560,122 @@ def test_an_ancestor_other_users_can_modify_is_refused_without_creating_anything
         pass
     assert str(error.value).startswith(f"{shared} is an ancestor that other users can modify.")
     assert tree_state(shared) == before
+
+
+def test_the_app_keeps_a_paused_job_private_and_serves_it_once_done(tmp_path):
+    backend = PausingBackend()
+    with running(tmp_path, backend=backend) as client:
+        job = submit(client, image_count=2, seed=0, width=16, height=16)["id"]
+        try:
+            assert backend.paused.wait(10), "the second image never started"
+            paused = modes(tmp_path)
+        finally:
+            backend.resume.set()
+        body = wait_for(client, job)
+        download = client.get(body["images"][1]["url"])
+
+    assert paused == {
+        "db": 0o700,
+        "db/chriek.db": 0o600,
+        "db/chriek.db-wal": 0o600,
+        "db/chriek.db-shm": 0o600,
+        "images": 0o700,
+        f"images/{job}.partial": 0o700,
+        f"images/{job}.partial/0.png": 0o600,
+    }
+    assert body["status"] == "succeeded"
+    assert download.status_code == 200
+    assert Image.open(io.BytesIO(download.content)).text["Seed"] == "1"
+
+
+def public_alias(tmp_path: Path) -> Path:
+    """`public/alias` -> a private directory, where `public` is world-writable and not sticky."""
+    public = tmp_path / "public"
+    public.mkdir()
+    public.chmod(0o777)
+    (tmp_path / "private").mkdir(mode=0o700)
+    (public / "alias").symlink_to(tmp_path / "private")
+    return public / "alias"
+
+
+def chained_alias(tmp_path: Path) -> Path:
+    """`entry` -> `public/alias` -> a private directory: no unsafe level in the configured path."""
+    (tmp_path / "entry").symlink_to(public_alias(tmp_path))
+    return tmp_path / "entry"
+
+
+@pytest.mark.parametrize("alias", [public_alias, chained_alias], ids=["direct", "chained"])
+def test_a_link_in_an_ancestor_other_users_can_modify_is_refused(tmp_path, alias):
+    """Anyone could re-point `public/alias` and choose where chriek's data goes."""
+    env = {
+        "CHRIEK_DB_PATH": str(alias(tmp_path) / "chriek" / "db" / "chriek.db"),
+        "CHRIEK_STORAGE_DIR": str(tmp_path / "images"),
+    }
+    before = tree_state(tmp_path)
+
+    with pytest.raises(StorageError) as error, running(tmp_path, **env):
+        pass
+    assert str(error.value).startswith(
+        f"{tmp_path / 'public'} is an ancestor that other users can modify."
+    )
+    assert tree_state(tmp_path) == before
+
+
+def test_a_link_another_user_owns_in_a_sticky_directory_is_refused(tmp_path, monkeypatch):
+    """Stand-in (faked owner) for another user's link in /tmp choosing a directory of ours."""
+    sticky = tmp_path / "sticky"
+    sticky.mkdir()
+    sticky.chmod(0o1777)
+    (tmp_path / "home").mkdir(mode=0o700)
+    link = sticky / "chriek-data"
+    link.symlink_to(tmp_path / "home" / "chosen")
+    before = tree_state(tmp_path)
+    foreign = report_owned_by_another_user(monkeypatch, link)
+
+    with pytest.raises(StorageError) as error:
+        JobStore(link / "db" / "chriek.db")
+    monkeypatch.undo()
+    assert str(error.value).startswith(f"{link} is a symbolic link owned by uid {foreign}.")
+    assert tree_state(tmp_path) == before, "nothing may be created at the link's target"
+
+
+@pytest.mark.skipif(not Path("/var").is_symlink(), reason="needs macOS's root-owned /var link")
+def test_a_root_owned_system_alias_is_followed(tmp_path):
+    if not tmp_path.is_relative_to("/private/var"):
+        pytest.skip("temporary directory is not under /private/var")
+    via_var = Path("/var") / tmp_path.relative_to("/private/var")
+    env = {
+        "CHRIEK_DB_PATH": str(via_var / "db" / "chriek.db"),
+        "CHRIEK_STORAGE_DIR": str(via_var / "images"),
+    }
+    with running(tmp_path, **env) as client:
+        job = wait_for(client, submit(client, width=16, height=16)["id"])
+        assert client.get(job["images"][0]["url"]).status_code == 200
+    assert modes(tmp_path)["images"] == 0o700
+
+
+def test_repointing_a_trusted_alias_after_startup_never_moves_storage(tmp_path):
+    """Pins the documented contract: links above the configured paths resolve once, at startup."""
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir(mode=0o700)
+    second.mkdir(mode=0o700)
+    alias = tmp_path / "alias"
+    alias.symlink_to(first)
+    env = {
+        "CHRIEK_DB_PATH": str(alias / "chriek" / "db" / "chriek.db"),
+        "CHRIEK_STORAGE_DIR": str(alias / "chriek" / "images"),
+    }
+    with running(tmp_path, **env) as client:
+        alias.unlink()
+        alias.symlink_to(second)
+        body = wait_for(client, submit(client, width=16, height=16)["id"])
+        download = client.get(body["images"][0]["url"])
+
+    assert body["status"] == "succeeded"
+    assert download.status_code == 200
+    assert download.content == (first / "chriek/images" / body["id"] / "0.png").read_bytes()
+    assert download.content.startswith(b"\x89PNG")
+    assert list(second.iterdir()) == [], "nothing may follow the re-pointed link"
+    with closing(sqlite3.connect(first / "chriek/db/chriek.db")) as db:
+        statuses = db.execute("SELECT status FROM jobs WHERE id = ?", (body["id"],)).fetchall()
+    assert statuses == [("succeeded",)]

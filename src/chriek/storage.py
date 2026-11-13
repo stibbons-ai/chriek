@@ -3,6 +3,7 @@
 Existing paths are checked, never repaired: chriek refuses to start rather than chmod data.
 """
 
+import errno
 import os
 import stat
 from collections.abc import Iterator
@@ -15,14 +16,16 @@ PRIVATE_DIR_MODE = 0o700
 _SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
 _GUIDANCE = (
     "chriek needs dedicated directories owned by the service user with no group or other "
-    "access, under ancestors only root or the service user can modify. chriek never changes "
-    "existing permissions: stop chriek, move the data into a new private directory (see "
-    "README, Storage permissions) or configure a new dedicated path, then restart"
+    "access, reached only through directories and links root or the service user controls. "
+    "chriek never changes existing permissions: stop chriek, then remove group and other access "
+    "from chriek's own data (chmod -R go= <dedicated dir>, never a shared parent), or move the "
+    "data into a new dedicated directory, remove its group and other access and point "
+    "CHRIEK_DB_PATH or CHRIEK_STORAGE_DIR there; restart (see README, Storage permissions)"
 )
 
 
 class StorageError(RuntimeError):
-    """Configured storage is not private to the service user; nothing existing was changed."""
+    """Configured storage is unsafe, or can't be checked or set up; nothing existing was changed."""
 
 
 def private_image_root(path: Path) -> Path:
@@ -76,21 +79,18 @@ def _checked_dir(path: Path) -> tuple[Path, list[Path]]:
     Returns the real path and its missing levels, outermost first.
     """
     path = Path(os.path.abspath(path))
+    _check_traversal(path.parent)
     real = path.resolve()
     missing = []
     # Outermost first: a level counts as missing only below an existing checked directory, so
     # a non-directory ancestor is named before anything below it fails with "Not a directory".
     for parent in reversed(real.parents):
-        info = None if missing else _stat(parent)  # a link here appeared after resolving: refused
+        # A link here (planted after resolving, or a loop resolve left alone) is not a directory.
+        info = None if missing else _stat(parent)
         if info is None:
             missing.append(parent)
-            continue
-        if not stat.S_ISDIR(info.st_mode):
-            _reject(parent, "is an ancestor that is not a directory")
-        if info.st_uid not in (0, os.geteuid()):
-            _reject(parent, f"is an ancestor owned by uid {info.st_uid}")
-        if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
-            _reject(parent, "is an ancestor that other users can modify")
+        else:
+            _check_ancestor(parent, info)
     info = _stat(path)  # also below missing levels: a dangling configured link is still a link
     if info is None:
         missing.append(real)
@@ -99,6 +99,43 @@ def _checked_dir(path: Path) -> tuple[Path, list[Path]]:
     elif not stat.S_ISDIR(_check_private(real).st_mode):
         _reject(real, "is not a directory")
     return real, missing
+
+
+def _check_traversal(path: Path) -> None:
+    """Check every directory and link followed to reach existing levels of absolute `path`.
+
+    Follows links like `Path.resolve`, so link targets and chains are checked too: a link
+    another user owns, or one in a directory they can modify, could choose where chriek's
+    directories end up.
+    """
+    pending = list(reversed(path.parts[1:]))
+    current, links = Path(path.anchor), 0
+    while (info := _stat(current)) is not None:
+        if stat.S_ISLNK(info.st_mode):
+            # The directory holding the link was checked on the way in.
+            if info.st_uid not in (0, os.geteuid()):
+                _reject(current, f"is a symbolic link owned by uid {info.st_uid}")
+            links += 1
+            if links > 40:
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(current))
+            target = Path(os.readlink(current))
+            pending.extend(reversed(target.parts[1:] if target.is_absolute() else target.parts))
+            current = Path(target.anchor) if target.is_absolute() else current.parent
+            continue
+        _check_ancestor(current, info)
+        if not pending:
+            return
+        part = pending.pop()
+        current = current.parent if part == ".." else current / part
+
+
+def _check_ancestor(path: Path, info: os.stat_result) -> None:
+    if not stat.S_ISDIR(info.st_mode):
+        _reject(path, "is an ancestor that is not a directory")
+    if info.st_uid not in (0, os.geteuid()):
+        _reject(path, f"is an ancestor owned by uid {info.st_uid}")
+    if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+        _reject(path, "is an ancestor that other users can modify")
 
 
 def _stat(path: Path) -> os.stat_result | None:
