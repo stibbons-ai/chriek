@@ -436,6 +436,60 @@ def test_a_linked_ancestor_is_followed_to_its_private_target(tmp_path):
     }
 
 
+CANONICAL_PATHS = """
+import sys, time
+from pathlib import Path
+
+from chriek.backend import FakeBackend
+from chriek.store import SUCCEEDED, JobStore
+from chriek.worker import Worker
+
+root = Path(sys.argv[1])
+store = JobStore(root / "alias" / ".." / "db" / "chriek.db")
+job = store.create(owner="alice", prompt="p", image_count=1, width=16, height=16, seed=0, now=0.0)
+worker = Worker(store, FakeBackend(), root / "alias" / ".." / "images", time.time)
+worker.start()
+deadline = time.monotonic() + 10
+try:
+    while store.get("alice", job.id).status != SUCCEEDED:
+        assert time.monotonic() < deadline, "job did not finish"
+        time.sleep(0.02)
+finally:
+    worker.stop(10)
+    store.close()
+print(job.id)
+"""
+
+
+def test_paths_through_a_linked_level_and_dotdot_are_used_where_they_point(tmp_path):
+    """`alias/../x` means the `x` beside `alias`, as documented, never one under its target."""
+    real = tmp_path / "real"
+    real.mkdir(mode=0o700)
+    for directory in (real / "sub", real / "db", real / "images"):
+        make(directory, 0o777, directory=True)  # unchecked shared directories chriek must ignore
+    (tmp_path / "alias").symlink_to(real / "sub")
+    before = tree_state(real)
+
+    result = subprocess.run(
+        [sys.executable, "-c", CANONICAL_PATHS, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        umask=0o022,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    job = result.stdout.strip()
+
+    assert {name: modes(tmp_path)[name] for name in ("db", "images")} == {
+        "db": 0o700,
+        "images": 0o700,
+    }
+    assert modes(tmp_path / "db") == {"chriek.db": 0o600}
+    assert modes(tmp_path / "images") == {job: 0o700, f"{job}/0.png": 0o600}
+    assert tree_state(real) == before, "nothing may be created or changed below the link target"
+
+
 def shared_install(tmp_path: Path, mode: int, below: str = "") -> tuple[Path, dict[str, str]]:
     """A caller-owned shared directory with dedicated chriek directories configured inside.
 
