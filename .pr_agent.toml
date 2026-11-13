@@ -1,0 +1,15 @@
+[config]
+model="anthropic/claude-opus-5-5"
+fallback_models=["anthropic/claude-haiku-5-5"]
+
+allow_dynamic_context=true
+max_extra_lines_before_dynamic_context=8
+patch_extra_lines_before = 3
+patch_extra_lines_after = 1
+
+reasoning_effort = "medium"
+# Claude 5.x ignores reasoning_effort unless adaptive thinking is on; effort goes out as output_config.effort.
+enable_claude_adaptive_thinking = true
+# Thinking tokens count against this completion cap; pr-agent raises values below 4096.
+max_output_tokens = 16000
+max_model_tokens = 32000
