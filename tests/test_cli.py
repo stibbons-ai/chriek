@@ -70,7 +70,10 @@ CONTROL_KEY = ALICE_KEY + "\x07"
 MARKER = "public-url-secret-marker"
 URL_FORM = "CHRIEK_PUBLIC_URL must be an absolute http or https URL"
 PRINTABLE = "CHRIEK_PUBLIC_URL must contain only printable ASCII"
-UNENCODED_AT_PASSWORD = ("S3cr", "tTail-9999")  # written as S3cr@tTail-9999
+# Password, host and database fragments a URL with a second raw `@` would expose.
+AT_FRAGMENTS = ("S3cr", "tTail-9999", "Pa55frag", "MidSecret", "TailSecret", "SECa", "SECb")
+AT_ERROR = "CHRIEK_DATABASE_URL must percent-encode every @ as %40, except the one before the host"
+CONNINFO_ERROR = "CHRIEK_DATABASE_URL must not contain NUL characters (also as %00) or raw invalid"
 
 
 def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str) -> str:
@@ -87,7 +90,7 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
         "short-secret-key",
         "short-signing-secret",
         DB_PASSWORD,
-        *UNENCODED_AT_PASSWORD,
+        *AT_FRAGMENTS,
     ):
         assert secret not in output
     for secret in (EMOJI_KEY, LATIN1_KEY):
@@ -257,21 +260,32 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
             {"CHRIEK_DATABASE_URL": f"mysql://chriek:{DB_PASSWORD}@db/chriek"},
             "CHRIEK_DATABASE_URL must start with postgresql:// or postgresql+psycopg://",
         ),
-        (
-            {
-                "CHRIEK_DATABASE_URL": "postgresql://chriek:{}@{}@db.invalid/chriek".format(
-                    *UNENCODED_AT_PASSWORD
-                )
-            },
-            "CHRIEK_DATABASE_URL must percent-encode @ in the user name and password as %40",
+        *(
+            ({"CHRIEK_DATABASE_URL": url}, AT_ERROR)
+            for url in (
+                "postgresql://chriek:S3cr@tTail-9999@db.invalid/chriek",
+                "postgresql://chriek:Pa55frag@MidSecret/TailSecret@db.invalid/chriek",
+                "postgresql://chriek:Pa55frag@MidSecret?TailSecret@db.invalid/chriek",
+                "postgresql://chriek:SECa@[SECb]@h.invalid/db",
+                # A reachable host would print the rest as a database name.
+                "postgresql://chriek:Pa55frag@127.0.0.1:1/TailSecret@db.invalid/chriek",
+            )
         ),
         # %00 would truncate libpq's connection settings; \udcff is an undecodable 0xff byte.
         *(
-            (
-                {"CHRIEK_DATABASE_URL": f"postgresql://chriek:{password}@127.0.0.1:1/chriek"},
-                "CHRIEK_DATABASE_URL must be UTF-8 text without NUL characters",
+            ({"CHRIEK_DATABASE_URL": f"postgresql://{rest}"}, CONNINFO_ERROR)
+            for rest in (
+                f"chriek:{DB_PASSWORD}%00@127.0.0.1:1/chriek",
+                f"chriek:{DB_PASSWORD}\udcff@127.0.0.1:1/chriek",
+                f"chr%00iek:{DB_PASSWORD}@127.0.0.1:1/chriek",
+                f"chr\udcffiek:{DB_PASSWORD}@127.0.0.1:1/chriek",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chr%00iek",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chr\udcffiek",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chriek?app%00name=x",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chriek?application_name=a%00b",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chriek?application_name=a\udcffb",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chriek?options=a&options=b%00",
             )
-            for password in (f"{DB_PASSWORD}%00", f"{DB_PASSWORD}\udcff")
         ),
     ],
 )
@@ -309,26 +323,28 @@ def test_missing_public_url_exits_2_without_fallback(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("password", "host", "detail"),
+    "url",
     [
-        (DB_PASSWORD, "127.0.0.1:1", "connection failed: "),
+        f"postgresql://chriek:{DB_PASSWORD}@127.0.0.1:1/chriek",
         # A driver message that echoes a password-bearing host name still hides the password.
-        (DB_PASSWORD, f"{DB_PASSWORD}.invalid", "'***.invalid'"),
+        f"postgresql://chriek:{DB_PASSWORD}@{DB_PASSWORD}.invalid/chriek",
         # Percent-encoded reserved and non-ASCII characters are valid configuration.
-        ("db-%40%25-%C3%A9-0123456789", "127.0.0.1:1", "connection failed: "),
+        "postgresql://chriek:db-%40%25-%C3%A9-0123456789@127.0.0.1:1/chriek",
+        f"postgresql://chriek:{DB_PASSWORD}@[::1]:1/chriek",
+        "postgresql://chriek@/chriek?host=127.0.0.1&port=1&application_name=a%40b"
+        f"&password={DB_PASSWORD}",
+        # Host names Python's IDNA codec refuses (empty or 64-character label).
+        f"postgresql://chriek:{DB_PASSWORD}@a..b/chriek",
+        f"postgresql://chriek:{DB_PASSWORD}@{'a' * 64}.invalid/chriek",
     ],
-    ids=["refused", "echoed", "encoded-unicode"],
+    ids=["refused", "echoed", "encoded-unicode", "ipv6", "query", "empty-label", "long-label"],
 )
-def test_unreachable_postgres_exits_1_without_leaking_the_password(
-    tmp_path, password, host, detail
-):
-    url = f"postgresql://chriek:{password}@{host}/chriek"
+def test_unreachable_postgres_exits_1_without_leaking_the_password(tmp_path, url):
     process = serve(base_env(tmp_path) | {"CHRIEK_DATABASE_URL": url})
     output, _ = process.communicate(timeout=60)
 
     assert process.returncode == 1, output
     assert output.startswith("chriek: database error: "), output
-    assert detail in output
     assert "0123456789" not in output
     assert "Traceback" not in output
     assert not (tmp_path / "db").exists(), "CHRIEK_DATABASE_URL takes precedence over the path"

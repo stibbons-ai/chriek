@@ -34,7 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     except StorageError as error:
         print(f"chriek: storage error: {error}", file=sys.stderr)
         return 2
-    except SQLAlchemyError as error:
+    except (SQLAlchemyError, UnicodeError) as error:  # psycopg's IDNA host encoding: UnicodeError
         print(
             f"chriek: database error: {_database_error(error, settings.database)}", file=sys.stderr
         )
@@ -60,7 +60,7 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _database_error(error: SQLAlchemyError, database: Path | URL) -> str:
+def _database_error(error: SQLAlchemyError | UnicodeError, database: Path | URL) -> str:
     """The driver's message without SQLAlchemy's wrapper, and never the database password."""
     message = str(getattr(error, "orig", None) or error)
     if isinstance(database, URL):

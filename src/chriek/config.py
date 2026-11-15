@@ -151,6 +151,12 @@ def _database(env: Mapping[str, str]) -> Path | URL:
     if raw is None:
         return Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db"))
     # The URL carries the database password: errors name the variable, never the value.
+    # A second raw `@` makes the parser split a credential into host and database names, which
+    # drivers echo; only the authority separator may stay unencoded.
+    if raw.count("@") > 1:
+        raise ConfigError(
+            "CHRIEK_DATABASE_URL must percent-encode every @ as %40, except the one before the host"
+        )
     try:
         url = make_url(raw)
     except ArgumentError, ValueError:
@@ -159,21 +165,16 @@ def _database(env: Mapping[str, str]) -> Path | URL:
         raise ConfigError(
             "CHRIEK_DATABASE_URL must start with postgresql:// or postgresql+psycopg://"
         )
-    # An unencoded `@` in the password puts the rest of it into the host, which drivers echo.
-    if url.host and "@" in url.host:
-        raise ConfigError(
-            "CHRIEK_DATABASE_URL must percent-encode @ in the user name and password as %40"
-        )
     if not all(_is_conninfo_text(text) for text in _url_texts(url)):
         raise ConfigError(
-            "CHRIEK_DATABASE_URL must be UTF-8 text without NUL characters, also after "
-            "percent-decoding"
+            "CHRIEK_DATABASE_URL must not contain NUL characters (also as %00) or raw invalid UTF-8"
         )
     return url
 
 
 def _url_texts(url: URL) -> Iterator[str]:
-    """Every decoded value the driver receives; repeated query keys hold tuples."""
+    """Every URL part the driver receives (percent-decoded except the host); repeated query
+    keys hold tuples."""
     yield from (text for text in (url.username, url.password, url.host, url.database) if text)
     for key, value in url.query.items():
         yield key

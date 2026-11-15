@@ -206,9 +206,15 @@ class JobStore:
 
 def _create_engine(database: Path | URL) -> Engine:
     if isinstance(database, URL):
-        # The worker holds no connection while rendering; a server-side drop meanwhile (restart,
-        # failover, idle timeout) must not fail the result write that follows.
-        return create_engine(database.set(drivername="postgresql+psycopg"), pool_pre_ping=True)
+        # The worker holds no connection while rendering; pre-ping replaces one the server dropped
+        # meanwhile (restart, failover, idle timeout), but can't save a result while the database
+        # stays unreachable. A forced UTF-8 client encoding overrides URL and PGCLIENTENCODING
+        # settings, so every prompt and error text reaches a UTF8 database.
+        return create_engine(
+            database.set(drivername="postgresql+psycopg"),
+            pool_pre_ping=True,
+            connect_args={"client_encoding": "utf8"},
+        )
     return _sqlite_engine(database)
 
 
