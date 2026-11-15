@@ -1,15 +1,18 @@
 """Issue #5: multipart reference images for edit jobs."""
 
 import hashlib
+import http.client
 import io
 import json
 import logging
 import os
+import socket
 import sqlite3
 import struct
 import subprocess
 import sys
 import threading
+import urllib.request
 import uuid
 import zlib
 from pathlib import Path
@@ -30,7 +33,7 @@ from conftest import (
     wait_for,
 )
 from fastapi.testclient import TestClient
-from PIL import Image, ImageCms, ImageOps, PngImagePlugin
+from PIL import Image, ImageCms, ImageFile, ImageOps, PngImagePlugin
 from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -534,26 +537,62 @@ def test_reference_bytes_cannot_be_downloaded_and_failed_edit_job_publishes_no_o
             assert client.get(path).status_code == 404, path
 
 
-def test_url_and_text_reference_fields_are_rejected_without_network_fetch(tmp_path):
+@pytest.fixture
+def network_attempts(monkeypatch) -> list:
+    """Records, then refuses, every outbound connection: urllib, socket.create_connection and
+    raw socket connects (which httpx, requests and http.client all end in).
+
+    Recorded before raising, so code that swallows the network error is still seen.
+    """
+    attempts = []
+
+    def refuse(entry):
+        def guard(*args, **kwargs):
+            attempts.append(entry)
+            raise OSError(f"network access blocked in tests: {entry}")
+
+        return guard
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse("urlopen"))
+    monkeypatch.setattr(socket, "create_connection", refuse("create_connection"))
+    monkeypatch.setattr(socket.socket, "connect", refuse("socket.connect"))
+    monkeypatch.setattr(socket.socket, "connect_ex", refuse("socket.connect_ex"))
+    return attempts
+
+
+def test_url_and_text_reference_fields_are_rejected_without_network_fetch(
+    tmp_path, network_attempts
+):
+    url = "http://127.0.0.1:9/ref.png"
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
         for bad_json in (
-            {"prompt": "hi", "references": ["http://127.0.0.1:9/ref.png"]},
-            {"prompt": "hi", "reference_urls": ["http://127.0.0.1:9/ref.png"]},
-            {"prompt": "hi", "image_url": "http://127.0.0.1:9/ref.png"},
+            {"prompt": "hi", "references": [url]},
+            {"prompt": "hi", "reference_urls": [url]},
+            {"prompt": "hi", "image_url": url},
         ):
             resp = client.post("/jobs", headers=ALICE, json=bad_json)
             assert resp.status_code == 422
             assert resp.json()["detail"]
 
         for bad_form in (
-            {"prompt": "hi", "references": "http://127.0.0.1:9/ref.png"},
-            {"prompt": "hi", "reference_url": "http://127.0.0.1:9/ref.png"},
+            {"prompt": "hi", "references": url},
+            {"prompt": "hi", "reference_url": url},
         ):
             resp = post_multipart(client, headers=ALICE, data=bad_form)
             assert resp.status_code == 422
             assert resp.json()["detail"]
         assert backend.renders == 0
+    assert network_attempts == []
+
+    # Control: the guard sees the usual client paths, so an empty list above means no fetch.
+    with pytest.raises(OSError):
+        urllib.request.urlopen(url, timeout=1)
+    with pytest.raises(OSError):
+        http.client.HTTPConnection("127.0.0.1", 9, timeout=1).request("GET", "/ref.png")
+    with socket.socket() as raw, pytest.raises(OSError):
+        raw.connect(("127.0.0.1", 9))
+    assert network_attempts == ["urlopen", "create_connection", "socket.connect"]
 
 
 def test_reference_count_and_upload_byte_limits_are_configurable_and_enforced(tmp_path):
@@ -968,30 +1007,41 @@ def test_reference_format_allowlist_corrupt_metadata_and_bomb_headers(tmp_path, 
     fake_gs.chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
 
-    eps_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="EPS")
-
-    gif_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="GIF")
-    bmp_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="BMP")
-    tiff_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="TIFF")
+    # Decodable by Pillow, but outside the allowlist (encoders installed with Pillow).
+    unsupported = {
+        "EPS": make_image_bytes((10, 20, 30), (16, 16), fmt="EPS"),
+        "GIF": make_image_bytes((10, 20, 30), (16, 16), fmt="GIF"),
+        "BMP": make_image_bytes((10, 20, 30), (16, 16), fmt="BMP"),
+        "TIFF": make_image_bytes((10, 20, 30), (16, 16), fmt="TIFF"),
+        "DDS": make_image_bytes((10, 20, 30), (16, 16), fmt="DDS"),
+        "JPEG2000": make_image_bytes((10, 20, 30), (16, 16), fmt="JPEG2000"),
+        "ICO": make_image_bytes((10, 20, 30), (16, 16), fmt="ICO"),
+        "PPM": make_image_bytes((10, 20, 30), (16, 16), fmt="PPM"),
+    }
     blp_buf = io.BytesIO()
     Image.new("P", (16, 16)).save(blp_buf, format="BLP")
-    dds_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="DDS")
-    # Decodable by Pillow, but outside the allowlist (encoders installed with Pillow).
-    jpeg2000_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="JPEG2000")
-    ico_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="ICO")
-    ppm_bytes = make_image_bytes((10, 20, 30), (16, 16), fmt="PPM")
+    unsupported["BLP"] = blp_buf.getvalue()
 
-    with running(tmp_path) as client:
+    # The allowlist must keep these plugins' header parsers off untrusted bytes, not merely
+    # reject what they parsed: record every entry into their `_open`.
+    opened = []
+
+    def recording_open(fmt, original):
+        def _open(self):
+            opened.append(fmt)
+            return original(self)
+
+        return _open
+
+    Image.init()
+    for fmt in unsupported:
+        plugin = Image.OPEN[fmt][0]
+        monkeypatch.setattr(plugin, "_open", recording_open(fmt, plugin._open))
+
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
         for name, payload in (
-            ("vector.eps", eps_bytes),
-            ("anim.gif", gif_bytes),
-            ("bitmap.bmp", bmp_bytes),
-            ("scan.tiff", tiff_bytes),
-            ("texture.blp", blp_buf.getvalue()),
-            ("surface.dds", dds_bytes),
-            ("image.jp2", jpeg2000_bytes),
-            ("favicon.ico", ico_bytes),
-            ("pixmap.ppm", ppm_bytes),
+            *unsupported.items(),
             ("trunc.png", make_image_bytes(fmt="PNG")[:45]),
         ):
             resp = post_multipart(
@@ -1004,7 +1054,13 @@ def test_reference_format_allowlist_corrupt_metadata_and_bomb_headers(tmp_path, 
             assert detail[0]["loc"] == ["body", "references", 0]
             assert "not a valid image" in detail[0]["msg"]
 
+        assert opened == []
+        _assert_nothing_persisted(tmp_path, backend)
         assert not gs_marker.exists(), "EPS upload must never invoke external Ghostscript"
+        # Control: an unrestricted open of each fixture enters its plugin's spied `_open`.
+        for fmt, payload in unsupported.items():
+            with Image.open(io.BytesIO(payload)):
+                assert fmt in opened, fmt
 
         bomb_resp = post_multipart(
             client,
@@ -1081,23 +1137,34 @@ def test_non_rgb_and_transparent_references_are_stored_as_plain_rgb(tmp_path):
         assert backend.renders == 5
 
 
-def test_reference_pixel_limit_includes_exact_boundary(tmp_path):
+def test_reference_pixel_limit_includes_exact_boundary(tmp_path, monkeypatch):
     form = {"prompt": "boundary", "width": "16", "height": "16"}
-    with running(tmp_path, CHRIEK_MAX_PIXELS="1024") as client:
-        exact = submit_multipart(
-            client,
-            data=form,
-            files=[("references", ("exact.png", make_image_bytes(size=(32, 32)), "image/png"))],
-        )
-        assert wait_for(client, exact["id"])["status"] == "succeeded"
+    exact_png = make_image_bytes(size=(32, 32))
+    over_png = make_image_bytes(size=(32, 33))
+    loaded = []
+    original_load = ImageFile.ImageFile.load
 
+    def recording_load(self):
+        loaded.append(self.size)
+        return original_load(self)
+
+    monkeypatch.setattr(ImageFile.ImageFile, "load", recording_load)
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend, CHRIEK_MAX_PIXELS="1024") as client:
+        # Far below Pillow's own bomb threshold: only chriek's size check, before decoding.
         over = post_multipart(
-            client,
-            data=form,
-            files=[("references", ("over.png", make_image_bytes(size=(32, 33)), "image/png"))],
+            client, data=form, files=[("references", ("over.png", over_png, "image/png"))]
         )
         assert over.status_code == 422
         assert over.json()["detail"][0]["msg"] == "reference image 0 exceeds maximum of 1024 pixels"
+        assert loaded == []
+        _assert_nothing_persisted(tmp_path, backend)
+
+        exact = submit_multipart(
+            client, data=form, files=[("references", ("exact.png", exact_png, "image/png"))]
+        )
+        assert loaded[0] == (32, 32)  # the spy sees the decode of a permitted reference
+        assert wait_for(client, exact["id"])["status"] == "succeeded"
 
 
 def test_16_bit_greyscale_references_are_scaled_not_clipped(client, tmp_path):
@@ -2034,6 +2101,63 @@ def test_costly_uploads_are_rejected_before_pillow_opens_them(
         [error] = response.json()["detail"]
         assert error["loc"] == ["body", "references", 0]
         assert reason in error["msg"]
+        assert decoder_entries == []
+        _assert_nothing_persisted(tmp_path, backend)
+
+
+_INFLATE_BOMB = zlib.compress(b"0" * 1_000_000)
+
+
+@pytest.mark.parametrize(
+    "exif_text",
+    [
+        pytest.param(
+            _png_chunk(b"zTXt", b"Raw profile type exif\x00\x00" + _INFLATE_BOMB), id="ztxt-raw"
+        ),
+        pytest.param(_png_chunk(b"zTXt", b"exif\x00\x00" + _INFLATE_BOMB), id="ztxt-exif"),
+        pytest.param(
+            _png_chunk(b"iTXt", b"Raw profile type exif\x00\x01\x00en\x00\x00" + _INFLATE_BOMB),
+            id="itxt-raw",
+        ),
+        pytest.param(
+            _png_chunk(b"iTXt", b"exif\x00\x01\x00en\x00\x00" + _INFLATE_BOMB), id="itxt-exif"
+        ),
+    ],
+)
+def test_compressed_exif_text_inflates_only_up_to_the_remaining_budget(
+    tmp_path, monkeypatch, decoder_entries, exif_text
+):
+    preceding = 40_000  # plain EXIF text before the compressed chunk, 25,536 bytes remain
+    upload = _png_with_chunks(_png_chunk(b"tEXt", b"exif\x00" + b"0" * preceding), exif_text)
+    inflate_limits = []
+    real_decompressobj = zlib.decompressobj
+
+    class RecordingInflate:
+        """Forwards bounded inflation; refuses an unbounded call instead of allocating it."""
+
+        def __init__(self, *args, **kwargs):
+            self._real = real_decompressobj(*args, **kwargs)
+
+        def decompress(self, data, max_length=0):
+            inflate_limits.append(max_length)
+            if max_length <= 0:
+                raise zlib.error("unbounded inflate refused in test")
+            return self._real.decompress(data, max_length)
+
+    monkeypatch.setattr(zlib, "decompressobj", RecordingInflate)
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        response = post_multipart(
+            client, data=FORM_16, files=[("references", ("r", upload, "image/png"))]
+        )
+        assert response.status_code == 422, response.text
+        [error] = response.json()["detail"]
+        assert error["loc"] == ["body", "references", 0]
+        assert "too much EXIF" in error["msg"]
+        # Non-empty: the walker's inflation was observed. Each call may produce at most one
+        # byte more than the budget left after the preceding EXIF text.
+        assert inflate_limits
+        assert all(0 < limit <= 64 * 1024 - preceding + 1 for limit in inflate_limits)
         assert decoder_entries == []
         _assert_nothing_persisted(tmp_path, backend)
 
