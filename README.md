@@ -2,7 +2,7 @@
 
 Self-hostable image generation server for FLUX 3 Image Klein, with an asynchronous job API: submit a job, poll it, download the PNGs through signed, expiring URLs. Architecture: [ADR-0001](docs/adr/0001-mvp-architecture.md).
 
-> **Status: home mode.** The default fake backend draws deterministic placeholder PNGs without a GPU or model weights. On Apple Silicon, the optional MLX backend runs FLUX 3 Image Klein in BF16. CUDA and API reference uploads are not available yet; use the local smoke command to try edits with reference images.
+> **Status: home mode.** The default fake backend draws deterministic placeholder PNGs (two coloured rectangles derived from prompt, size, seed and uploaded reference images) without a GPU or model weights; it does not run FLUX or any other model. On Apple Silicon, the optional MLX backend runs FLUX 3 Image Klein in BF16, including edits with reference images uploaded through the API or the local smoke command. CUDA is not available yet.
 
 ## Install and run (uv)
 
@@ -87,7 +87,7 @@ To serve MLX jobs, also set the server settings from [Install and run](#install-
 
 ### Smoke test
 
-Generate a labeled PNG and print a JSON run record to stdout. The command uses the configured backend, defaults to 1024×1024 and seed 7, and needs no server settings. Dimensions must be positive multiples of 16 and obey the default server limits for each side and for total pixels. `--reference` is repeatable. An existing output is replaced only after the new PNG is fully written. The server API does not accept references yet.
+Generate a labeled PNG and print a JSON run record to stdout. The command uses the configured backend, defaults to 1024×1024 and seed 7, and needs no server settings. Dimensions must be positive multiples of 16 and obey the default server limits for each side and for total pixels. `--reference` is repeatable. An existing output is replaced only after the new PNG is fully written. Server jobs take references as multipart uploads; see [`POST /jobs`](#post-jobs).
 
 ```sh
 uv run --locked --extra mlx chriek smoke --prompt "A red bicycle in the rain" --out bicycle.png
@@ -123,7 +123,7 @@ All configuration comes from environment variables.
 | `CHRIEK_JOB_TIMEOUT_SECONDS` | `3600` | Longest a job may stay `running`, 1–604800 seconds, counted from `started_at` (time spent `queued` doesn't count). A job running longer fails as timed out; see [Job behaviour](#job-behaviour). |
 | `CHRIEK_DATABASE_URL` | unset | Postgres database, `postgresql://user:password@host:5432/dbname` (or `postgresql+psycopg://…`; chriek always uses the psycopg 3 driver). When set, it takes precedence and `CHRIEK_DB_PATH` is ignored. Set but empty, unparsable, with another scheme, with an unencoded `@` other than the one before the host (more than one, or one after the first `/` or `?` following `://`; write every other `@` as `%40`, and a `/` or `?` in the user name or password as `%2F` or `%3F`), or containing a NUL character (also as `%00`) or raw invalid UTF-8 is a configuration error. A parsable URL with parts left out, such as bare `postgresql://`, is accepted: libpq fills them from its defaults and `PG*` variables, and a connection that then fails is a database error. See [Postgres](#postgres). |
 | `CHRIEK_DB_PATH` | `chriek-data/chriek.db` | SQLite database file, used when `CHRIEK_DATABASE_URL` is unset. Used literally (`?` and `%20` are ordinary filename characters); missing parent directories are created private. Its parent must be a dedicated directory; see [Storage permissions](#storage-permissions). Put it on a volume to keep jobs across restarts. The exact value `:memory:` (or `./:memory:`) selects an ephemeral in-memory database instead; see [In-memory database](#in-memory-database). |
-| `CHRIEK_STORAGE_DIR` | `chriek-data/images` | Dedicated directory for generated PNGs, one subdirectory per job; see [Storage permissions](#storage-permissions). |
+| `CHRIEK_STORAGE_DIR` | `chriek-data/images` | Dedicated directory for generated PNGs (`<id>/<index>.png`) and uploaded reference images (`<id>/references/<index>.png`), one subdirectory per job; see [Storage permissions](#storage-permissions). |
 | `CHRIEK_HOST` | `127.0.0.1` | Listen address. |
 | `CHRIEK_ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` in `proxy` mode | `proxy` mode only: comma-separated host names and IP addresses (IPv6 in brackets, as in `[::1]`) that requests must name in their `Host` header; see [Behind a reverse proxy](#behind-a-reverse-proxy-chriek_auth_modeproxy). Exact names only: no wildcards, empty entries, schemes, ports or paths. Setting it in `api-key` mode stops startup. |
 | `CHRIEK_PORT` | `8000` | Listen port. |
@@ -132,8 +132,10 @@ All configuration comes from environment variables.
 | `CHRIEK_MAX_QUEUED_JOBS` | `100` | Maximum `queued` jobs per owner (1–100000); see [Queue limit](#queue-limit). |
 | `CHRIEK_MAX_IMAGES` | `4` | Maximum `image_count` per job (configurable 1–64). |
 | `CHRIEK_MAX_DIMENSION` | `2048` | Maximum `width` and `height`; a multiple of 16 (16–8192). |
-| `CHRIEK_MAX_PIXELS` | `1048576` | Maximum `width * height` (256–67108864). |
+| `CHRIEK_MAX_PIXELS` | `1048576` | Maximum `width * height` for generated outputs and uploaded reference images (256–67108864). |
 | `CHRIEK_MAX_PROMPT_CHARS` | `2000` | Maximum prompt length in characters (1–100000). |
+| `CHRIEK_MAX_REFERENCES` | `4` | Maximum uploaded reference images per job (0–16; `0` disables edit jobs). |
+| `CHRIEK_MAX_UPLOAD_BYTES` | `20971520` | Maximum raw HTTP request body size in bytes of a `multipart/form-data` `POST /jobs` request (including framing), enforced while streaming without trusting `Content-Length` (1024–536870912). A small value can reject a request before `CHRIEK_MAX_PROMPT_CHARS` is reached. JSON bodies have the fixed 2 MiB budget instead; see [`POST /jobs`](#post-jobs). |
 
 Relative paths resolve against the working directory. The database schema (SQLite or Postgres) is created on first start, and indexes added by newer chriek versions are created in an existing database on start, keeping its jobs; there are no other migrations yet.
 
@@ -227,10 +229,20 @@ In `api-key` mode (the default) every `/jobs` request needs `Authorization: Bear
 
 ### `POST /jobs`
 
+`POST /jobs` accepts either `application/json` (text-to-image) or `multipart/form-data` (zero or more uploaded `references` image files: zero selects text-to-image, one or more selects image-conditioned edit). The server never fetches reference URLs.
+
 ```sh
+# Text-to-image (JSON)
 curl -s -X POST http://127.0.0.1:8000/jobs \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"prompt": "a lighthouse at dusk", "image_count": 2, "seed": 41, "width": 1024, "height": 768}'
+
+# Edit job with reference images (multipart/form-data)
+curl -s -X POST http://127.0.0.1:8000/jobs \
+  -H "Authorization: Bearer $KEY" \
+  -F "prompt=keep both characters consistent in a stormy harbor" \
+  -F "image_count=2" -F "seed=41" -F "width=1024" -F "height=768" \
+  -F "references=@char1.png" -F "references=@char2.jpg"
 ```
 
 | Field | Type | Default | Rule |
@@ -239,12 +251,15 @@ curl -s -X POST http://127.0.0.1:8000/jobs \
 | `image_count` | integer | `1` | 1 to `CHRIEK_MAX_IMAGES` |
 | `seed` | integer or null | random | `0 ≤ seed` and `seed + image_count - 1 ≤ 4294967295` |
 | `width`, `height` | integer | `1024` | multiples of 16, 16 to `CHRIEK_MAX_DIMENSION`, `width * height ≤ CHRIEK_MAX_PIXELS` |
+| `references` | 0..N image files (multipart only) | none | at most `CHRIEK_MAX_REFERENCES` files (PNG, JPEG or WebP); each decoded as an image with `width * height ≤ CHRIEK_MAX_PIXELS`; total raw request body at most `CHRIEK_MAX_UPLOAD_BYTES` |
 
 Types are strict (`"1024"` or `1024.0` is not an integer) and unknown fields are rejected. Nonfinite numbers (`NaN`, `Infinity`, `1e999`) and prompts with unpaired UTF-16 surrogates (`"\ud800"`) are rejected too. Requests that fail validation, including malformed JSON syntax such as `{`, return `422` with a `{"detail": [{"type": ..., "loc": [...], "msg": ...}]}` error list. Other JSON decoding failures, such as a byte `0xFF` inside an otherwise UTF-8 JSON string or an integer literal thousands of digits long, return `400 {"detail": "There was an error parsing the body"}` instead; chriek JSON-decodes only bodies sent as `application/json` or `application/*+json`. The JSON decoder also accepts UTF-16 and UTF-32; the request byte cap below applies to those encodings too. A body without a `Content-Type` or of any other type, such as `text/plain` (even invalid bytes), is not decoded and fails validation with `422`. Neither kind of rejected request enters the queue. A valid request returns `202`, a `Location: /jobs/<id>` header and the job (below) in status `queued`. Job IDs are UUIDv7. When `seed` is omitted, chriek picks one at random and reports it in `params.seed`; image `i` uses seed `seed + i`.
 
+In `multipart/form-data`, scalar fields use the same names with decimal integer strings (`seed=` empty string or omitted chooses a random seed), and reference images are uploaded as repeated `references` file parts in order; only PNG, JPEG and WebP images are accepted, and each is re-encoded as PNG (not stored as the original uploaded bytes) at `references/<index>.png` inside the job's storage directory before the job enters the queue, while client filenames are ignored. Normalization: only one picture is kept: for PNG the default image (an APNG's first frame, or its separate default image when it has one), for animated WebP the first frame, and for JPEG the first picture (Pillow's JPEG decoder also reads multi-picture MPO files from cameras; later pictures are ignored). The image is rotated or flipped by its EXIF orientation tag, or by an XMP `tiff:Orientation` when EXIF has no orientation (when JFIF gives no DPI, Pillow's JPEG reader also reads the EXIF resolution tags; their values are dropped), and converted to RGB without colour management: pixel values pass through unchanged (CMYK and greyscale sources use Pillow's plain conversion; 16-bit greyscale is scaled to 8 bits), so an embedded ICC profile is dropped, not applied, even though it described those values. Any alpha channel and any PNG `tRNS` transparency is discarded (transparent pixels keep their colour values and become opaque). The stored PNG carries no metadata: ICC profiles, EXIF (including the orientation already applied), XMP, comments, text and DPI are all dropped. JPEG uploads are checked before decoding, because their structure can cost far more memory and CPU than their pixels: between SOI and the first EOI at most 256 markers (restart markers inside scan data don't count), at most 64 scans and at most 256 `0xFF` fill bytes in total before markers outside scan data, that is after SOI, a marker segment or a bare RST or TEM marker (fill bytes between scan data and the next marker are skipped with the scan data and not counted); exceeding a bound returns `422 reference image <i> has too complex a JPEG structure …`. Stray bytes between segments, a nested SOI, a reserved JPG or JPGn marker (`0xFFC8`, `0xFFF0` to `0xFFFD`, which encoders don't write), a segment length below 2, an EOI before the first scan and a file ending before EOI return `422 … is not a valid image`. Data after the first EOI (further MPO pictures) may be buffered but is never parsed or decoded. Before decoding, each reference's raw EXIF payload is also capped at 65,536 bytes (64 KiB), counted over every occurrence, not only the one Pillow uses: in JPEG the APP1 `Exif` segments up to the first EOI, without their 6-byte `Exif\0\0` headers; in PNG every `eXIf` chunk, before or after the image data, plus the text of `tEXt`, `zTXt` and `iTXt` chunks keyed `exif` or `Raw profile type exif` (decompressed for `zTXt` and for `iTXt` with any nonzero compression flag, so hex-encoded raw profiles count at their text size); in WebP every `EXIF` chunk, top-level or inside an animation frame (`ANMF`), where libwebp reads it too. A larger total returns `422 reference image <i> has too much EXIF metadata …`, so images with unusually large EXIF blocks (for example big maker notes or embedded thumbnails beyond 64 KiB) must have their metadata stripped before upload; the cap is not configurable. Multipart requests that fail validation, including unknown fields, non-file `references` parts (such as URLs), unsupported or unreadable images, and count or byte limit violations, return `422` with the same error list and never enter the queue.
+
 Two fixed byte budgets apply; neither is configurable:
 
-- **Request body: at most 2,097,152 bytes (2 MiB).** After the key check, both authenticated routes (`POST /jobs` and `GET /jobs/{id}`) reject a `Content-Length` above the limit with `413 {"detail": "request body must be at most 2097152 bytes"}` before any body is read. When `POST /jobs` reads a body, chriek also counts the bytes it actually receives from the server, for example a chunked (`Transfer-Encoding: chunked`) body, and answers `413` at the first chunk that crosses the limit, without reading on. `GET /jobs/{id}` does not read a body. HTTP framing is the server's job: with a declared `Content-Length`, the server hands chriek at most that many bytes, and anything sent after them is not part of the request. A `POST /jobs` body of exactly 2 MiB is validated normally. The budget is a byte limit, independent of `CHRIEK_MAX_PROMPT_CHARS` (which counts characters): a UTF-8 JSON body with a prompt at the highest allowed setting, 100,000 characters, fits even when every character is written as `\uXXXX` escapes. Multipart uploads ([#5](https://github.com/stibbons-ai/chriek/issues/5)) will need their own size policy.
+- **Request body: at most 2,097,152 bytes (2 MiB).** After the key check, both authenticated routes (`POST /jobs` and `GET /jobs/{id}`) reject a `Content-Length` above the limit with `413 {"detail": "request body must be at most 2097152 bytes"}` before any body is read. When `POST /jobs` reads a body, chriek also counts the bytes it actually receives from the server, for example a chunked (`Transfer-Encoding: chunked`) body, and answers `413` at the first chunk that crosses the limit, without reading on. `GET /jobs/{id}` does not read a body. HTTP framing is the server's job: with a declared `Content-Length`, the server hands chriek at most that many bytes, and anything sent after them is not part of the request. A `POST /jobs` body of exactly 2 MiB is validated normally. The budget is a byte limit, independent of `CHRIEK_MAX_PROMPT_CHARS` (which counts characters): a UTF-8 JSON body with a prompt at the highest allowed setting, 100,000 characters, fits even when every character is written as `\uXXXX` escapes. `multipart/form-data` bodies are exempt: `CHRIEK_MAX_UPLOAD_BYTES` bounds them instead, counting received bytes and answering `422 … upload exceeds maximum size of <n> bytes`; it covers the whole body including multipart framing, so a small setting can reject a prompt below `CHRIEK_MAX_PROMPT_CHARS`.
 - **`422` response: at most 16,384 bytes (16 KiB).** Error entries carry only `type`, `loc` and `msg`; the rejected input and the validation error's `ctx` are never echoed. Each text value, including field names you sent that show up in `loc`, is first clipped to 200 characters; unpaired surrogates in it are then written as escape text such as `\ud800`, which may make it longer. Locations retain at most eight parts. Errors that no longer fit are dropped from the end, so the list may be incomplete.
 
 An early rejection can leave the request body unread. Clients that finish uploading before reading the response may see a broken pipe or connection reset instead of the `401` or `413` response.
@@ -263,7 +278,7 @@ curl -s http://127.0.0.1:8000/jobs/$JOB_ID -H "Authorization: Bearer $KEY"
 {
   "id": "019a7c1e-4b2a-7c3d-9e8f-0123456789ab",
   "status": "succeeded",
-  "params": {"prompt": "a lighthouse at dusk", "image_count": 2, "seed": 41, "width": 1024, "height": 768},
+  "params": {"prompt": "a lighthouse at dusk", "image_count": 2, "seed": 41, "width": 1024, "height": 768, "reference_count": 0},
   "created_at": "2026-11-11T12:00:00.000000+00:00",
   "started_at": "2026-11-11T12:00:00.010000+00:00",
   "finished_at": "2026-11-11T12:00:00.090000+00:00",
@@ -277,9 +292,9 @@ curl -s http://127.0.0.1:8000/jobs/$JOB_ID -H "Authorization: Bearer $KEY"
 ```
 
 - `status` is `queued`, `running`, `succeeded` or `failed`.
-- `run` records `backend`, `model`, `revision` and `render_seconds` (wall time including model load and PNG writes) when the worker finishes the job, whether it succeeded or an image failed. MLX also reports `load_seconds` (the initial pipeline load paid by this job; `0.0` after loading), `peak_memory_bytes` (MLX allocation peak for this job, not system RAM use; `null` if the counter could not be reset or read), `hardware` (`chip`, `gpu_cores`, `memory_gb`, `macos_version`), `runtime` (`flux3_mlx`, `mlx` versions), `precision` (`BF16`) and `steps` (`16`). A job failed by restart recovery or by the running-time limit has `run: null`; see [Job behaviour](#job-behaviour).
+- `run` records `backend`, `model`, `revision` and `render_seconds` (wall time including model load and PNG writes) when the worker finishes the job, whether it succeeded, an image failed or a stored reference could not be loaded. MLX also reports `load_seconds` (the initial pipeline load paid by this job; `0.0` after loading), `peak_memory_bytes` (MLX allocation peak for this job, not system RAM use; `null` if the counter could not be reset or read), `hardware` (`chip`, `gpu_cores`, `memory_gb`, `macos_version`), `runtime` (`flux3_mlx`, `mlx` versions), `precision` (`BF16`) and `steps` (`16`), except after a reference load failure, when the backend never ran. A job failed by restart recovery or by the running-time limit has `run: null`; see [Job behaviour](#job-behaviour).
 - `images` is filled only when `succeeded`. Every poll mints fresh URLs that expire `CHRIEK_URL_TTL_SECONDS` later.
-- `error` is `null` unless the job `failed`. A failed image is reported as exactly `image N of M failed` (N is the one-based image that failed, M the requested `image_count`); a job failed by restart recovery or by the running-time limit carries the interrupted or timed-out message below. The error never includes exception text, classes or other backend details: the server log keeps the full traceback with the job ID and the zero-based image index.
+- `error` is `null` unless the job `failed`. A failed image is reported as exactly `image N of M failed` (N is the one-based image that failed, M the requested `image_count`); a stored reference image the worker can't load (for example one deleted from `CHRIEK_STORAGE_DIR`) as exactly `reference N of M could not be loaded`; a job failed by restart recovery or by the running-time limit carries the interrupted or timed-out message below. The error never includes exception text, classes or other backend details: the server log keeps the full traceback with the job ID and the zero-based image index.
 
 ### `GET /images/{id}/{index}.png?expires=…&sig=…`
 
@@ -303,7 +318,7 @@ Returns `200 {"status": "ok"}`. If the worker could not save a job's result (suc
 - **Polling during write failures.** If an overdue owner poll reads the job but SQLite's write lock prevents it from recording the timeout, the poll logs the error and returns `200` with the last read status (`running`). A later overdue poll can retry. Not all write failures receive this fallback: an overdue poll can return `500` if Postgres becomes read-only while chriek is running.
 - **Unsaved results stop the worker.** If saving a finished job's result to the database fails, the worker logs the error and stops instead of moving on: that job stays `running` (until a poll after the running-time limit fails it as timed out), no later job runs, jobs accepted before the failure stay `queued`, new submissions are rejected with `503` (see [`POST /jobs`](#post-jobs)), and `GET /health` returns `503`. Fix the database or disk problem and restart `chriek serve`; restart recovery then fails the stuck job as interrupted if it is still `running`, the queued jobs run, and submissions are accepted again. Rejected submissions were never stored, so they don't run after the restart.
 - **AI disclosure in every PNG**, always on: PNG text chunks `AI-Generated: true`, `Model`, `Model-Revision`, `Seed` and `Description`, plus XMP (`XML:com.adobe.xmp`) with IPTC `Iptc4xmpExt:DigitalSourceType` = `http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia`. With the fake backend, `Model` is `chriek-fake-backend` and `Model-Revision` is `fake-v1`.
-- No retention: generated files stay in `CHRIEK_STORAGE_DIR` until you delete them.
+- No retention: generated files and normalized reference PNGs (including those of failed or interrupted jobs) stay in `CHRIEK_STORAGE_DIR` until you delete them. Reference PNGs are written before the job row is created, so a crash between the two can leave a `<id>/references/` directory with no job; it also stays until you delete it.
 
 ### Queue limit
 

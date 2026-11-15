@@ -45,6 +45,8 @@ SETTING_NAMES = frozenset(
         "CHRIEK_MAX_PIXELS",
         "CHRIEK_MAX_PROMPT_CHARS",
         "CHRIEK_MAX_QUEUED_JOBS",
+        "CHRIEK_MAX_REFERENCES",
+        "CHRIEK_MAX_UPLOAD_BYTES",
         "CHRIEK_OFFLOAD",
         "CHRIEK_PORT",
         "CHRIEK_PUBLIC_URL",
@@ -77,6 +79,8 @@ class Limits:
     max_pixels: int = 1024 * 1024
     max_prompt_chars: int = 2000
     max_queued_jobs: int = 100  # per owner; running and finished jobs don't count
+    max_references: int = 4
+    max_upload_bytes: int = 20 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -132,6 +136,10 @@ class Settings:
                 env, "CHRIEK_MAX_PROMPT_CHARS", Limits.max_prompt_chars, 1, 100_000
             ),
             max_queued_jobs=_int(env, "CHRIEK_MAX_QUEUED_JOBS", Limits.max_queued_jobs, 1, 100_000),
+            max_references=_int(env, "CHRIEK_MAX_REFERENCES", Limits.max_references, 0, 16),
+            max_upload_bytes=_int(
+                env, "CHRIEK_MAX_UPLOAD_BYTES", Limits.max_upload_bytes, 1024, 512 * 1024 * 1024
+            ),
         )
         if limits.max_dimension % 16:
             raise ConfigError("CHRIEK_MAX_DIMENSION must be a multiple of 16")

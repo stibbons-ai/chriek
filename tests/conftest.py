@@ -6,6 +6,7 @@ Every test runs on SQLite unless CHRIEK_TEST_POSTGRES_URL names a disposable Pos
 then each test not marked `sqlite` gets its own fresh database there, dropped afterwards.
 """
 
+import io
 import os
 import stat
 import threading
@@ -18,6 +19,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 from sqlalchemy import URL, Connection, Engine, create_engine, make_url, text
 
 from chriek.api import create_app
@@ -169,7 +171,7 @@ class GatedBackend(FakeBackend):
     def release(self) -> None:
         self._gate.set()
 
-    def render(self, prompt, width, height, seed):
+    def render(self, prompt, width, height, seed, references=()):
         with self._lock:
             self.active += 1
             self.max_active = max(self.max_active, self.active)
@@ -177,7 +179,7 @@ class GatedBackend(FakeBackend):
         self.rendering.set()
         try:
             assert self._gate.wait(10), "gated render never released"
-            return super().render(prompt, width, height, seed)
+            return super().render(prompt, width, height, seed, references)
         finally:
             with self._lock:
                 self.active -= 1
@@ -191,11 +193,11 @@ class PausingBackend(FakeBackend):
         self.paused = threading.Event()
         self.resume = threading.Event()
 
-    def render(self, prompt, width, height, seed):
+    def render(self, prompt, width, height, seed, references=()):
         if seed == 1:
             self.paused.set()
             assert self.resume.wait(10), "paused render never resumed"
-        return super().render(prompt, width, height, seed)
+        return super().render(prompt, width, height, seed, references)
 
 
 class FailingBackend(FakeBackend):
@@ -206,20 +208,20 @@ class FailingBackend(FakeBackend):
         self.fail_index = fail_index
         self.renders = 0
 
-    def render(self, prompt, width, height, seed):
+    def render(self, prompt, width, height, seed, references=()):
         self.renders += 1
         if self.renders - 1 == self.fail_index:
             raise RuntimeError(BACKEND_SECRET) from OSError(f"cause: {BACKEND_SECRET}")
-        return super().render(prompt, width, height, seed)
+        return super().render(prompt, width, height, seed, references)
 
 
 class CountingBackend(FakeBackend):
     def __init__(self) -> None:
         self.renders = 0
 
-    def render(self, prompt, width, height, seed):
+    def render(self, prompt, width, height, seed, references=()):
         self.renders += 1
-        return super().render(prompt, width, height, seed)
+        return super().render(prompt, width, height, seed, references)
 
 
 class StepBackend(FakeBackend):
@@ -300,3 +302,13 @@ def with_query(url: str, **changes: str) -> str:
 def client(tmp_path: Path) -> Iterator[TestClient]:
     with running(tmp_path) as test_client:
         yield test_client
+
+
+def make_image_bytes(
+    color: tuple[int, int, int] = (20, 40, 60),
+    size: tuple[int, int] = (16, 16),
+    fmt: str = "PNG",
+) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, format=fmt)
+    return buffer.getvalue()
