@@ -659,6 +659,7 @@ def test_reference_count_and_upload_byte_limits_are_configurable_and_enforced(tm
             "at most 0 reference images" in e["msg"] for e in one_ref_rejected.json()["detail"]
         )
 
+
 def test_json_and_multipart_body_caps_are_independent(tmp_path):
     """JSON keeps the fixed 2 MiB cap whatever CHRIEK_MAX_UPLOAD_BYTES says, and vice versa."""
     json_body = json.dumps({"prompt": "small cap", "width": 16, "height": 16}).encode()
