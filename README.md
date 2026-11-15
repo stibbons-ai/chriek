@@ -29,7 +29,7 @@ Every environment variable whose name starts with `CHRIEK_` (in any letter case)
 
 Logs go to standard output/error: startup, shutdown and errors. At startup chriek logs its authentication mode, as a `WARNING` in `proxy` mode because chriek itself then authenticates nobody; it never logs keys or secrets. There is no HTTP access log, because download URLs carry their signature, which works like a password until it expires; put any access logging you need in a reverse proxy and strip the query string there.
 
-> **Warning: without TLS, use chriek only on a private network or behind a TLS-terminating reverse proxy.** API keys and download signatures travel in every request; over plain HTTP anyone on the path can read and reuse them. Either let a reverse proxy terminate TLS, or turn on [native TLS](#native-tls).
+> **Warning: without TLS, use chriek only on a private network or behind a TLS-terminating reverse proxy.** API keys travel in `/jobs` requests in `api-key` mode; download signatures travel in image URLs in both modes. Over plain HTTP anyone on the path can read and reuse these credentials. Either let a reverse proxy terminate TLS, or turn on [native TLS](#native-tls).
 
 ### Native TLS
 
@@ -38,6 +38,7 @@ chriek can serve HTTPS itself, without a proxy. Point it at a PEM certificate (c
 ```sh
 export CHRIEK_TLS_CERTFILE=/etc/chriek/fullchain.pem
 export CHRIEK_TLS_KEYFILE=/etc/chriek/privkey.pem
+export CHRIEK_PUBLIC_URL="https://127.0.0.1:8000"
 uv run chriek serve   # logs "Uvicorn running on https://127.0.0.1:8000"
 ```
 
@@ -109,7 +110,7 @@ Relative paths resolve against the working directory. The database schema is cre
 Every download URL chriek returns is `CHRIEK_PUBLIC_URL` followed by `/images/{id}/{index}.png?expires=…&sig=…`; `https://images.example/chriek/` yields `https://images.example/chriek/images/…`. Nothing from the request goes into it: not the `Host` header, `Forwarded`, `X-Forwarded-Host`, `X-Forwarded-Proto`, nor the scheme or port the client connected with. The server (uvicorn) does honour `X-Forwarded-For` and `X-Forwarded-Proto` from trusted proxy addresses, by default only `127.0.0.1` and `::1`, a list the `FORWARDED_ALLOW_IPS` environment variable replaces; that changes the client address and request scheme the server sees, never the link origin.
 
 - **Upgrading.** `CHRIEK_PUBLIC_URL` is new and has no default. Earlier versions built links from the host the client used; a deployment upgraded without setting it no longer starts (exit 2, `CHRIEK_PUBLIC_URL is required`). There is no fallback to the request host. Set it to the address clients use to reach chriek, for example the `http://127.0.0.1:8000` of the [install example](#install-and-run-uv) for local use. No data migration is needed.
-- **Scheme.** `http://` suits local use on one machine. For anything reached over a network, use an `https://` URL served by a TLS-terminating proxy: download URLs are bearer credentials until they expire.
+- **Scheme.** `http://` suits local use on one machine. For anything reached over a network, use an `https://` URL served by native TLS or a TLS-terminating proxy: download URLs are bearer credentials until they expire.
 - **Path prefix.** chriek always serves downloads at `/images/…` on its own listener; it does not strip or know about any prefix. With a prefix such as `/chriek`, your proxy must route `https://images.example/chriek/images/…` to chriek's `/images/…`, removing `/chriek` and keeping the query string unchanged. Without that mapping the links fail instead of returning the image: with the proxy's error, or with chriek's `404 {"detail": "Not Found"}` when the proxy forwards the path without removing the prefix. The `Location: /jobs/<id>` header of a submission carries no prefix either; a prefix proxy must rewrite it for clients that follow that header.
 
 ### Storage permissions
