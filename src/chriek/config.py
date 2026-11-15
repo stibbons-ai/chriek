@@ -151,9 +151,9 @@ def _database(env: Mapping[str, str]) -> Path | URL:
     if raw is None:
         return Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db"))
     # The URL carries the database password: errors name the variable, never the value.
-    # A raw `@` outside the authority (a second one, or one after the first `/` past `://`)
-    # makes the parser split credentials into host or database names, which drivers echo.
-    if raw.count("@") > 1 or "@" in raw.partition("://")[2].partition("/")[2]:
+    # A raw `@` outside the authority (a second one, or one after the first `/` or `?` past
+    # `://`) makes the parser split credentials into host or database names, which drivers echo.
+    if raw.count("@") > 1 or re.search(r"://[^/?]*[/?].*@", raw, re.DOTALL):
         raise ConfigError(
             "CHRIEK_DATABASE_URL must percent-encode every @ as %40, except the one before the host"
         )

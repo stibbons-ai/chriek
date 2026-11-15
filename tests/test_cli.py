@@ -79,7 +79,8 @@ AT_FRAGMENTS = (
     "TailSecret",
     "SECa",
     "SECb",
-    "Zq9pw-Secret",
+    "Zq9pw",
+    "Tail-Secret99",
 )
 AT_ERROR = "CHRIEK_DATABASE_URL must percent-encode every @ as %40, except the one before the host"
 CONNINFO_ERROR = "CHRIEK_DATABASE_URL must not contain NUL characters (also as %00) or raw invalid"
@@ -281,6 +282,10 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
                 # A lone `@` the parser cannot place leaves the credentials in the database name.
                 "postgresql:///chriek:Zq9pw-Secret@db.invalid/chriek",
                 "postgresql://127.0.0.1/iek:Zq9pw-Secret@db.invalid/chriek",
+                # Without a database slash, `?` ends the authority: the query password splits.
+                "postgresql://db.internal?user=chriek&password=Zq9pw@Tail-Secret99",
+                "postgresql://?host=db.internal&user=chriek&password=Zq9pw@Tail-Secret99",
+                "postgresql://db.internal:5432?password=Zq9pw@Tail-Secret99",
             )
         ),
         # %00 would truncate libpq's connection settings; \udcff is an undecodable 0xff byte.
@@ -341,15 +346,28 @@ def test_missing_public_url_exits_2_without_fallback(tmp_path):
         # A driver message that echoes a password-bearing host name still hides the password.
         f"postgresql://chriek:{DB_PASSWORD}@{DB_PASSWORD}.invalid/chriek",
         # Percent-encoded reserved and non-ASCII characters are valid configuration.
-        "postgresql://chriek:db-%40%25-%C3%A9-0123456789@127.0.0.1:1/chriek",
+        "postgresql://chriek:db-%40%25%3F-%C3%A9-0123456789@127.0.0.1:1/chriek",
         f"postgresql://chriek:{DB_PASSWORD}@[::1]:1/chriek",
         "postgresql://chriek@/chriek?host=127.0.0.1&port=1&application_name=a%40b"
         f"&password={DB_PASSWORD}",
+        # Query parameters straight after the authority, with and without user info.
+        f"postgresql://127.0.0.1:1?user=chriek&password={DB_PASSWORD}",
+        f"postgresql://chriek@127.0.0.1:1?password={DB_PASSWORD}",
         # Host names Python's IDNA codec refuses (empty or 64-character label).
         f"postgresql://chriek:{DB_PASSWORD}@a..b/chriek",
         f"postgresql://chriek:{DB_PASSWORD}@{'a' * 64}.invalid/chriek",
     ],
-    ids=["refused", "echoed", "encoded-unicode", "ipv6", "query", "empty-label", "long-label"],
+    ids=[
+        "refused",
+        "echoed",
+        "encoded-unicode",
+        "ipv6",
+        "query",
+        "query-no-slash",
+        "userinfo-query-no-slash",
+        "empty-label",
+        "long-label",
+    ],
 )
 def test_unreachable_postgres_exits_1_without_leaking_the_password(tmp_path, url):
     process = serve(base_env(tmp_path) | {"CHRIEK_DATABASE_URL": url})
