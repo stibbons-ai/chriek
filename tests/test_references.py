@@ -1984,6 +1984,16 @@ _BASELINE_16 = _jpeg(_noise_image((16, 16)))
             id="jpeg-xresolution-split-over-two-segments",
         ),
         pytest.param(
+            # Without the nested-SOI check each FFD8 reads FFE1 as its length and skips the
+            # whole 0xFFE1-byte APP1 (10 header bytes + TIFF) uncounted, while Pillow skips
+            # the SOI and loads both payloads: 2x the cap.
+            _BASELINE_16[:2]
+            + (b"\xff\xd8" + _app1_exif(_oriented_exif(0xFFE1 - 10))) * 2
+            + _BASELINE_16[2:],
+            "not a valid image",
+            id="nested-soi-exif-flood",
+        ),
+        pytest.param(
             _png_with_chunks(
                 _png_chunk(b"eXIf", _oriented_exif(40_000)),
                 _png_chunk(b"eXIf", _oriented_exif(40_000)),
