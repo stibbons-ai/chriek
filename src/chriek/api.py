@@ -83,6 +83,11 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 # Text chunk keywords Pillow's PNG reader turns into EXIF (`getexif` decodes the second
 # from hex when no `exif` is present).
 _PNG_EXIF_TEXT_KEYWORDS = (b"exif", b"Raw profile type exif")
+# Pillow inflates every iCCP, zTXt and compressed iTXt chunk (each up to 1 MiB, its own
+# per-chunk ceiling) and reads every other chunk into memory, including after IDAT, so a
+# small PNG can repeat them far beyond its pixel cost. IDAT chunks are pixel data, not counted.
+MAX_PNG_CHUNKS = 256
+MAX_PNG_COMPRESSED_CHUNKS = 8
 # A marker outside entropy-coded data: optional 0xFF fill bytes, then the marker code.
 _JPEG_MARKER = re.compile(rb"\xff(\xff*+)([^\x00\xff])")
 # End of entropy-coded scan data: the next marker that is neither stuffing (FF00), fill
@@ -762,6 +767,17 @@ def _decode_reference_png(
             ),
             "input": None,
         }
+    except _PngTooComplex:
+        return None, {
+            "type": "value_error",
+            "loc": loc,
+            "msg": (
+                f"reference image {index} has too many PNG chunks (at most {MAX_PNG_CHUNKS} "
+                f"chunks other than IDAT, of them at most {MAX_PNG_COMPRESSED_CHUNKS} iCCP, "
+                "zTXt or compressed iTXt)"
+            ),
+            "input": None,
+        }
     except _ExifTooLarge:
         return None, {
             "type": "value_error",
@@ -795,6 +811,10 @@ class _JpegTooComplex(Exception):
     pass
 
 
+class _PngTooComplex(Exception):
+    pass
+
+
 class _ExifTooLarge(Exception):
     pass
 
@@ -808,7 +828,7 @@ def _check_before_decoding(data: bytes) -> None:
     if data.startswith(b"\xff\xd8\xff"):
         _check_jpeg_structure(data)
     elif data.startswith(_PNG_SIGNATURE):
-        _check_png_exif(data)
+        _check_png_structure(data)
     elif data.startswith(b"RIFF") and data.startswith(b"WEBP", 8):
         _check_webp_exif(data)
 
@@ -872,19 +892,30 @@ def _check_jpeg_structure(data: bytes) -> None:
             pos = scan_end.start()
 
 
-def _check_png_exif(data: bytes) -> None:
-    """Raise `_ExifTooLarge` when a PNG's EXIF payloads total more than `MAX_EXIF_BYTES`.
+def _check_png_structure(data: bytes) -> None:
+    """Walk PNG chunks up to IEND, inflating only EXIF text and only up to the EXIF budget.
 
-    Counts the data of every `eXIf` chunk up to IEND (Pillow keeps only the last one) and
-    the text of every tEXt, zTXt or iTXt chunk with an EXIF keyword, decompressed for
-    zTXt and compressed iTXt. A chunk cut off by the end of the file counts what is
-    there; the walk stops at it.
+    Raises `_PngTooComplex` above `MAX_PNG_CHUNKS` chunks other than IDAT or above
+    `MAX_PNG_COMPRESSED_CHUNKS` iCCP, zTXt or iTXt chunks with a nonzero compression flag
+    (counted whatever their keyword or text, as Pillow inflates them first), and
+    `_ExifTooLarge` when the EXIF payloads total more than `MAX_EXIF_BYTES`: the data of every
+    `eXIf` chunk (Pillow keeps only the last one) and the text of every tEXt, zTXt or iTXt
+    chunk with an EXIF keyword, decompressed for zTXt and compressed iTXt. A chunk cut off
+    by the end of the file counts what is there; the walk stops at it.
     """
-    pos, exif = len(_PNG_SIGNATURE), 0
+    pos, chunks, compressed, exif = len(_PNG_SIGNATURE), 0, 0, 0
     while pos + 8 <= len(data):
         start = pos + 8
         end = min(start + int.from_bytes(data[pos : pos + 4]), len(data))
         kind = data[pos + 4 : start]
+        if kind != b"IDAT":
+            chunks += 1
+            if kind in (b"iCCP", b"zTXt") or (
+                kind == b"iTXt" and _png_itxt_zipped(data, start, end)
+            ):
+                compressed += 1
+            if chunks > MAX_PNG_CHUNKS or compressed > MAX_PNG_COMPRESSED_CHUNKS:
+                raise _PngTooComplex
         if kind == b"eXIf":
             exif += end - start
         elif kind in (b"tEXt", b"zTXt", b"iTXt"):
@@ -894,6 +925,12 @@ def _check_png_exif(data: bytes) -> None:
         if kind == b"IEND":
             return
         pos = end + 4  # CRC
+
+
+def _png_itxt_zipped(data: bytes, start: int, end: int) -> bool:
+    """Whether an iTXt chunk's compression flag, the byte after its keyword, is nonzero."""
+    flag = data.find(b"\x00", start, end) + 1
+    return 0 < flag < end and data[flag] != 0
 
 
 def _png_exif_text_size(kind: bytes, data: bytes, start: int, end: int, budget: int) -> int:

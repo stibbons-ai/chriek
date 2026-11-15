@@ -30,7 +30,7 @@ from conftest import (
     wait_for,
 )
 from fastapi.testclient import TestClient
-from PIL import Image, ImageOps
+from PIL import Image, ImageCms, ImageOps, PngImagePlugin
 from sqlalchemy import event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
@@ -281,6 +281,31 @@ def test_references_change_fake_backend_output_deterministically_and_preserve_or
     )
     assert len({pixels_text, pixels_one, pixels_other, pixels_rb, pixels_br}) == 5
     assert pixels_red_square != pixels_blue_square
+
+
+def test_every_reference_position_changes_the_fake_backend_output(client):
+    """Only the middle reference differs, so first-only and last-only backends render alike."""
+    first, middle, other_middle, last = (
+        make_image_bytes(color, (16, 16))
+        for color in ((220, 20, 20), (20, 40, 220), (20, 200, 40), (200, 200, 20))
+    )
+    form = {"prompt": "character panel", "seed": "12", "width": "32", "height": "32"}
+    pixels = []
+    for refs in ((first, middle, last), (first, other_middle, last)):
+        job = wait_for(
+            client,
+            submit_multipart(
+                client,
+                data=form,
+                files=[
+                    ("references", (f"{i}.png", ref, "image/png")) for i, ref in enumerate(refs)
+                ],
+            )["id"],
+        )
+        assert job["status"] == "succeeded"
+        assert job["params"]["reference_count"] == 3
+        pixels.append(download_pixels(client, job))
+    assert pixels[0] != pixels[1]
 
 
 def test_every_render_receives_references_in_upload_order(tmp_path):
@@ -633,6 +658,35 @@ def test_reference_count_and_upload_byte_limits_are_configurable_and_enforced(tm
         assert any(
             "at most 0 reference images" in e["msg"] for e in one_ref_rejected.json()["detail"]
         )
+
+def test_json_and_multipart_body_caps_are_independent(tmp_path):
+    """JSON keeps the fixed 2 MiB cap whatever CHRIEK_MAX_UPLOAD_BYTES says, and vice versa."""
+    json_body = json.dumps({"prompt": "small cap", "width": 16, "height": 16}).encode()
+    json_body = json_body[:-1] + b" " * (4096 - len(json_body)) + b"}"
+    with running(tmp_path, CHRIEK_MAX_UPLOAD_BYTES="1024") as client:
+        response = client.post(
+            "/jobs", headers=ALICE | {"Content-Type": "application/json"}, content=json_body
+        )
+        assert response.status_code == 202, response.text
+        job = wait_for(client, response.json()["id"])
+        assert job["status"] == "succeeded"
+        assert job["params"]["prompt"] == "small cap"
+        download_pixels(client, job)
+
+    with running(tmp_path) as client:
+        _, body = encode_multipart(
+            FORM_16, files=[("references", ("big.png", _BIG_PNG, "image/png"))]
+        )
+        assert len(body) > 2 * 1024 * 1024
+        job = wait_for(
+            client,
+            submit_multipart(
+                client, data=FORM_16, files=[("references", ("big.png", _BIG_PNG, "image/png"))]
+            )["id"],
+        )
+        assert job["status"] == "succeeded"
+        assert job["params"]["reference_count"] == 1
+        download_pixels(client, job)
 
 
 def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_small_chunks(
@@ -1678,6 +1732,47 @@ def _raw_exif_profile_itxt(flag: int, text: bytes) -> bytes:
     )
 
 
+def _png_around_idat(before: bytes, after: bytes) -> bytes:
+    """Noise PNG with `before` inserted after IHDR and `after` between IDAT and IEND."""
+    png = _png_bytes(_noise_image((24, 16)))
+    return png[:33] + before + png[33:-12] + after + png[-12:]
+
+
+def _png_with_idat_chunks(png: bytes, size: int) -> bytes:
+    """`png` (IHDR, IDAT..., IEND only) re-split into `size`-byte IDAT chunks, as libpng does."""
+    pos, data = 33, b""
+    while png[pos + 4 : pos + 8] == b"IDAT":
+        length = int.from_bytes(png[pos : pos + 4])
+        data += png[pos + 8 : pos + 8 + length]
+        pos += 12 + length
+    assert png[pos:] == _png_chunk(b"IEND", b"")
+    chunks = (_png_chunk(b"IDAT", data[i : i + size]) for i in range(0, len(data), size))
+    return png[:33] + b"".join(chunks) + png[pos:]
+
+
+# 1024x1024 noise: over 2 MiB, at the default pixel limit, in more 8 KiB IDAT chunks than
+# MAX_PNG_CHUNKS.
+_BIG_PNG = _png_with_idat_chunks(_png_bytes(_noise_image((1024, 1024))), 8192)
+_PNG_PRIVATE = _png_chunk(b"prVt", b"")
+_PNG_ZTXT = _png_chunk(b"zTXt", b"k\x00\x00" + zlib.compress(b"text"))
+_PNG_ICCP = _png_chunk(b"iCCP", b"icc\x00\x00" + zlib.compress(b"\x00" * 128))
+# Nonzero compression flag, invalid UTF-8 text: Pillow inflates it, then drops it.
+_PNG_ITXT_ZIP = _png_chunk(b"iTXt", b"k\x00\x01\x00\x00\x00" + zlib.compress(b"\xff\xfe"))
+_PNG_ITXT_PLAIN = _png_chunk(b"iTXt", b"k\x00\x00\x00\x00\x00text")
+# IHDR and IEND count towards MAX_PNG_CHUNKS too.
+_PNG_SPARE_CHUNKS = chriek.api.MAX_PNG_CHUNKS - 2
+_PNG_MAX_COMPRESSED = chriek.api.MAX_PNG_COMPRESSED_CHUNKS
+
+
+def _ordinary_png_with_profile_and_text() -> bytes:
+    info = PngImagePlugin.PngInfo()
+    info.add_text("Title", "lighthouse")
+    info.add_text("Comment", "harbor at dusk", zip=True)
+    info.add_itxt("Description", "Leuchtturm", lang="de", zip=True)
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
+    return _png_bytes(_noise_image((24, 16)), icc_profile=profile, pnginfo=info)
+
+
 def _with_exif(fmt: str, exif: bytes) -> bytes:
     if fmt == "JPEG":
         return _jpeg_with_exif_segments(_noise_image((24, 16)), exif, parts=2)
@@ -1878,6 +1973,24 @@ _BASELINE_16 = _jpeg(_noise_image((16, 16)))
             "too much EXIF",
             id="webp-exif-inside-animation-frame",
         ),
+        *(
+            pytest.param(
+                _png_around_idat(chunk * _PNG_MAX_COMPRESSED, chunk),
+                "too many PNG chunks",
+                id=f"png-{chunk[4:8].decode()}-flood-ending-after-idat",
+            )
+            for chunk in (_PNG_ZTXT, _PNG_ICCP, _PNG_ITXT_ZIP)
+        ),
+        pytest.param(
+            _png_around_idat(_PNG_ZTXT * 3 + _PNG_ICCP * 3, _PNG_ITXT_ZIP * 3),
+            "too many PNG chunks",
+            id="png-mixed-compressed-flood",
+        ),
+        pytest.param(
+            _png_around_idat(_PNG_PRIVATE * 200, _PNG_PRIVATE * (_PNG_SPARE_CHUNKS - 199)),
+            "too many PNG chunks",
+            id="png-empty-chunk-flood-ending-after-idat",
+        ),
     ],
 )
 def test_costly_uploads_are_rejected_before_pillow_opens_them(
@@ -1910,6 +2023,20 @@ def test_costly_uploads_are_rejected_before_pillow_opens_them(
         pytest.param(
             _webp_with_chunks(_webp_chunk(b"EXIF", _ordinary_exif(1)), in_first_frame=True),
             id="webp-small-exif-inside-animation-frame",
+        ),
+        pytest.param(_ordinary_png_with_profile_and_text(), id="png-icc-profile-and-text"),
+        pytest.param(_BIG_PNG, id="png-many-8k-idat-chunks"),
+        pytest.param(
+            _png_around_idat(_PNG_PRIVATE * 200, _PNG_PRIVATE * (_PNG_SPARE_CHUNKS - 200)),
+            id="png-chunk-count-at-limit",
+        ),
+        pytest.param(
+            _png_around_idat(_PNG_ZTXT * 3 + _PNG_ICCP * 3, _PNG_ITXT_ZIP * 2),
+            id="png-compressed-count-at-limit",
+        ),
+        pytest.param(
+            _png_around_idat(_PNG_ITXT_PLAIN * _PNG_MAX_COMPRESSED, _PNG_ITXT_PLAIN),
+            id="png-uncompressed-itxt-not-counted",
         ),
     ],
 )
