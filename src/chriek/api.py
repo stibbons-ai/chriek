@@ -85,9 +85,12 @@ _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_EXIF_TEXT_KEYWORDS = (b"exif", b"Raw profile type exif")
 # Pillow inflates every iCCP, zTXt and compressed iTXt chunk (each up to 1 MiB, its own
 # per-chunk ceiling) and reads every other chunk into memory, including after IDAT, so a
-# small PNG can repeat them far beyond its pixel cost. IDAT chunks are pixel data, not counted.
+# small PNG can repeat them far beyond its pixel cost. IDAT chunks of at least
+# MIN_UNCOUNTED_IDAT_BYTES are pixel data, not counted; shorter ones (empty or split into
+# tiny pieces) cost per-chunk work without pixel data, so they count.
 MAX_PNG_CHUNKS = 256
 MAX_PNG_COMPRESSED_CHUNKS = 8
+MIN_UNCOUNTED_IDAT_BYTES = 1024
 # A marker outside entropy-coded data: optional 0xFF fill bytes, then the marker code.
 _JPEG_MARKER = re.compile(rb"\xff(\xff*+)([^\x00\xff])")
 # End of entropy-coded scan data: the next marker that is neither stuffing (FF00), fill
@@ -773,8 +776,8 @@ def _decode_reference_png(
             "loc": loc,
             "msg": (
                 f"reference image {index} has too many PNG chunks (at most {MAX_PNG_CHUNKS} "
-                f"chunks other than IDAT, of them at most {MAX_PNG_COMPRESSED_CHUNKS} iCCP, "
-                "zTXt or compressed iTXt)"
+                f"chunks other than IDAT chunks of at least {MIN_UNCOUNTED_IDAT_BYTES} bytes, "
+                f"of them at most {MAX_PNG_COMPRESSED_CHUNKS} iCCP, zTXt or compressed iTXt)"
             ),
             "input": None,
         }
@@ -895,9 +898,10 @@ def _check_jpeg_structure(data: bytes) -> None:
 def _check_png_structure(data: bytes) -> None:
     """Walk PNG chunks up to IEND, inflating only EXIF text and only up to the EXIF budget.
 
-    Raises `_PngTooComplex` above `MAX_PNG_CHUNKS` chunks other than IDAT or above
-    `MAX_PNG_COMPRESSED_CHUNKS` iCCP, zTXt or iTXt chunks with a nonzero compression flag
-    (counted whatever their keyword or text, as Pillow inflates them first), and
+    Raises `_PngTooComplex` above `MAX_PNG_CHUNKS` chunks other than IDAT chunks of at least
+    `MIN_UNCOUNTED_IDAT_BYTES` bytes, or above `MAX_PNG_COMPRESSED_CHUNKS` iCCP, zTXt or
+    iTXt chunks with a nonzero compression flag (counted whatever their keyword or text, as
+    Pillow inflates them first), and
     `_ExifTooLarge` when the EXIF payloads total more than `MAX_EXIF_BYTES`: the data of every
     `eXIf` chunk (Pillow keeps only the last one) and the text of every tEXt, zTXt or iTXt
     chunk with an EXIF keyword, decompressed for zTXt and compressed iTXt. A chunk cut off
@@ -908,7 +912,7 @@ def _check_png_structure(data: bytes) -> None:
         start = pos + 8
         end = min(start + int.from_bytes(data[pos : pos + 4]), len(data))
         kind = data[pos + 4 : start]
-        if kind != b"IDAT":
+        if kind != b"IDAT" or end - start < MIN_UNCOUNTED_IDAT_BYTES:
             chunks += 1
             if kind in (b"iCCP", b"zTXt") or (
                 kind == b"iTXt" and _png_itxt_zipped(data, start, end)

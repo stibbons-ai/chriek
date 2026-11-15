@@ -1760,9 +1760,12 @@ _PNG_ICCP = _png_chunk(b"iCCP", b"icc\x00\x00" + zlib.compress(b"\x00" * 128))
 # Nonzero compression flag, invalid UTF-8 text: Pillow inflates it, then drops it.
 _PNG_ITXT_ZIP = _png_chunk(b"iTXt", b"k\x00\x01\x00\x00\x00" + zlib.compress(b"\xff\xfe"))
 _PNG_ITXT_PLAIN = _png_chunk(b"iTXt", b"k\x00\x00\x00\x00\x00text")
+_PNG_EMPTY_IDAT = _png_chunk(b"IDAT", b"")
 # IHDR and IEND count towards MAX_PNG_CHUNKS too.
 _PNG_SPARE_CHUNKS = chriek.api.MAX_PNG_CHUNKS - 2
 _PNG_MAX_COMPRESSED = chriek.api.MAX_PNG_COMPRESSED_CHUNKS
+# Fixed, not derived from MAX_PNG_CHUNKS, so a loosened budget fails the tests.
+_PNG_FLOOD = 1000
 
 
 def _ordinary_png_with_profile_and_text() -> bytes:
@@ -1992,6 +1995,31 @@ _BASELINE_16 = _jpeg(_noise_image((16, 16)))
             "too many PNG chunks",
             id="png-empty-chunk-flood-ending-after-idat",
         ),
+        pytest.param(
+            _png_around_idat(_PNG_EMPTY_IDAT * _PNG_FLOOD, b""),
+            "too many PNG chunks",
+            id="png-empty-idat-flood-before-data",
+        ),
+        pytest.param(
+            _png_around_idat(b"", _PNG_EMPTY_IDAT * _PNG_FLOOD),
+            "too many PNG chunks",
+            id="png-empty-idat-flood-after-data",
+        ),
+        pytest.param(
+            _png_with_idat_chunks(_png_bytes(_noise_image((24, 16))), 1),
+            "too many PNG chunks",
+            id="png-one-byte-idat-chunks",
+        ),
+        pytest.param(
+            _png_around_idat(_PNG_PRIVATE * 100, _PNG_EMPTY_IDAT * (_PNG_SPARE_CHUNKS - 99)),
+            "too many PNG chunks",
+            id="png-short-idat-shares-chunk-budget",
+        ),
+        pytest.param(
+            _png_with_idat_chunks(_BIG_PNG, chriek.api.MIN_UNCOUNTED_IDAT_BYTES - 1),
+            "too many PNG chunks",
+            id="png-idat-chunks-just-below-floor",
+        ),
     ],
 )
 def test_costly_uploads_are_rejected_before_pillow_opens_them(
@@ -2027,6 +2055,14 @@ def test_costly_uploads_are_rejected_before_pillow_opens_them(
         ),
         pytest.param(_ordinary_png_with_profile_and_text(), id="png-icc-profile-and-text"),
         pytest.param(_BIG_PNG, id="png-many-8k-idat-chunks"),
+        pytest.param(
+            _png_with_idat_chunks(_BIG_PNG, chriek.api.MIN_UNCOUNTED_IDAT_BYTES),
+            id="png-many-idat-chunks-at-floor",
+        ),
+        pytest.param(
+            _png_around_idat(_PNG_PRIVATE * 100, _PNG_EMPTY_IDAT * (_PNG_SPARE_CHUNKS - 100)),
+            id="png-short-idat-at-chunk-budget",
+        ),
         pytest.param(
             _png_around_idat(_PNG_PRIVATE * 200, _PNG_PRIVATE * (_PNG_SPARE_CHUNKS - 200)),
             id="png-chunk-count-at-limit",
