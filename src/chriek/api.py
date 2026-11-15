@@ -21,7 +21,8 @@ from chriek.auth import ApiKeyAuth
 from chriek.backend import FakeBackend, ImageBackend
 from chriek.config import Limits, Settings
 from chriek.signing import UrlSigner
-from chriek.store import SUCCEEDED, Job, JobStore
+from chriek.storage import check_database, private_image_root
+from chriek.store import MEMORY_DATABASE, SUCCEEDED, Job, JobStore
 from chriek.worker import Worker, image_path
 
 MAX_SEED = 2**32 - 1
@@ -68,16 +69,24 @@ def create_app(
     clock: Callable[[], float] = time.time,
 ) -> FastAPI:
     """Build the home-mode app. `backend` and `clock` are test seams; `chriek serve` omits them."""
-    storage_dir = settings.storage_dir.resolve()
+    # Both storage sides are checked before either is created: the database side here without
+    # creating anything, then the image side by private_image_root. JobStore and Worker check
+    # their own side again, so they stay safe when used without the app.
+    if str(settings.db_path) != MEMORY_DATABASE:
+        check_database(settings.db_path)
+    storage_dir = private_image_root(settings.storage_dir)
     store = JobStore(settings.db_path)
-    worker = Worker(store, backend or FakeBackend(), storage_dir, clock)
+    try:
+        worker = Worker(store, backend or FakeBackend(), storage_dir, clock)
+    except BaseException:
+        store.close()
+        raise
     signer = UrlSigner(settings.signing_secret)
     jobs = APIRouter(route_class=_authenticated_route(ApiKeyAuth(settings.api_keys)))
     Owner = Annotated[str, Depends(_owner)]
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        storage_dir.mkdir(parents=True, exist_ok=True)
         store.fail_interrupted(clock())
         worker.start()
         yield

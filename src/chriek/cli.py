@@ -9,6 +9,7 @@ import uvicorn
 
 from chriek.api import create_app
 from chriek.config import ConfigError, Settings
+from chriek.storage import StorageError
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -25,6 +26,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"chriek: configuration error: {error}", file=sys.stderr)
         return 2
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    try:
+        app = create_app(settings)
+    except StorageError as error:
+        print(f"chriek: storage error: {error}", file=sys.stderr)
+        return 2
     # No access log: download URLs carry their signature, a bearer credential until expiry.
-    uvicorn.run(create_app(settings), host=settings.host, port=settings.port, access_log=False)
+    uvicorn.run(app, host=settings.host, port=settings.port, access_log=False)
     return 0
