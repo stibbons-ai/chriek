@@ -1,14 +1,16 @@
-"""Shared HTTP test helpers. Tests talk to chriek through its HTTP API and CLI, plus the direct
-store, worker and app entry points where storage privacy must hold without the CLI."""
+"""Shared test helpers. Most tests talk to chriek through its HTTP API or the installed CLI;
+others check configuration, the store, the worker or the SQLite file directly, including where
+storage privacy must hold without the CLI (see README.md)."""
 
 import os
 import sqlite3
 import stat
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -28,6 +30,7 @@ BACKEND_SECRET = (
     "injected backend failure at /srv/secret-weights/model.bin "
     "token=hf_SENTINEL0123 https://user:p4ss@example.invalid/x?sig=SENTINEL"
 )
+SMALL = {"width": 16, "height": 16}  # cheapest valid image size
 
 
 def base_env(tmp_path: Path) -> dict[str, str]:
@@ -66,6 +69,20 @@ def tree_state(root: Path) -> dict[str, tuple]:
             content = path.read_bytes() if stat.S_ISREG(info.st_mode) else None
         state[str(path.relative_to(root))] = (info.st_mode, info.st_uid, content)
     return state
+
+
+def proxy_env(tmp_path: Path) -> dict[str, str]:
+    """Proxy mode as an operator configures it: no API keys at all. TestClient sends
+    `Host: testserver`, so it is allowed here explicitly; it is no production default."""
+    env = base_env(tmp_path) | {"CHRIEK_AUTH_MODE": "proxy", "CHRIEK_ALLOWED_HOSTS": "testserver"}
+    del env["CHRIEK_API_KEYS"]
+    return env
+
+
+def stored_owners(tmp_path: Path) -> list[str]:
+    """Owner of every stored job, oldest first, read from the SQLite file."""
+    with connect_db(tmp_path) as db:
+        return [row[0] for row in db.execute("SELECT owner FROM jobs ORDER BY seq")]
 
 
 class FakeClock:
@@ -146,9 +163,42 @@ class CountingBackend(FakeBackend):
         return super().render(prompt, width, height, seed)
 
 
+class StepBackend(FakeBackend):
+    """Fake backend whose renders each wait for one `step()`; `wait_started(n)` blocks until
+    `n` renders have begun. Several apps may share one instance."""
+
+    def __init__(self) -> None:
+        self._steps = threading.Semaphore(0)
+        self._started = threading.Condition()
+        self.prompts: list[str] = []
+
+    def step(self, renders: int = 1) -> None:
+        self._steps.release(renders)
+
+    def wait_started(self, renders: int) -> None:
+        with self._started:
+            assert self._started.wait_for(lambda: len(self.prompts) >= renders, 10), (
+                f"only {len(self.prompts)} of {renders} renders started"
+            )
+
+    def render(self, prompt, width, height, seed):
+        with self._started:
+            self.prompts.append(prompt)
+            self._started.notify_all()
+        assert self._steps.acquire(timeout=10), "render step never released"
+        return super().render(prompt, width, height, seed)
+
+
 @contextmanager
-def running(tmp_path: Path, *, backend=None, clock=None, **env: str) -> Iterator[TestClient]:
-    settings = Settings.from_env(base_env(tmp_path) | env)
+def running(
+    tmp_path: Path,
+    *,
+    backend=None,
+    clock=None,
+    env_base: Callable[[Path], dict[str, str]] = base_env,
+    **env: str,
+) -> Iterator[TestClient]:
+    settings = Settings.from_env(env_base(tmp_path) | env)
     app = create_app(settings, backend=backend or FakeBackend(), clock=clock or time.time)
     with TestClient(app) as client:
         yield client
@@ -164,8 +214,12 @@ def wait_for(client: TestClient, job_id: str, statuses=TERMINAL, headers=ALICE) 
     raise AssertionError(f"job {job_id} never reached {statuses}")
 
 
+def post_job(client: TestClient, prompt: str = "a lighthouse", headers=ALICE, **fields):
+    return client.post("/jobs", headers=headers, json={"prompt": prompt} | fields)
+
+
 def submit(client: TestClient, headers=ALICE, **fields) -> dict:
-    response = client.post("/jobs", headers=headers, json={"prompt": "a lighthouse"} | fields)
+    response = post_job(client, headers=headers, **fields)
     assert response.status_code == 202, response.text
     return response.json()
 
@@ -175,6 +229,12 @@ def assert_nothing_queued(client: TestClient, backend: CountingBackend) -> None:
     valid = submit(client, width=16, height=16)
     assert wait_for(client, valid["id"])["status"] == "succeeded"
     assert backend.renders == 1
+
+
+def with_query(url: str, **changes: str) -> str:
+    parts = urlsplit(url)
+    query = {key: values[0] for key, values in parse_qs(parts.query).items()} | changes
+    return parts._replace(query=urlencode(query)).geturl()
 
 
 @pytest.fixture

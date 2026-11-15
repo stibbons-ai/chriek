@@ -1,10 +1,33 @@
-"""API-key authentication: `Authorization: Bearer <key>` resolves to the key's owner name."""
+"""Request authentication: resolves every /jobs request to the name of a job owner.
+
+`api-key` mode: `Authorization: Bearer <key>` resolves to the key's owner name.
+`proxy` mode: a trusted reverse proxy has already authenticated the client; every request
+resolves to one shared owner, whatever headers it carries.
+"""
 
 import hashlib
 import hmac
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
 from fastapi import HTTPException, Request, status
+
+from chriek.config import AuthMode
+
+# The ':' can't occur in an API key name, so proxy-mode jobs never share an owner with
+# api-key-mode jobs in the same database.
+PROXY_OWNER = "proxy:shared"
+
+Authenticate = Callable[[Request], str]
+
+
+def authenticator(auth_mode: AuthMode, api_keys: Mapping[str, str]) -> Authenticate:
+    if auth_mode is AuthMode.PROXY:
+        return _proxy_owner
+    return ApiKeyAuth(api_keys)
+
+
+def _proxy_owner(_request: Request) -> str:
+    return PROXY_OWNER
 
 
 def _digest(value: str) -> bytes:

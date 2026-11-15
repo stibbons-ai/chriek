@@ -50,7 +50,9 @@ def watch(event, args):
 sys.addaudithook(watch)
 
 store = JobStore(db_path)
-job = store.create(owner="alice", prompt="p", image_count=2, width=16, height=16, seed=0, now=0.0)
+job = store.create(
+    owner="alice", prompt="p", image_count=2, width=16, height=16, seed=0, now=0.0, max_queued=9
+)
 backend = PausingBackend()
 worker = Worker(store, backend, root / "data" / "images", time.time)
 worker.start()
@@ -66,7 +68,9 @@ seen["done"] = modes(root)
 store.close()  # the last connection removes the WAL and SHM sidecars
 seen["closed"] = modes(root)
 store = JobStore(db_path)
-store.create(owner="alice", prompt="q", image_count=1, width=16, height=16, seed=0, now=1.0)
+store.create(
+    owner="alice", prompt="q", image_count=1, width=16, height=16, seed=0, now=1.0, max_queued=9
+)
 seen["reopened"] = modes(root)
 store.close()
 print(json.dumps(seen | {"exposed": sorted(exposed)}))
@@ -526,7 +530,9 @@ from chriek.worker import Worker
 
 root = Path(sys.argv[1])
 store = JobStore(root / "alias" / ".." / "db" / "chriek.db")
-job = store.create(owner="alice", prompt="p", image_count=1, width=16, height=16, seed=0, now=0.0)
+job = store.create(
+    owner="alice", prompt="p", image_count=1, width=16, height=16, seed=0, now=0.0, max_queued=9
+)
 worker = Worker(store, FakeBackend(), root / "alias" / ".." / "images", time.time)
 worker.start()
 deadline = time.monotonic() + 10

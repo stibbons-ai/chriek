@@ -1,9 +1,12 @@
 """Environment-variable configuration. Every name and default is documented in README.md."""
 
 import ipaddress
+import os
 import re
+import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -22,9 +25,41 @@ PUBLIC_URL_FORM = (
     "1-65535 and an optional path prefix"
 )
 
+# Every supported CHRIEK_* name; any other name with that prefix stops startup.
+SETTING_NAMES = frozenset(
+    {
+        "CHRIEK_ALLOWED_HOSTS",
+        "CHRIEK_API_KEYS",
+        "CHRIEK_AUTH_MODE",
+        "CHRIEK_DB_PATH",
+        "CHRIEK_HOST",
+        "CHRIEK_MAX_DIMENSION",
+        "CHRIEK_MAX_IMAGES",
+        "CHRIEK_MAX_PIXELS",
+        "CHRIEK_MAX_PROMPT_CHARS",
+        "CHRIEK_MAX_QUEUED_JOBS",
+        "CHRIEK_PORT",
+        "CHRIEK_PUBLIC_URL",
+        "CHRIEK_SIGNING_SECRET",
+        "CHRIEK_STORAGE_DIR",
+        "CHRIEK_TLS_CERTFILE",
+        "CHRIEK_TLS_KEYFILE",
+        "CHRIEK_URL_TTL_SECONDS",
+    }
+)
+DEFAULT_ALLOWED_HOSTS = "localhost,127.0.0.1,[::1]"
+_LABEL = r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?"
+HOSTNAME_PATTERN = re.compile(rf"{_LABEL}(?:\.{_LABEL})*")  # IPv4 addresses match too
+BRACKETED_IPV6_PATTERN = re.compile(r"\[([0-9a-f:.]+)\]")
+
 
 class ConfigError(ValueError):
     """Invalid configuration. Messages never contain secret values."""
+
+
+class AuthMode(StrEnum):
+    API_KEY = "api-key"  # chriek checks named static keys; each key owns its jobs
+    PROXY = "proxy"  # a trusted reverse proxy authenticates; all clients share one owner
 
 
 @dataclass(frozen=True)
@@ -33,6 +68,13 @@ class Limits:
     max_dimension: int = 2048
     max_pixels: int = 1024 * 1024
     max_prompt_chars: int = 2000
+    max_queued_jobs: int = 100  # per owner; running and finished jobs don't count
+
+
+@dataclass(frozen=True)
+class Tls:
+    certfile: Path
+    keyfile: Path
 
 
 @dataclass(frozen=True)
@@ -40,15 +82,23 @@ class Settings:
     db_path: Path
     public_url: str  # scheme://authority[/prefix], no trailing slash
     storage_dir: Path
-    api_keys: Mapping[str, str]  # owner name -> key
+    auth_mode: AuthMode
+    api_keys: Mapping[str, str]  # owner name -> key; empty in proxy mode
     signing_secret: str
     url_ttl_seconds: int
     limits: Limits
     host: str
     port: int
+    tls: Tls | None  # None serves plain HTTP
+    allowed_hosts: tuple[str, ...]  # proxy mode's accepted Host names; empty in api-key mode
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Settings:
+        unknown = sorted(
+            name for name in env if name.upper().startswith("CHRIEK_") and name not in SETTING_NAMES
+        )
+        if unknown:
+            raise ConfigError(f"unknown setting {', '.join(unknown)}; see README.md for names")
         limits = Limits(
             max_images=_int(env, "CHRIEK_MAX_IMAGES", Limits.max_images, 1, 64),
             max_dimension=_int(env, "CHRIEK_MAX_DIMENSION", Limits.max_dimension, 16, 8192),
@@ -56,10 +106,16 @@ class Settings:
             max_prompt_chars=_int(
                 env, "CHRIEK_MAX_PROMPT_CHARS", Limits.max_prompt_chars, 1, 100_000
             ),
+            max_queued_jobs=_int(env, "CHRIEK_MAX_QUEUED_JOBS", Limits.max_queued_jobs, 1, 100_000),
         )
         if limits.max_dimension % 16:
             raise ConfigError("CHRIEK_MAX_DIMENSION must be a multiple of 16")
-        api_keys = _api_keys(env.get("CHRIEK_API_KEYS", ""))
+        auth_mode = _auth_mode(env.get("CHRIEK_AUTH_MODE", AuthMode.API_KEY))
+        if auth_mode is AuthMode.API_KEY and "CHRIEK_ALLOWED_HOSTS" in env:
+            # Host checking runs only in proxy mode; refusing it here keeps it from looking active.
+            raise ConfigError("CHRIEK_ALLOWED_HOSTS applies only when CHRIEK_AUTH_MODE is 'proxy'")
+        raw_keys = env.get("CHRIEK_API_KEYS", "")
+        api_keys = _no_api_keys(raw_keys) if auth_mode is AuthMode.PROXY else _api_keys(raw_keys)
         signing_secret = _signing_secret(env.get("CHRIEK_SIGNING_SECRET", ""))
         if signing_secret in api_keys or signing_secret in api_keys.values():
             raise ConfigError(
@@ -69,12 +125,19 @@ class Settings:
             public_url=_public_url(env.get("CHRIEK_PUBLIC_URL", "")),
             db_path=Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db")),
             storage_dir=Path(env.get("CHRIEK_STORAGE_DIR", "chriek-data/images")),
+            auth_mode=auth_mode,
             api_keys=api_keys,
             signing_secret=signing_secret,
             url_ttl_seconds=_int(env, "CHRIEK_URL_TTL_SECONDS", 900, 1, 7 * 24 * 3600),
             limits=limits,
             host=env.get("CHRIEK_HOST", "127.0.0.1"),
             port=_int(env, "CHRIEK_PORT", 8000, 1, 65535),
+            tls=_tls(env),
+            allowed_hosts=(
+                _allowed_hosts(env.get("CHRIEK_ALLOWED_HOSTS", DEFAULT_ALLOWED_HOSTS))
+                if auth_mode is AuthMode.PROXY
+                else ()
+            ),
         )
 
 
@@ -91,9 +154,24 @@ def _int(env: Mapping[str, str], name: str, default: int, low: int, high: int) -
     return value
 
 
+def _auth_mode(raw: str) -> AuthMode:
+    try:
+        return AuthMode(raw)
+    except ValueError:
+        raise ConfigError("CHRIEK_AUTH_MODE must be 'api-key' or 'proxy'") from None
+
+
+def _no_api_keys(raw: str) -> dict[str, str]:
+    # Proxy mode never checks keys; refusing them keeps operators from relying on them.
+    if raw.strip():
+        raise ConfigError("CHRIEK_API_KEYS must be unset or empty when CHRIEK_AUTH_MODE is 'proxy'")
+    return {}
+
+
 def _api_keys(raw: str) -> dict[str, str]:
     """Parse `name:key,name:key`. Names identify job owners; keys are secrets."""
     keys: dict[str, str] = {}
+    # Diagnostics cite entry positions only: a reversed key:name puts a secret in the name.
     for position, entry in enumerate(raw.split(","), start=1):
         entry = entry.strip()
         if not entry:
@@ -163,3 +241,69 @@ def _public_url(raw: str) -> str:
     if "\\" in parts.path or "." in segments or ".." in segments:
         raise ConfigError(PUBLIC_URL_FORM)
     return raw.rstrip("/")
+
+
+def _tls(env: Mapping[str, str]) -> Tls | None:
+    """Both files or neither. A variable that is set counts even when empty, so an unset
+    shell variable expanded into it stops startup instead of silently serving plain HTTP."""
+    certfile, keyfile = env.get("CHRIEK_TLS_CERTFILE"), env.get("CHRIEK_TLS_KEYFILE")
+    if certfile is None and keyfile is None:
+        return None
+    if certfile is None or keyfile is None:
+        raise ConfigError("CHRIEK_TLS_CERTFILE and CHRIEK_TLS_KEYFILE must be set together")
+    if not certfile:
+        raise ConfigError("CHRIEK_TLS_CERTFILE must not be empty")
+    if not keyfile:
+        raise ConfigError("CHRIEK_TLS_KEYFILE must not be empty")
+    tls = Tls(certfile=Path(certfile), keyfile=Path(keyfile))
+    # Diagnostics only, naming the bad variable but not its value, which may be pasted key
+    # material: the pair load below stays authoritative.
+    for name, path in (("CHRIEK_TLS_CERTFILE", tls.certfile), ("CHRIEK_TLS_KEYFILE", tls.keyfile)):
+        if not path.is_file() or not os.access(path, os.R_OK):
+            raise ConfigError(
+                f"{name} must name a readable file; the configured path is missing, "
+                "not a regular file or unreadable"
+            )
+    try:
+        # Loading the pair here turns a bad file into a configuration error before the
+        # database or port opens. The callback rejects encrypted keys instead of prompting.
+        # A bare server context, like uvicorn's: create_default_context would also open
+        # SSLKEYLOGFILE and blame its failure on the certificate pair.
+        ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(
+            tls.certfile, tls.keyfile, password=_reject_encrypted_key
+        )
+    except OSError as error:  # ssl.SSLError is an OSError
+        raise ConfigError(
+            "CHRIEK_TLS_CERTFILE and CHRIEK_TLS_KEYFILE must name a readable PEM certificate "
+            f"and its unencrypted private key: {error}"
+        ) from None
+    return tls
+
+
+def _allowed_hosts(raw: str) -> tuple[str, ...]:
+    """Parse exact host names and IP addresses, IPv6 in brackets as in a Host header."""
+    hosts = []
+    for position, entry in enumerate(raw.split(","), start=1):
+        host = entry.strip().lower()
+        if not _is_valid_host(host):
+            raise ConfigError(
+                f"CHRIEK_ALLOWED_HOSTS entry {position} must be a host name, an IPv4 address or "
+                "a bracketed IPv6 address, without wildcard, scheme, port or path"
+            )
+        hosts.append(host)
+    return tuple(hosts)
+
+
+def _is_valid_host(host: str) -> bool:
+    ipv6 = BRACKETED_IPV6_PATTERN.fullmatch(host)  # no zone IDs, which Host can't carry
+    if ipv6 is None:
+        return HOSTNAME_PATTERN.fullmatch(host) is not None
+    try:
+        ipaddress.IPv6Address(ipv6[1])
+    except ValueError:
+        return False
+    return True
+
+
+def _reject_encrypted_key() -> str:
+    raise ConfigError("CHRIEK_TLS_KEYFILE must be an unencrypted private key")

@@ -1,4 +1,4 @@
-"""HTTP API: job submission and polling (API key required), signed image downloads (no key)."""
+"""HTTP API: job submission and polling (authenticated), signed image downloads (no key)."""
 
 import json
 import re
@@ -12,14 +12,15 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
 from starlette.types import Message
 
-from chriek.auth import ApiKeyAuth
+from chriek.auth import Authenticate, authenticator
 from chriek.backend import FakeBackend, ImageBackend
-from chriek.config import Limits, Settings
+from chriek.config import AuthMode, Limits, Settings
 from chriek.signing import UrlSigner
 from chriek.storage import check_database, private_image_root
 from chriek.store import MEMORY_DATABASE, SUCCEEDED, Job, JobStore
@@ -82,7 +83,9 @@ def create_app(
         store.close()
         raise
     signer = UrlSigner(settings.signing_secret)
-    jobs = APIRouter(route_class=_authenticated_route(ApiKeyAuth(settings.api_keys)))
+    jobs = APIRouter(
+        route_class=_authenticated_route(authenticator(settings.auth_mode, settings.api_keys))
+    )
     Owner = Annotated[str, Depends(_owner)]
 
     @asynccontextmanager
@@ -94,6 +97,12 @@ def create_app(
         store.close()
 
     app = FastAPI(title="chriek", lifespan=lifespan)
+    if settings.auth_mode is AuthMode.PROXY:
+        # Proxy mode only: with no authentication, a Host check is what stops DNS rebinding
+        # from letting a browser page drive chriek. Missing or malformed Host also gets 400.
+        app.add_middleware(
+            TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts, www_redirect=False
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> Response:
@@ -162,7 +171,14 @@ def create_app(
             height=body.height,
             seed=seed,
             now=clock(),
+            max_queued=settings.limits.max_queued_jobs,
         )
+        if job is None:
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                f"queue full: at most {settings.limits.max_queued_jobs} queued jobs per owner; "
+                "new jobs are accepted only while fewer are queued",
+            )
         worker.notify()
         response.headers["Location"] = f"/jobs/{job.id}"
         return job_body(job)
@@ -198,7 +214,7 @@ def create_app(
     return app
 
 
-def _authenticated_route(authenticate: ApiKeyAuth) -> type[APIRoute]:
+def _authenticated_route(authenticate: Authenticate) -> type[APIRoute]:
     """Route class that authenticates, then caps the body, before FastAPI reads or parses it.
 
     FastAPI parses the request body before running dependencies, so a key check as a
