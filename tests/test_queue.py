@@ -213,9 +213,12 @@ def test_unsaved_job_result_stops_the_worker_and_rejects_jobs_until_restart(
     backend = FailingBackend(fail_index=0) if first_render_fails else CountingBackend()
     job = {"prompt": "rejected", "width": 16, "height": 16}
 
-    with running(tmp_path, backend=backend) as before:
+    # Cap 1: once the first job runs, alice's queued second job fills her queue; bob's stays empty.
+    with running(tmp_path, backend=backend, CHRIEK_MAX_QUEUED_JOBS="1") as before:
         first = submit(before, prompt="first", width=16, height=16)
+        wait_for(before, first["id"], statuses={"running"})
         second = submit(before, prompt="second", width=16, height=16)
+        assert before.post("/jobs", headers=ALICE, json=job).status_code == 429
         second_queued.set()
 
         deadline = time.monotonic() + 10
@@ -229,7 +232,8 @@ def test_unsaved_job_result_stops_the_worker_and_rejects_jobs_until_restart(
         assert status(before, second["id"]) == "queued"
         persisted, notified = db_dump(tmp_path), len(notifies)
 
-        # Act/assert: valid submissions from any owner are refused with nothing stored.
+        # Act/assert: valid submissions from any owner, full queue or not, are refused with
+        # nothing stored; a stopped worker's 503 takes precedence over a full queue's 429.
         for headers in (ALICE, BOB):
             rejected = before.post("/jobs", headers=headers, json=job)
             assert rejected.status_code == 503
