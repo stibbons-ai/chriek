@@ -70,8 +70,17 @@ CONTROL_KEY = ALICE_KEY + "\x07"
 MARKER = "public-url-secret-marker"
 URL_FORM = "CHRIEK_PUBLIC_URL must be an absolute http or https URL"
 PRINTABLE = "CHRIEK_PUBLIC_URL must contain only printable ASCII"
-# Password, host and database fragments a URL with a second raw `@` would expose.
-AT_FRAGMENTS = ("S3cr", "tTail-9999", "Pa55frag", "MidSecret", "TailSecret", "SECa", "SECb")
+# Password, host and database fragments a misplaced raw `@` would expose.
+AT_FRAGMENTS = (
+    "S3cr",
+    "tTail-9999",
+    "Pa55frag",
+    "MidSecret",
+    "TailSecret",
+    "SECa",
+    "SECb",
+    "Zq9pw-Secret",
+)
 AT_ERROR = "CHRIEK_DATABASE_URL must percent-encode every @ as %40, except the one before the host"
 CONNINFO_ERROR = "CHRIEK_DATABASE_URL must not contain NUL characters (also as %00) or raw invalid"
 
@@ -269,6 +278,9 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
                 "postgresql://chriek:SECa@[SECb]@h.invalid/db",
                 # A reachable host would print the rest as a database name.
                 "postgresql://chriek:Pa55frag@127.0.0.1:1/TailSecret@db.invalid/chriek",
+                # A lone `@` the parser cannot place leaves the credentials in the database name.
+                "postgresql:///chriek:Zq9pw-Secret@db.invalid/chriek",
+                "postgresql://127.0.0.1/iek:Zq9pw-Secret@db.invalid/chriek",
             )
         ),
         # %00 would truncate libpq's connection settings; \udcff is an undecodable 0xff byte.
