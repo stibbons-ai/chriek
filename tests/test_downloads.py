@@ -4,7 +4,17 @@ import io
 import xml.etree.ElementTree as ET
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from conftest import ALICE, BOB, SIGNING_SECRET, FakeClock, running, submit, wait_for
+import pytest
+from conftest import (
+    ALICE,
+    BOB,
+    SIGNING_SECRET,
+    FakeClock,
+    connect_db,
+    running,
+    submit,
+    wait_for,
+)
 from PIL import Image
 
 TRAINED_ALGORITHMIC_MEDIA = "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
@@ -23,6 +33,52 @@ def with_query(url, **changes):
     return parts._replace(query=urlencode(query)).geturl()
 
 
+# Request origins a client or a misconfigured proxy could present; none may reach the links.
+HOSTILE_ORIGINS = [
+    ("http://testserver", {"Host": "evil.example"}),
+    (
+        "http://testserver",
+        {
+            "X-Forwarded-Host": "evil.example",
+            "X-Forwarded-Proto": "http",
+            "X-Forwarded-Port": "8080",
+            "X-Forwarded-Prefix": "/evil",
+        },
+    ),
+    ("http://testserver", {"Forwarded": "for=192.0.2.1;host=evil.example;proto=http"}),
+    ("https://evil.example:8443", {}),
+]
+
+
+@pytest.mark.parametrize(
+    ("public_url", "origin"),
+    [
+        ("https://images.example", "https://images.example"),
+        ("https://images.example/", "https://images.example"),
+        ("https://images.example/chriek", "https://images.example/chriek"),
+        ("https://images.example/chriek/", "https://images.example/chriek"),
+        ("https://images.example/chriek//", "https://images.example/chriek"),
+        ("https://192.0.2.10:8443/chriek/", "https://192.0.2.10:8443/chriek"),
+        ("http://192.0.2.10:1", "http://192.0.2.10:1"),
+        ("https://images.example:65535/", "https://images.example:65535"),
+        ("https://[2001:db8::1]:8443/v%2E1/", "https://[2001:db8::1]:8443/v%2E1"),
+        ("HTTPS://Images.Example.:443///", "HTTPS://Images.Example.:443"),
+    ],
+)
+def test_links_use_only_the_configured_public_url(tmp_path, public_url, origin):
+    with running(tmp_path, CHRIEK_PUBLIC_URL=public_url) as client:
+        job_id = finished_job(client)["id"]
+        for base, headers in HOSTILE_ORIGINS:
+            response = client.get(f"{base}/jobs/{job_id}", headers=ALICE | headers)
+            url = response.json()["images"][0]["url"]
+
+            assert url.startswith(f"{origin}/images/{job_id}/0.png?expires="), url
+            # The operator's proxy maps the public origin to chriek, stripping any prefix.
+            download = client.get(url.removeprefix(origin))
+            assert download.status_code == 200
+            assert Image.open(io.BytesIO(download.content)).size == (32, 16)
+
+
 def test_download_needs_no_api_key_and_returns_the_png(client):
     image = finished_job(client, seed=9)["images"][0]
 
@@ -34,6 +90,14 @@ def test_download_needs_no_api_key_and_returns_the_png(client):
     png = Image.open(io.BytesIO(response.content))
     assert png.format == "PNG"
     assert png.size == (32, 16)
+
+
+def test_validly_signed_url_of_an_unpublished_image_is_404(tmp_path):
+    with running(tmp_path) as client:
+        url = finished_job(client)["images"][0]["url"]
+        with connect_db(tmp_path) as db, db:
+            db.execute("DELETE FROM images")  # the PNG stays on disk, signed and unexpired
+        assert client.get(url).status_code == 404
 
 
 def test_every_png_carries_ai_disclosure_model_revision_and_seed(client):
