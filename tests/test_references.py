@@ -41,7 +41,7 @@ from conftest import (
 )
 from fastapi.testclient import TestClient
 from PIL import Image, ImageCms, ImageFile, ImageOps, PngImagePlugin
-from sqlalchemy import event
+from sqlalchemy import Select, event
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -1666,6 +1666,8 @@ def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_w
         assert failed_jpeg["error"] == "reference 1 of 1 could not be loaded"
         assert failed_jpeg["images"] == []
         assert wait_for(client, follow_up["id"])["status"] == "succeeded"
+        # A job whose reference fails to load never reaches the backend.
+        assert gated_next.prompts == ["hold worker", "after missing ref"]
         assert client.get("/health").status_code == 200
 
 
@@ -2464,9 +2466,14 @@ def _reference_file(name: str, color: tuple[int, int, int]):
     return ("references", (name, make_image_bytes(color), "image/png"))
 
 
+def _admission_state(tmp_path: Path) -> tuple[str, list[Path]]:
+    """Database dump and storage tree, to prove a rejected admission changed neither."""
+    storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
+    return db_dump(tmp_path), sorted(p.relative_to(storage) for p in storage.rglob("*"))
+
+
 def test_full_queue_rejects_every_transport_and_leaves_no_reference_artifacts(tmp_path):
     red, blue, green = (200, 0, 0), (0, 0, 200), (0, 200, 0)
-    storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
     backend = RecordingStepBackend()
     with running(tmp_path, backend=backend, CHRIEK_MAX_QUEUED_JOBS="1") as client:
         first = submit(client, prompt="running", **SMALL)
@@ -2476,7 +2483,7 @@ def test_full_queue_rejects_every_transport_and_leaves_no_reference_artifacts(tm
             data=FORM_16 | {"prompt": "queued"},
             files=[_reference_file("a.png", red), _reference_file("b.png", blue)],
         )
-        before = (db_dump(tmp_path), sorted(p.relative_to(storage) for p in storage.rglob("*")))
+        before = _admission_state(tmp_path)
 
         rejected = [
             post_job(client, "json", **SMALL),
@@ -2489,8 +2496,9 @@ def test_full_queue_rejects_every_transport_and_leaves_no_reference_artifacts(tm
         for response in rejected:
             assert response.status_code == 429, response.text
             assert "location" not in response.headers
-        after = (db_dump(tmp_path), sorted(p.relative_to(storage) for p in storage.rglob("*")))
-        assert after == before, "a rejected admission must leave no row or reference file"
+        assert _admission_state(tmp_path) == before, (
+            "a rejected admission must leave no row or reference file"
+        )
         other_owner = submit_multipart(
             client,
             headers=BOB,
@@ -2513,6 +2521,50 @@ def test_full_queue_rejects_every_transport_and_leaves_no_reference_artifacts(tm
         "bob": [green],
         "follow-up": [blue],
     }
+
+
+def test_admission_lost_after_the_early_count_saw_room_is_429_without_artifacts(
+    tmp_path, monkeypatch
+):
+    red, blue = (200, 0, 0), (0, 0, 200)
+    original_scalar = Session.scalar
+    early_counts: list[int] = []
+
+    def early_count_sees_room(self, statement, *args, **kwargs):
+        # Only the standalone pre-check is a plain SELECT count; the admitting
+        # INSERT ... SELECT still counts for real, as a competing admission would leave it.
+        if isinstance(statement, Select) and "count(" in str(statement):
+            early_counts.append(original_scalar(self, statement, *args, **kwargs))
+            return 0
+        return original_scalar(self, statement, *args, **kwargs)
+
+    backend = StepBackend()
+    with running(tmp_path, backend=backend, CHRIEK_MAX_QUEUED_JOBS="1") as client:
+        try:
+            first = submit(client, prompt="running", **SMALL)
+            backend.wait_started(1)
+            queued = submit(client, prompt="queued", **SMALL)
+            before = _admission_state(tmp_path)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(Session, "scalar", early_count_sees_room)
+                rejected = post_multipart(
+                    client,
+                    data=FORM_16 | {"prompt": "raced"},
+                    files=[_reference_file("a.png", red), _reference_file("b.png", blue)],
+                )
+
+            assert early_counts == [1], "the early count saw the full queue and was overridden"
+            assert rejected.status_code == 429, rejected.text
+            assert "location" not in rejected.headers
+            assert _admission_state(tmp_path) == before, (
+                "a lost admission must leave no row or reference file"
+            )
+        finally:
+            backend.step(2)
+        for job in (first, queued):
+            assert wait_for(client, job["id"])["status"] == "succeeded"
+    assert backend.prompts == ["running", "queued"]
 
 
 def test_proxy_mode_edit_jobs_use_the_shared_owner_and_the_host_check(tmp_path):
