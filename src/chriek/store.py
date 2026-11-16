@@ -18,6 +18,7 @@ from sqlalchemy import (
     event,
     func,
     insert,
+    inspect,
     literal,
     select,
     update,
@@ -27,7 +28,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship,
 from sqlalchemy.pool import QueuePool
 from sqlalchemy.schema import CreateIndex
 
-from chriek.storage import private_database
+from chriek.storage import StorageError, private_database
 
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
@@ -85,7 +86,7 @@ class Image(Base):
 class Reference(Base):
     """An uploaded reference image associated with an edit job in submission order."""
 
-    __tablename__ = "references"
+    __tablename__ = "job_references"
 
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), primary_key=True)
     index: Mapped[int] = mapped_column(primary_key=True)
@@ -94,6 +95,7 @@ class Reference(Base):
 class JobStore:
     def __init__(self, database: Path | URL) -> None:
         self._engine = _create_engine(database)
+        _rename_draft_reference_table(self._engine)
         Base.metadata.create_all(self._engine)
         # create_all skips existing tables and so their indexes: add indexes introduced
         # after a database file was created. Idempotent; existing rows stay untouched.
@@ -244,6 +246,25 @@ class JobStore:
             .values(status=status, error=error, run_record=run_record, finished_at=now)
             .returning(Job)
         ).one_or_none()
+
+
+def _rename_draft_reference_table(engine: Engine) -> None:
+    """Earlier SQLite drafts named the association table `references`; keep their rows.
+
+    Those drafts predate Postgres support, so a Postgres `references` table isn't ours to rename.
+    """
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as connection:
+        tables = set(inspect(connection).get_table_names())
+        if "references" not in tables:
+            return
+        if "job_references" in tables:
+            raise StorageError(
+                "database has both a 'references' and a 'job_references' table; "
+                "merge or remove one before starting chriek"
+            )
+        connection.exec_driver_sql('ALTER TABLE "references" RENAME TO job_references')
 
 
 def _create_engine(database: Path | URL) -> Engine:

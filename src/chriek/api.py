@@ -732,7 +732,14 @@ def _decode_reference_png(
             "input": None,
         }
     try:
-        _check_before_decoding(data)
+        try:
+            _check_before_decoding(data)
+        except _RejectedBeforeDecoding:
+            raise
+        except Exception:
+            # A bug in chriek's own walk, not bad input: log it, answer a generic 500.
+            log.exception("reference image %d: structure check failed unexpectedly", index)
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "internal error") from None
         with Image.open(io.BytesIO(data), formats=ALLOWED_REFERENCE_FORMATS) as image:
             width, height = image.size
             if width <= 0 or height <= 0 or width * height > limits.max_pixels:
@@ -798,7 +805,7 @@ def _decode_reference_png(
             "msg": f"reference image {index} exceeds maximum of {limits.max_pixels} pixels",
             "input": None,
         }
-    except _DECODER_ERRORS:
+    except (_MalformedImage, *_DECODER_ERRORS):
         return None, {
             "type": "value_error",
             "loc": loc,
@@ -810,16 +817,24 @@ def _decode_reference_png(
     return buf.getvalue(), None
 
 
-class _JpegTooComplex(Exception):
+class _RejectedBeforeDecoding(Exception):
+    """An upload the structure walk rejects; anything else it raises is a bug."""
+
+
+class _JpegTooComplex(_RejectedBeforeDecoding):
     pass
 
 
-class _PngTooComplex(Exception):
+class _PngTooComplex(_RejectedBeforeDecoding):
     pass
 
 
-class _ExifTooLarge(Exception):
+class _ExifTooLarge(_RejectedBeforeDecoding):
     pass
+
+
+class _MalformedImage(_RejectedBeforeDecoding):
+    """Structure Pillow or libjpeg would have to skip or guess at."""
 
 
 def _check_before_decoding(data: bytes) -> None:
@@ -841,7 +856,7 @@ def _check_jpeg_structure(data: bytes) -> None:
 
     Raises `_JpegTooComplex` above the segment, scan or fill-byte bounds, `_ExifTooLarge`
     when the APP1 `Exif` payloads (after their 6-byte `Exif\\0\\0` headers, which Pillow
-    concatenates) total more than `MAX_EXIF_BYTES`, and `SyntaxError` for structure Pillow
+    concatenates) total more than `MAX_EXIF_BYTES`, and `_MalformedImage` for structure Pillow
     or libjpeg would have to skip or guess at: bytes other than a marker between segments,
     a nested SOI, a length below 2, an EOI before the first SOS (Pillow's header parser
     reads on past it), a reserved JPG or JPGn marker (Pillow reads no length for it and
@@ -857,7 +872,7 @@ def _check_jpeg_structure(data: bytes) -> None:
     while True:
         marker = _JPEG_MARKER.match(data, pos)
         if marker is None:
-            raise SyntaxError("JPEG marker expected")
+            raise _MalformedImage("JPEG marker expected")
         fill += len(marker.group(1))
         if fill > MAX_JPEG_FILL_BYTES:
             raise _JpegTooComplex
@@ -865,10 +880,10 @@ def _check_jpeg_structure(data: bytes) -> None:
         pos = marker.end()
         if code == 0xD9:  # EOI
             if scans == 0:
-                raise SyntaxError("JPEG EOI before the first scan")
+                raise _MalformedImage("JPEG EOI before the first scan")
             return
         if code == 0xD8:  # SOI
-            raise SyntaxError("nested JPEG SOI")
+            raise _MalformedImage("nested JPEG SOI")
         segments += 1
         if segments > MAX_JPEG_SEGMENTS:
             raise _JpegTooComplex
@@ -876,10 +891,10 @@ def _check_jpeg_structure(data: bytes) -> None:
             continue
         if code == 0xC8 or 0xF0 <= code <= 0xFD:
             # Reserved JPG and JPGn: Pillow reads no length and parses their payload as markers.
-            raise SyntaxError("reserved JPEG marker")
+            raise _MalformedImage("reserved JPEG marker")
         length = int.from_bytes(data[pos : pos + 2])
         if length < 2 or pos + length > len(data):
-            raise SyntaxError("truncated JPEG segment")
+            raise _MalformedImage("truncated JPEG segment")
         if code == 0xE1 and data.startswith(b"Exif\x00\x00", pos + 2, pos + length):
             exif += length - 8
             if exif > MAX_EXIF_BYTES:
@@ -891,7 +906,7 @@ def _check_jpeg_structure(data: bytes) -> None:
                 raise _JpegTooComplex
             scan_end = _JPEG_SCAN_END.search(data, pos)
             if scan_end is None:
-                raise SyntaxError("truncated JPEG scan")
+                raise _MalformedImage("truncated JPEG scan")
             pos = scan_end.start()
 
 

@@ -211,6 +211,7 @@ def test_mlx_without_extra_stops_before_opening_storage(tmp_path, monkeypatch, c
         ({"CHRIEK_MAX_REFERENCES": "17"}, "CHRIEK_MAX_REFERENCES must be between"),
         ({"CHRIEK_MAX_REFERENCES": "many"}, "CHRIEK_MAX_REFERENCES must be an integer"),
         ({"CHRIEK_MAX_UPLOAD_BYTES": "1023"}, "CHRIEK_MAX_UPLOAD_BYTES must be between"),
+        ({"CHRIEK_MAX_UPLOAD_BYTES": "536870913"}, "CHRIEK_MAX_UPLOAD_BYTES must be between"),
         ({"CHRIEK_MAX_UPLOAD_BYTES": "huge"}, "CHRIEK_MAX_UPLOAD_BYTES must be an integer"),
         ({"CHRIEK_PORT": "70000"}, "CHRIEK_PORT must be between"),
         ({"CHRIEK_PUBLIC_URL": ""}, "CHRIEK_PUBLIC_URL is required"),

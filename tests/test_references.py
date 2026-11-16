@@ -27,6 +27,8 @@ from conftest import (
     FailingBackend,
     GatedBackend,
     base_env,
+    connect_db,
+    db_dump,
     make_image_bytes,
     running,
     submit,
@@ -43,8 +45,9 @@ from chriek.api import create_app
 from chriek.backend import FakeBackend
 from chriek.config import Settings
 from chriek.signing import UrlSigner
+from chriek.storage import StorageError
 from chriek.store import JobStore
-from chriek.worker import reference_path
+from chriek.worker import reference_path, write_references
 
 
 def encode_multipart(
@@ -430,6 +433,77 @@ def test_old_sqlite_jobs_without_references_report_zero_reference_count(tmp_path
         assert edit["params"]["reference_count"] == 1
 
 
+def _draft_db_with_queued_edit_job(tmp_path: Path, refs: list[bytes]) -> str:
+    """A database as earlier drafts of this branch left it: associations in `"references"`."""
+    store = JobStore(Path(base_env(tmp_path)["CHRIEK_DB_PATH"]))
+    (tmp_path / "images").mkdir(mode=0o700)
+    job_id = str(uuid.uuid7())
+    write_references(tmp_path / "images", job_id, refs)
+    store.create(
+        job_id=job_id,
+        owner="alice",
+        prompt="draft edit",
+        image_count=1,
+        width=16,
+        height=16,
+        seed=55,
+        reference_count=len(refs),
+        now=1_800_000_000.0,
+    )
+    store.close()
+    with connect_db(tmp_path) as db, db:
+        db.execute('ALTER TABLE job_references RENAME TO "references"')
+    return job_id
+
+
+def test_draft_database_reference_table_is_renamed_keeping_associations_and_order(tmp_path):
+    ref_a = make_image_bytes((111, 22, 33))
+    ref_b = make_image_bytes((44, 155, 66))
+    job_id = _draft_db_with_queued_edit_job(tmp_path, [ref_a, ref_b])
+
+    with running(tmp_path) as client:
+        survivor = wait_for(client, job_id)
+        assert survivor["status"] == "succeeded"
+        assert survivor["params"]["reference_count"] == 2
+        direct = wait_for(
+            client,
+            submit_multipart(
+                client,
+                data={"prompt": "draft edit", "seed": "55", "width": "16", "height": "16"},
+                files=[
+                    ("references", ("a", ref_a, "image/png")),
+                    ("references", ("b", ref_b, "image/png")),
+                ],
+            )["id"],
+        )
+        assert download_pixels(client, survivor) == download_pixels(client, direct)
+
+    with running(tmp_path) as client:  # a second startup finds nothing left to rename
+        assert client.get(f"/jobs/{job_id}", headers=ALICE).json()["params"]["reference_count"] == 2
+    with connect_db(tmp_path) as db:
+        tables = {
+            row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        assert "references" not in tables
+        rows = db.execute("SELECT job_id, `index` FROM job_references WHERE job_id = ?", (job_id,))
+        assert sorted(rows) == [(job_id, 0), (job_id, 1)]
+
+
+def test_startup_refuses_a_database_with_both_reference_tables(tmp_path):
+    job_id = _draft_db_with_queued_edit_job(tmp_path, [make_image_bytes()])
+    with connect_db(tmp_path) as db, db:
+        db.execute(
+            'CREATE TABLE job_references (job_id VARCHAR(36) NOT NULL, "index" INTEGER NOT NULL, '
+            'PRIMARY KEY (job_id, "index"))'
+        )
+        db.execute('INSERT INTO job_references (job_id, "index") VALUES (?, 0)', (job_id,))
+    before = db_dump(tmp_path)
+
+    with pytest.raises(StorageError, match="job_references"):
+        create_app(Settings.from_env(base_env(tmp_path)), backend=FakeBackend())
+    assert db_dump(tmp_path) == before
+
+
 def test_references_stored_with_safe_names_and_persist_across_restart_for_queued_job(tmp_path):
     crashed = GatedBackend()
     ref_a = make_image_bytes((111, 22, 33))
@@ -575,13 +649,18 @@ def test_url_and_text_reference_fields_are_rejected_without_network_fetch(
             assert resp.status_code == 422
             assert resp.json()["detail"]
 
-        for bad_form in (
-            {"prompt": "hi", "references": url},
-            {"prompt": "hi", "reference_url": url},
-        ):
-            resp = post_multipart(client, headers=ALICE, data=bad_form)
-            assert resp.status_code == 422
-            assert resp.json()["detail"]
+        text_reference = post_multipart(
+            client, headers=ALICE, data={"prompt": "hi", "references": url}
+        )
+        assert text_reference.status_code == 422
+        [error] = text_reference.json()["detail"]
+        assert error["loc"] == ["body", "references"]
+        assert error["msg"] == "references must be uploaded as image files, not text or URLs"
+        assert url not in text_reference.text
+
+        resp = post_multipart(client, headers=ALICE, data={"prompt": "hi", "reference_url": url})
+        assert resp.status_code == 422
+        assert resp.json()["detail"]
         assert backend.renders == 0
     assert network_attempts == []
 
@@ -698,6 +777,18 @@ def test_reference_count_and_upload_byte_limits_are_configurable_and_enforced(tm
             "at most 0 reference images" in e["msg"] for e in one_ref_rejected.json()["detail"]
         )
 
+    # Upper ends of the configurable ranges are usable: 16 references, a 512 MiB body cap.
+    sixteen = [("references", (f"{i}.png", small_png, "image/png")) for i in range(16)]
+    with running(
+        tmp_path,
+        backend=backend,
+        CHRIEK_MAX_REFERENCES="16",
+        CHRIEK_MAX_UPLOAD_BYTES=str(512 * 1024 * 1024),
+    ) as client:
+        job = wait_for(client, submit_multipart(client, data=FORM_16, files=sixteen)["id"])
+        assert job["status"] == "succeeded"
+        assert job["params"]["reference_count"] == 16
+
 
 def test_json_and_multipart_body_caps_are_independent(tmp_path):
     """JSON keeps the fixed 2 MiB cap whatever CHRIEK_MAX_UPLOAD_BYTES says, and vice versa."""
@@ -767,6 +858,23 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
             }
         ]
         assert mp_consumed == 6
+
+        # A fifth reference part (default limit 4) stops receipt at its own chunk, although
+        # the whole body is far below the byte cap: the count limit is enforced on its own.
+        ref_part = (
+            b"--bound\r\nContent-Disposition: form-data; "
+            b'name="references"; filename="r"\r\n\r\nx\r\n'
+        )
+        count_chunks = [ref_part] * 5 + [b"z" * 10 for _ in range(10)] + [b"--bound--\r\n"]
+        assert len(b"".join(count_chunks)) < 2048
+        count_status, count_err, count_consumed = asgi_post_jobs(
+            client,
+            ALICE | {"Content-Type": "multipart/form-data; boundary=bound"},
+            count_chunks,
+        )
+        assert count_status == 422
+        assert "at most 4 reference images" in count_err["detail"][0]["msg"]
+        assert count_consumed == 5
 
 
 @pytest.mark.parametrize(
@@ -1501,9 +1609,10 @@ def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_w
 
         monkeypatch.undo()
 
-    # Next, a missing reference file (OSError) and a corrupt one (ValueError: a PNG whose
-    # iCCP profile decompresses beyond the reader's limit) each fail only their job: the
-    # error does not leak the absolute storage path, and subsequent jobs still succeed.
+    # Next, a missing reference file (OSError), a corrupt one (ValueError: a PNG whose
+    # iCCP profile decompresses beyond the reader's limit) and a valid non-PNG one (the
+    # worker reopens stored references as PNG only) each fail only their job: the error
+    # does not leak the absolute storage path, and subsequent jobs still succeed.
     gated_next = GatedBackend()
     with running(tmp_path, backend=gated_next) as client:
         blocker = submit(client, prompt="hold worker", width=16, height=16)
@@ -1528,6 +1637,14 @@ def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_w
             format="PNG",
             icc_profile=b"\x00" * (1024 * 1024 + 1),
         )
+        jpeg_ref_job = submit_multipart(
+            client,
+            data={"prompt": "jpeg ref", "width": "16", "height": "16"},
+            files=[("references", ("r0.png", ref_bytes, "image/png"))],
+        )
+        Image.new("RGB", (16, 16)).save(
+            reference_path(tmp_path / "images", jpeg_ref_job["id"], 0), format="JPEG"
+        )
         follow_up = submit(client, prompt="after missing ref", width=16, height=16)
 
         gated_next.release()
@@ -1537,6 +1654,10 @@ def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_w
         assert failed_ref["error"] == "reference 1 of 2 could not be loaded"
         assert str(tmp_path) not in failed_ref["error"]
         assert wait_for(client, corrupt_ref_job["id"])["status"] == "failed"
+        failed_jpeg = wait_for(client, jpeg_ref_job["id"])
+        assert failed_jpeg["status"] == "failed"
+        assert failed_jpeg["error"] == "reference 1 of 1 could not be loaded"
+        assert failed_jpeg["images"] == []
         assert wait_for(client, follow_up["id"])["status"] == "succeeded"
         assert client.get("/health").status_code == 200
 
@@ -1789,8 +1910,12 @@ def _reserved_jpeg_marker(code: int, payload: bytes) -> bytes:
     return bytes((0xFF, code)) + (2 + len(payload)).to_bytes(2) + payload
 
 
+def _app1(payload: bytes) -> bytes:
+    return b"\xff\xe1" + (2 + len(payload)).to_bytes(2) + payload
+
+
 def _app1_exif(exif: bytes) -> bytes:
-    return b"\xff\xe1" + (8 + len(exif)).to_bytes(2) + b"Exif\x00\x00" + exif
+    return _app1(b"Exif\x00\x00" + exif)
 
 
 def _raw_exif_profile_itxt(flag: int, text: bytes) -> bytes:
@@ -2115,6 +2240,40 @@ def test_costly_uploads_are_rejected_before_pillow_opens_them(
         _assert_nothing_persisted(tmp_path, backend)
 
 
+def test_bug_in_the_structure_walk_is_logged_and_not_reported_as_an_invalid_image(
+    tmp_path, monkeypatch, caplog
+):
+    secret = "walker-bug-detail-SENTINEL"
+
+    def broken_walk(data: bytes) -> None:
+        raise KeyError(secret)
+
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        monkeypatch.setattr(chriek.api, "_check_png_structure", broken_walk)
+        response = post_multipart(
+            client, data=FORM_16, files=[("references", ("r.png", make_image_bytes(), "image/png"))]
+        )
+        assert response.status_code == 500
+        assert secret not in response.text
+        assert "not a valid image" not in response.text
+        _assert_nothing_persisted(tmp_path, backend)
+        [record] = [r for r in caplog.records if r.name == "chriek.api" and r.exc_info]
+        assert record.levelno == logging.ERROR
+        assert record.exc_info[0] is KeyError
+
+        monkeypatch.undo()
+        healthy = wait_for(
+            client,
+            submit_multipart(
+                client,
+                data=FORM_16,
+                files=[("references", ("r.png", make_image_bytes(), "image/png"))],
+            )["id"],
+        )
+        assert healthy["status"] == "succeeded"
+
+
 _INFLATE_BOMB = zlib.compress(b"0" * 1_000_000)
 
 
@@ -2209,6 +2368,29 @@ def test_compressed_exif_text_inflates_only_up_to_the_remaining_budget(
             _png_around_idat(_PNG_ITXT_PLAIN * _PNG_MAX_COMPRESSED, _PNG_ITXT_PLAIN),
             id="png-uncompressed-itxt-not-counted",
         ),
+        # Large non-EXIF metadata stays outside the EXIF budget: XMP and extended-XMP APP1
+        # segments (together over 64 KiB), text after IEND, a 70 KB text chunk whose keyword
+        # only starts with "exif", and an EXIF text chunk whose zlib data is corrupt.
+        pytest.param(
+            _after_first_segment(
+                _BASELINE_16,
+                _app1(b"http://ns.adobe.com/xap/1.0/\x00" + b"x" * 60_000)
+                + _app1(b"http://ns.adobe.com/xmp/extension/\x00" + b"y" * 60_000),
+            ),
+            id="jpeg-large-xmp-app1",
+        ),
+        pytest.param(
+            _png_bytes(_noise_image((24, 16))) + _png_chunk(b"tEXt", b"k\x00v") * 300,
+            id="png-text-chunks-after-iend",
+        ),
+        pytest.param(
+            _png_with_chunks(_png_chunk(b"tEXt", b"exifnote\x00" + b"0" * 70_000)),
+            id="png-large-text-with-exif-prefixed-keyword",
+        ),
+        pytest.param(
+            _png_with_chunks(_png_chunk(b"zTXt", b"Raw profile type exif\x00\x00not zlib")),
+            id="png-exif-ztxt-with-corrupt-zlib",
+        ),
     ],
 )
 def test_ordinary_uploads_pass_the_walk_and_reach_the_decoder(tmp_path, decoder_entries, upload):
@@ -2216,7 +2398,10 @@ def test_ordinary_uploads_pass_the_walk_and_reach_the_decoder(tmp_path, decoder_
         job = submit_multipart(
             client, data=FORM_16, files=[("references", ("r", upload, "image/x"))]
         )
-        assert wait_for(client, job["id"])["status"] == "succeeded"
+        assert job["params"]["reference_count"] == 1
+        done = wait_for(client, job["id"])
+        assert done["status"] == "succeeded"
+        download_pixels(client, done)
     # Positive control for the recorder: it sees the submission's in-memory decode.
     assert any(isinstance(entry, io.BytesIO) for entry in decoder_entries)
 

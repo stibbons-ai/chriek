@@ -97,7 +97,8 @@ class Worker:
         references: list[Image.Image] = []
         for ref in job.references:
             try:
-                with Image.open(reference_path(self._storage_dir, job.id, ref.index)) as opened:
+                path = reference_path(self._storage_dir, job.id, ref.index)
+                with Image.open(path, formats=("PNG",)) as opened:
                     references.append(opened.copy())
             except Exception:
                 # Like render failures: the traceback stays in the log, never in the public error.
