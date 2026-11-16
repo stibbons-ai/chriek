@@ -650,6 +650,22 @@ def test_chriek_serve_reports_a_database_it_cannot_create_without_a_traceback(tm
     assert list(read_only.iterdir()) == [], "nothing may be created below the read-only directory"
 
 
+@pytest.mark.sqlite
+def test_chriek_serve_reports_a_corrupt_database_file_without_a_traceback(tmp_path):
+    # Private file in a private directory: the storage preflight passes, the driver refuses.
+    env = base_env(tmp_path)
+    database = Path(env["CHRIEK_DB_PATH"])
+    database.parent.mkdir(mode=0o700)
+    database.write_bytes(b"not a sqlite database " * 64)
+    database.chmod(0o600)
+    process = serve(env)
+    output, _ = process.communicate(timeout=30)
+
+    assert process.returncode == 1, output
+    assert output.startswith("chriek: database error: "), output
+    assert "Traceback" not in output
+
+
 def openssl(*args: str) -> None:
     command = shutil.which("openssl")
     assert command, "the TLS tests need the openssl command"
