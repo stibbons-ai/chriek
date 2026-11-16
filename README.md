@@ -25,9 +25,45 @@ chriek runs only on POSIX hosts and filesystems (Linux, macOS) and refuses to st
 
 `chriek serve` runs the API and the in-process worker in one process (home mode). It listens on `127.0.0.1:8000` by default. A missing setting that has no default, such as `CHRIEK_PUBLIC_URL`, or a setting rejected by configuration validation (see the ranges and formats in [Configuration](#configuration)) stops it before it opens the database or a port, with exit code 2 and a message that names the variable but never prints secret values or the rejected `CHRIEK_PUBLIC_URL`. Values that aren't validated, such as an unresolvable `CHRIEK_HOST`, fail later, when the server binds.
 
-Logs go to standard output/error: startup, shutdown and errors. There is no HTTP access log, because download URLs carry their signature, which works like a password until it expires; put any access logging you need in a reverse proxy and strip the query string there.
+Every environment variable whose name starts with `CHRIEK_` (in any letter case) must be one of the settings in [Configuration](#configuration); any other, such as a misspelt `CHRIEK_TLS_CERTFLE`, stops startup the same way, naming the variable but never its value. Earlier versions ignored unknown `CHRIEK_` names, so a leftover or misspelt one in an existing deployment now stops startup until you remove or correct it. On Kubernetes, a Service named `chriek` or starting with `chriek-` (such as `chriek-web`) can inject variables like `CHRIEK_WEB_SERVICE_HOST` into pods in its namespace; set `enableServiceLinks: false` in the pod spec, or rename the Service. Other variables, such as uvicorn's `FORWARDED_ALLOW_IPS`, are unaffected.
 
-chriek has no TLS of its own. Expose it only on a private network or behind a TLS-terminating reverse proxy: API keys and download signatures travel in requests.
+Logs go to standard output/error: startup, shutdown and errors. At startup chriek logs its authentication mode, as a `WARNING` in `proxy` mode because chriek itself then authenticates nobody; it never logs keys or secrets. There is no HTTP access log, because download URLs carry their signature, which works like a password until it expires; put any access logging you need in a reverse proxy and strip the query string there.
+
+> **Warning: without TLS, use chriek only on a private network or behind a TLS-terminating reverse proxy.** API keys travel in `/jobs` requests in `api-key` mode; download signatures travel in image URLs in both modes. Over plain HTTP anyone on the path can read and reuse these credentials. Either let a reverse proxy terminate TLS, or turn on [native TLS](#native-tls).
+
+### Native TLS
+
+chriek can serve HTTPS itself, without a proxy. Point it at a PEM certificate (chain) and its unencrypted PEM private key:
+
+```sh
+export CHRIEK_TLS_CERTFILE=/etc/chriek/fullchain.pem
+export CHRIEK_TLS_KEYFILE=/etc/chriek/privkey.pem
+export CHRIEK_PUBLIC_URL="https://127.0.0.1:8000"
+uv run chriek serve   # logs "Uvicorn running on https://127.0.0.1:8000"
+```
+
+Set both variables or neither. With TLS configured, chriek never falls back to plain HTTP. Configuration validation loads the pair once: if only one variable is set, either is set but empty, or the files can't be loaded as a matching certificate and key (missing, unreadable, not PEM, mismatched, or an encrypted key), startup stops with exit code 2. A path that is missing, not a regular file or not readable is reported with the variable that names it; an encrypted key names `CHRIEK_TLS_KEYFILE`; other load failures, such as a mismatched pair, name both variables. The server loads the files again when it starts. If that load fails, startup stops with the server's own load error and no listener opens. Replacing the files between validation and server startup can change the outcome: another valid pair serves HTTPS, and an encrypted key can prompt for a pass phrase on a terminal. Neither case enables plain HTTP. A plain-HTTP request to a TLS port gets no HTTP answer. chriek doesn't obtain or renew certificates (no ACME): renew them yourself and restart `chriek serve` to load the new files. TLS doesn't change download URLs: they always start with `CHRIEK_PUBLIC_URL`, so set it to the server's `https://` origin (see [Public URL and reverse proxies](#public-url-and-reverse-proxies)).
+
+The exit-2, before-database guarantee applies only to configuration validation. A TLS load failure during server startup can instead exit 1 with a traceback after the database has been created; it still opens no listener.
+
+### Behind a reverse proxy (`CHRIEK_AUTH_MODE=proxy`)
+
+In `proxy` mode chriek does no authentication of its own: the reverse proxy in front of it must authenticate every client before forwarding a request. chriek ignores `Authorization` and identity headers such as `X-Forwarded-User`; it never derives an owner from headers. Every request belongs to one fixed, shared owner, so **all clients share all jobs**: any client can poll any job, and all of them share one queue capacity (`CHRIEK_MAX_QUEUED_JOBS`). Run separate chriek instances, or use `api-key` mode, when clients must not see each other's jobs.
+
+Anyone who reaches chriek's port directly bypasses the proxy and gets full access. Restrict access to trusted peers: with the default `CHRIEK_HOST=127.0.0.1`, every local process and user can reach it; on a private network, every host with access to the port can reach it. Neither binding alone restricts access to the proxy. Use host isolation, a dedicated container network or firewall rules when other peers must not have access. `CHRIEK_API_KEYS` must be unset, empty or whitespace only in proxy mode; `CHRIEK_SIGNING_SECRET` is still required with at least 32 characters, and downloads still need valid signed URLs. Polling is separate per mode: jobs created in one mode can't be polled in the other, even on the same database. Signed download URLs are bearer links and don't depend on the mode: one issued before a mode change keeps working until it expires, as long as the database, image directory and `CHRIEK_SIGNING_SECRET` stay the same.
+
+In `proxy` mode chriek answers only requests whose `Host` header names one of `CHRIEK_ALLOWED_HOSTS`, by default `localhost`, `127.0.0.1` and `[::1]`; every other request, on every path, gets `400 Invalid host header` before chriek reads or stores anything. Requests with no, several or a malformed `Host` header get `400` too, with nothing read or stored, though the server's HTTP parser may reject some of them first with a different body. Entries are exact host names or IP addresses, matched case-insensitively; the request's `Host` may add any port. IPv6 addresses match as written, not by value: `[::1]` and `[0:0:0:0:0:0:0:1]` are different entries. This stops DNS rebinding: a web page on another site can't make a visitor's browser drive chriek through its own host name. It is not authentication: every local process and every peer that reaches the port and sends an allowed `Host` still has full access, so the network isolation above stays necessary. Behind a public reverse proxy, set `CHRIEK_ALLOWED_HOSTS` to the public host name (for example `img.example.com`) and have the proxy forward the original `Host`; the replacement list drops the defaults, so add `127.0.0.1` too if local health checks use it. chriek never derives allowed names from the listen address. Only `Host` counts; `X-Forwarded-Host` is ignored.
+
+Download URLs always start with `CHRIEK_PUBLIC_URL` (see [Public URL and reverse proxies](#public-url-and-reverse-proxies)): set it to the proxy's public origin, for example `https://img.example.com`. Neither `Host` nor `X-Forwarded-Proto` changes them, whatever `FORWARDED_ALLOW_IPS` trusts.
+
+```sh
+export CHRIEK_AUTH_MODE=proxy
+unset CHRIEK_API_KEYS
+export CHRIEK_SIGNING_SECRET="$(openssl rand -hex 32)"
+export CHRIEK_PUBLIC_URL="https://img.example.com"
+export CHRIEK_ALLOWED_HOSTS="img.example.com"
+uv run chriek serve
+```
 
 ### Backend dependencies
 
@@ -45,20 +81,25 @@ All configuration comes from environment variables.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CHRIEK_API_KEYS` | required | Named static API keys, `name:key,name:key`. The name is the owner of the jobs created with that key. Names: 1–64 characters from `A-Z a-z 0-9 _ . -`, unique. Names are not secret: each job stores its owner's name in plain text, so never use a key or the signing secret as a name. Keys: at least 32 printable ASCII characters (`!` to `~`; no spaces, control or non-ASCII characters, no commas), unique. Keys travel in an HTTP header, so other characters are rejected at startup. Startup errors identify an invalid entry by its position, never by its name or key. |
+| `CHRIEK_AUTH_MODE` | `api-key` | `api-key`: every `/jobs` request needs a key from `CHRIEK_API_KEYS`, and each key owns its jobs. `proxy`: no key check; a trusted reverse proxy authenticates, and all clients are one shared owner; see [Behind a reverse proxy](#behind-a-reverse-proxy-chriek_auth_modeproxy). Empty, differently cased or other values stop startup. |
+| `CHRIEK_API_KEYS` | required in `api-key` mode | Named static API keys, `name:key,name:key`. The name is the owner of the jobs created with that key. Names: 1–64 characters from `A-Z a-z 0-9 _ . -`, unique. Names are not secret: each job stores its owner's name in plain text, so never use a key or the signing secret as a name. Keys: at least 32 printable ASCII characters (`!` to `~`; no spaces, control or non-ASCII characters, no commas), unique. Keys travel in an HTTP header, so other characters are rejected at startup. Startup errors identify an invalid entry by its position, never by its name or key. Must be unset, empty or whitespace only in `proxy` mode. |
 | `CHRIEK_SIGNING_SECRET` | required | HMAC secret for download URLs, at least 32 characters. Changing it invalidates every issued URL (polling the job again mints new ones). Anyone who knows it can sign download URLs, so it must not be one of the API keys: startup rejects a signing secret equal to any key or name in `CHRIEK_API_KEYS`. |
 | `CHRIEK_PUBLIC_URL` | required | Public base URL of download links, `http(s)://host[:port][/prefix]`, for example `https://images.example/chriek`. Final `/` characters are optional and ignored. The host is a DNS name, a dotted-decimal IPv4 address such as `192.0.2.10` or a bracketed IPv6 address; a port must be 1–65535. Hosts that browsers would read as a different IPv4 address (`017.0.0.1`, `2130706433`, `0x7f.1`) or as an invalid one (`1.2.3.4.5`) are rejected. The prefix must not contain `\`, `.` or `..` segments (also percent-encoded as `%2e`), which clients rewrite. Only printable ASCII is accepted (no whitespace or control characters; write internationalized host names in punycode), with no user name or password, query (`?`) or fragment (`#`). See [Public URL and reverse proxies](#public-url-and-reverse-proxies). |
 | `CHRIEK_URL_TTL_SECONDS` | `900` | Lifetime of a download URL, 1–604800 seconds. |
 | `CHRIEK_DB_PATH` | `chriek-data/chriek.db` | SQLite database file, used literally (`?` and `%20` are ordinary filename characters); missing parent directories are created private. Its parent must be a dedicated directory; see [Storage permissions](#storage-permissions). Put it on a volume to keep jobs across restarts. The exact value `:memory:` (or `./:memory:`) selects an ephemeral in-memory database instead; see [In-memory database](#in-memory-database). |
 | `CHRIEK_STORAGE_DIR` | `chriek-data/images` | Dedicated directory for generated PNGs, one subdirectory per job; see [Storage permissions](#storage-permissions). |
 | `CHRIEK_HOST` | `127.0.0.1` | Listen address. |
+| `CHRIEK_ALLOWED_HOSTS` | `localhost,127.0.0.1,[::1]` in `proxy` mode | `proxy` mode only: comma-separated host names and IP addresses (IPv6 in brackets, as in `[::1]`) that requests must name in their `Host` header; see [Behind a reverse proxy](#behind-a-reverse-proxy-chriek_auth_modeproxy). Exact names only: no wildcards, empty entries, schemes, ports or paths. Setting it in `api-key` mode stops startup. |
 | `CHRIEK_PORT` | `8000` | Listen port. |
+| `CHRIEK_TLS_CERTFILE` | unset | PEM certificate (chain) for [native TLS](#native-tls). Set together with `CHRIEK_TLS_KEYFILE`; leave both unset for plain HTTP. |
+| `CHRIEK_TLS_KEYFILE` | unset | Unencrypted PEM private key matching `CHRIEK_TLS_CERTFILE`. |
+| `CHRIEK_MAX_QUEUED_JOBS` | `100` | Maximum `queued` jobs per owner (1–100000); see [Queue limit](#queue-limit). |
 | `CHRIEK_MAX_IMAGES` | `4` | Maximum `image_count` per job (configurable 1–64). |
 | `CHRIEK_MAX_DIMENSION` | `2048` | Maximum `width` and `height`; a multiple of 16 (16–8192). |
 | `CHRIEK_MAX_PIXELS` | `1048576` | Maximum `width * height` (256–67108864). |
 | `CHRIEK_MAX_PROMPT_CHARS` | `2000` | Maximum prompt length in characters (1–100000). |
 
-Relative paths resolve against the working directory. The database schema is created on first start; there are no migrations yet.
+Relative paths resolve against the working directory. The database schema is created on first start, and indexes added by newer chriek versions are created in an existing database file on start, keeping its jobs; there are no other migrations yet.
 
 ### In-memory database
 
@@ -69,7 +110,7 @@ Relative paths resolve against the working directory. The database schema is cre
 Every download URL chriek returns is `CHRIEK_PUBLIC_URL` followed by `/images/{id}/{index}.png?expires=…&sig=…`; `https://images.example/chriek/` yields `https://images.example/chriek/images/…`. Nothing from the request goes into it: not the `Host` header, `Forwarded`, `X-Forwarded-Host`, `X-Forwarded-Proto`, nor the scheme or port the client connected with. The server (uvicorn) does honour `X-Forwarded-For` and `X-Forwarded-Proto` from trusted proxy addresses, by default only `127.0.0.1` and `::1`, a list the `FORWARDED_ALLOW_IPS` environment variable replaces; that changes the client address and request scheme the server sees, never the link origin.
 
 - **Upgrading.** `CHRIEK_PUBLIC_URL` is new and has no default. Earlier versions built links from the host the client used; a deployment upgraded without setting it no longer starts (exit 2, `CHRIEK_PUBLIC_URL is required`). There is no fallback to the request host. Set it to the address clients use to reach chriek, for example the `http://127.0.0.1:8000` of the [install example](#install-and-run-uv) for local use. No data migration is needed.
-- **Scheme.** `http://` suits local use on one machine. For anything reached over a network, use an `https://` URL served by a TLS-terminating proxy: download URLs are bearer credentials until they expire.
+- **Scheme.** `http://` suits local use on one machine. For anything reached over a network, use an `https://` URL served by native TLS or a TLS-terminating proxy: download URLs are bearer credentials until they expire.
 - **Path prefix.** chriek always serves downloads at `/images/…` on its own listener; it does not strip or know about any prefix. With a prefix such as `/chriek`, your proxy must route `https://images.example/chriek/images/…` to chriek's `/images/…`, removing `/chriek` and keeping the query string unchanged. Without that mapping the links fail instead of returning the image: with the proxy's error, or with chriek's `404 {"detail": "Not Found"}` when the proxy forwards the path without removing the prefix. The `Location: /jobs/<id>` header of a submission carries no prefix either; a prefix proxy must rewrite it for clients that follow that header.
 
 ### Storage permissions
@@ -132,7 +173,7 @@ chriek removes `..` from `CHRIEK_DB_PATH` and `CHRIEK_STORAGE_DIR` before follow
 
 ## API
 
-Every `/jobs` request needs `Authorization: Bearer <key>`. A missing or invalid key returns `401` before the request body is read, so even a malformed body gets `401`. A job created with another key returns `404`, exactly like a job that doesn't exist. `GET /health` and image downloads need no key.
+In `api-key` mode (the default) every `/jobs` request needs `Authorization: Bearer <key>`. A missing or invalid key returns `401` before the request body is read, so even a malformed body gets `401`. A job created with another key returns `404`, exactly like a job that doesn't exist. In `proxy` mode `/jobs` needs no key and never returns `401`; every request acts as the one shared owner ([Behind a reverse proxy](#behind-a-reverse-proxy-chriek_auth_modeproxy)). `GET /health` and image downloads need no key in either mode.
 
 ### `POST /jobs`
 
@@ -158,7 +199,9 @@ Two fixed byte budgets apply; neither is configurable:
 
 An early rejection can leave the request body unread. Clients that finish uploading before reading the response may see a broken pipe or connection reset instead of the `401` or `413` response.
 
-Once the worker has [stopped on an unsaved result](#job-behaviour), a request that passes authentication, the body-size limit and validation returns `503 {"detail": "worker stopped: a job result could not be saved; restart chriek"}` instead of `202`: no `Location` header, no job stored, nothing run. Authentication (`401`), the body-size limit (`413`) and validation (`422`, `400`) are checked first and keep their answers. The check sees the worker state at the time of the request, so a job accepted just before a result fails to save stays `queued` until restart. chriek has no queue cap; if one is added, this `503` takes precedence over a full-queue answer.
+Once the worker has [stopped on an unsaved result](#job-behaviour), a request that passes authentication, the body-size limit and validation returns `503 {"detail": "worker stopped: a job result could not be saved; restart chriek"}` instead of `202`: no `Location` header, no job stored, nothing run. Authentication (`401`), the body-size limit (`413`) and validation (`422`, `400`) are checked first and keep their answers. The check sees the worker state at the time of the request, so a job accepted just before a result fails to save stays `queued` until restart. This `503` takes precedence over a full-queue `429`.
+
+A valid request whose owner already has `CHRIEK_MAX_QUEUED_JOBS` queued jobs returns `429` instead and is not queued; see [Queue limit](#queue-limit). Validation comes first, so an invalid request gets `422` or `400` even when the queue is full.
 
 ### `GET /jobs/{id}`
 
@@ -203,12 +246,16 @@ Returns `200 {"status": "ok"}`. If the worker could not save a job's result (suc
 ## Job behaviour
 
 - **Queue.** Jobs are stored in SQLite and run one at a time, oldest first, by a single worker thread in the `chriek serve` process. There is one global queue across all owners: no round-robin or per-owner fairness. If owner A submits A1 and A2 before owner B submits B1, both A jobs run before B1; an A3 submitted after B1 runs after B1, even if A1 and A2 finish first. An admitted job is delayed only by jobs submitted before it, never by later ones, but chriek promises no maximum wait: a long or stalled earlier job holds up everything behind it.
-- **No admission cap.** Nothing limits how many jobs one owner can queue. A per-owner queue cap is proposed ([#8](https://github.com/stibbons-ai/chriek/issues/8), [PR #13](https://github.com/stibbons-ai/chriek/pull/13), not merged). Even then, a count cap would not bound how long jobs run, would not guarantee another owner's admission or latency, and is no SLA.
+- **Admission cap.** Each owner may have at most `CHRIEK_MAX_QUEUED_JOBS` queued jobs; see [Queue limit](#queue-limit). The cap does not bound how long jobs run or how long another owner's job waits, and is no SLA.
 - **All or nothing.** If any image of a job fails, the job fails and the images it already rendered are discarded. A job is never partly successful.
 - **Restarts.** With a database file, queued jobs survive a restart and run afterwards. A job that was `running` when the process stopped is marked `failed` on the next start (`interrupted: the server stopped while this job was running`) and isn't retried. An [in-memory database](#in-memory-database) starts empty instead.
 - **Unsaved results stop the worker.** If saving a finished job's result to the database fails, the worker logs the error and stops instead of moving on: that job stays `running`, no later job runs, jobs accepted before the failure stay `queued`, new submissions are rejected with `503` (see [`POST /jobs`](#post-jobs)), and `GET /health` returns `503`. Fix the database or disk problem and restart `chriek serve`; restart recovery then fails the stuck job as interrupted, the queued jobs run, and submissions are accepted again. Rejected submissions were never stored, so they don't run after the restart.
 - **AI disclosure in every PNG**, always on: PNG text chunks `AI-Generated: true`, `Model`, `Model-Revision`, `Seed` and `Description`, plus XMP (`XML:com.adobe.xmp`) with IPTC `Iptc4xmpExt:DigitalSourceType` = `http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia`. With the fake backend, `Model` is `chriek-fake-backend` and `Model-Revision` is `fake-v1`.
 - No retention: generated files stay in `CHRIEK_STORAGE_DIR` until you delete them.
+
+### Queue limit
+
+Each owner may have at most `CHRIEK_MAX_QUEUED_JOBS` jobs (default `100`, configurable 1–100000; there is no unlimited setting) in status `queued` at once. Earlier versions had no limit: after upgrading, an owner who already has 100 or more queued jobs gets `429` for new submissions until the queue drains below the limit, and existing queued jobs are kept and still run. Raise `CHRIEK_MAX_QUEUED_JOBS` if 100 is too low. Only `queued` jobs count: once the worker starts a job (`running`) it frees its slot, and `succeeded` or `failed` jobs never count. A submission that would exceed the limit returns `429 {"detail": "queue full: at most <n> queued jobs per owner; new jobs are accepted only while fewer are queued"}`; the rejected job is not stored and never runs. A full queue frees up only while the worker runs; if it has stopped (`GET /health` returns `503`), retrying doesn't help until chriek restarts. Each API key has its own limit; in `proxy` mode all clients share one. With a database file, a queue that is already full is rejected by a read alone, without waiting for SQLite's write lock. An in-memory database shares one pooled connection, so that read can wait for another operation to release the connection. Submissions that pass the read take the write lock like any other write, and some are then rejected there: admission counts again inside the same SQLite statement that inserts the job, so concurrent submissions, even through separate database connections, can't exceed the limit. Run one `chriek serve` per database file: on startup each server fails every `running` job as interrupted, including jobs another live server is rendering.
 
 ## Operator obligations under the FLUX Kommunity License
 
@@ -246,7 +293,9 @@ The full check, also run by CI (`.github/workflows/ci.yml`):
 uv sync --locked && uv run --locked pre-commit run jscpd --all-files && uv run ruff check . && uv run ruff format --check . && uv run pytest && uv run --locked python scripts/audit_dependencies.py
 ```
 
-Application tests drive chriek through its HTTP API and the installed `chriek` command, with the fake backend, plus direct store, worker, app and `chriek.storage` checks where storage privacy must hold without the CLI. Another user's ownership is simulated by patching `os.stat`/`os.lstat`, so the suite runs as one user. `tests/test_dependency_audit.py` checks the dependency-audit gate's boundaries offline: injected pip-audit reports, and the real pinned pip-audit with only its HTTP transport answering canned PyPI responses.
+The TLS tests generate throwaway certificates with the `openssl` command, so it must be on `PATH` (OpenSSL or LibreSSL).
+
+Application tests drive chriek through its HTTP API and the installed `chriek` command, with the fake backend. Some check what HTTP can't reach directly: they parse configuration, call the job store, inject store write failures, or open the SQLite file to read back stored jobs, their owners and indexes, hold its write lock from another connection, or prepare a database without a newer index; direct store, worker, app and `chriek.storage` checks cover where storage privacy must hold without the CLI. Another user's ownership is simulated by patching `os.stat`/`os.lstat`, so the suite runs as one user. Proxy tests use chriek's internal shared-owner name to check the owner stored for proxy-mode jobs and that no API key name can own them. Some installed-command tests send raw HTTP requests over a socket for `Host` headers an HTTP client won't send. `tests/test_dependency_audit.py` checks the dependency-audit gate's boundaries offline: injected pip-audit reports, and the real pinned pip-audit with only its HTTP transport answering canned PyPI responses.
 
 ### Dependency audit
 
