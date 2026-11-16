@@ -1,6 +1,7 @@
 """Job store on SQLite or Postgres. Status changes are conditional updates; a stale writer can't
 override them."""
 
+import hashlib
 import uuid
 from pathlib import Path
 from typing import Annotated, Any
@@ -104,16 +105,18 @@ class JobStore:
     ) -> Job | None:
         """Queue a job unless `owner` already has `max_queued` queued jobs; None if full.
 
-        A queue that is already full when read is rejected by that read alone, without the
-        write lock, so a flood of submissions against a full queue doesn't hold up other
-        writers (the worker saving results). That read only rejects; it never admits.
-        Submissions that pass it while the queue is near the cap wait for the write lock
-        and may still be rejected there: admission counts again inside the one
-        INSERT ... SELECT statement, which SQLite runs under the write lock, so the count
-        always sees the rows it races with and concurrent submissions, even through other
-        connections, can't overshoot the cap. Keep that count inside the statement; an
-        unconditional insert after a separate count would let two submissions both see
-        room.
+        A queue that is already full when read is rejected by that read alone, without
+        locks, so a flood of submissions against a full queue doesn't hold up other writers
+        (the worker saving results). That read only rejects; it never admits. Submissions
+        that pass it while the queue is near the cap may still be rejected by the count
+        inside the one INSERT ... SELECT statement. SQLite runs that statement under its
+        write lock. Postgres doesn't: a statement doesn't see rows of transactions still in
+        flight, so admission first takes a transaction-scoped advisory lock for `owner`,
+        and the statement's fresh READ COMMITTED snapshot then sees every earlier admission
+        for that owner. Either way the count sees the rows it races with, and concurrent
+        submissions, even through other connections, can't overshoot the cap. Other owners
+        and the worker never take that lock. Keep that count inside the statement; an
+        unconditional insert after a separate count would let two submissions both see room.
         """
         jobs = Job.__table__
         queued = (
@@ -138,6 +141,8 @@ class JobStore:
         row = select(*(literal(value, jobs.c[name].type) for name, value in values.items()))
         has_room = queued.correlate(None).scalar_subquery() < max_queued
         with self._session.begin() as session:
+            if self._engine.dialect.name == "postgresql":
+                session.execute(select(func.pg_advisory_xact_lock(_owner_lock_key(owner))))
             seq = session.scalar(
                 insert(jobs).from_select(list(values), row.where(has_room)).returning(jobs.c.seq)
             )
@@ -209,13 +214,22 @@ def _create_engine(database: Path | URL) -> Engine:
         # The worker holds no connection while rendering; pre-ping replaces one the server dropped
         # meanwhile (restart, failover, idle timeout), but can't save a result while the database
         # stays unreachable. A forced UTF-8 client encoding overrides URL and PGCLIENTENCODING
-        # settings, so every prompt and error text reaches a UTF8 database.
+        # settings, so every prompt and error text reaches a UTF8 database. READ COMMITTED
+        # overrides a stricter server default: queue admission needs each statement's fresh
+        # snapshot (see JobStore.create).
         return create_engine(
             database.set(drivername="postgresql+psycopg"),
             pool_pre_ping=True,
             connect_args={"client_encoding": "utf8"},
+            isolation_level="READ COMMITTED",
         )
     return _sqlite_engine(database)
+
+
+def _owner_lock_key(owner: str) -> int:
+    """Stable signed 64-bit advisory-lock key; a collision only serializes two owners."""
+    digest = hashlib.blake2b(owner.encode(errors="surrogatepass"), digest_size=8).digest()
+    return int.from_bytes(digest, signed=True)
 
 
 def _sqlite_engine(path: Path) -> Engine:

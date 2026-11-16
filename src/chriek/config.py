@@ -35,6 +35,7 @@ SETTING_NAMES = frozenset(
         "CHRIEK_ALLOWED_HOSTS",
         "CHRIEK_API_KEYS",
         "CHRIEK_AUTH_MODE",
+        "CHRIEK_DATABASE_URL",
         "CHRIEK_DB_PATH",
         "CHRIEK_HOST",
         "CHRIEK_MAX_DIMENSION",
