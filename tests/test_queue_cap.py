@@ -9,6 +9,7 @@ import pytest
 from conftest import (
     ALICE,
     BOB,
+    POSTGRES_URL,
     SMALL,
     StepBackend,
     base_env,
@@ -273,10 +274,24 @@ def test_existing_database_gains_the_owner_queue_index_and_keeps_its_jobs(tmp_pa
         store.close()
 
 
-def test_admission_racing_an_uncommitted_admission_never_exceeds_the_cap(tmp_path):
+@pytest.mark.parametrize(
+    "options",
+    [
+        None,
+        pytest.param(
+            r"-c default_transaction_isolation=repeatable\ read",
+            marks=pytest.mark.skipif(POSTGRES_URL is None, reason="sets a Postgres isolation"),
+        ),
+    ],
+    ids=["server-default", "repeatable-read-default"],
+)
+def test_admission_racing_an_uncommitted_admission_never_exceeds_the_cap(tmp_path, options):
     # Two stores, so two independent connection pools on one database. The first admission is
-    # paused after its INSERT, before COMMIT; the second must not admit past it.
+    # paused after its INSERT, before COMMIT; the second must not admit past it. A stricter
+    # server default must not change that (a REPEATABLE READ snapshot predates the lock wait).
     database = Settings.from_env(base_env(tmp_path)).database
+    if options:
+        database = database.update_query_dict({"options": options})
     first, second = JobStore(database), JobStore(database)
     inserted, release = threading.Event(), threading.Event()
 
