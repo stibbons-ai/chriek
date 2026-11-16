@@ -20,6 +20,10 @@ from chriek.storage import StorageError, private_image_root
 from chriek.store import JobStore
 from chriek.worker import Worker
 
+# These checks cover the SQLite database file next to the images. On Postgres, image privacy is
+# covered by the `chriek serve` walkthroughs in test_cli.py, which run on both databases.
+pytestmark = pytest.mark.sqlite
+
 # Runs in a child process so its umask never leaks into other tests.
 DIRECT_ENTRY_POINTS = """
 import json, sys, time

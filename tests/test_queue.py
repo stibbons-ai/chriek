@@ -177,7 +177,8 @@ CREATE TABLE images (
 @pytest.mark.sqlite
 def test_existing_sqlite_database_keeps_working(tmp_path):
     db_path = tmp_path / "db" / "chriek.db"
-    db_path.parent.mkdir()
+    db_path.parent.mkdir(mode=0o700)
+    db_path.touch(mode=0o600)  # chriek refuses existing data that other users can access
     job_id = str(uuid.uuid7())
     with sqlite3.connect(db_path) as connection:
         connection.executescript(PRE_POSTGRES_SQLITE_SCHEMA)
@@ -367,5 +368,5 @@ def test_unsaved_job_result_stops_the_worker_and_rejects_jobs_until_restart(
         assert wait_for(after, second["id"])["status"] == "succeeded"
     assert restarted.renders == 1
     with connect_db(tmp_path) as db:
-        stored = db.execute("SELECT id FROM jobs ORDER BY seq").fetchall()
-    assert stored == [(first["id"],), (second["id"],)], "a rejected job was persisted"
+        stored = db.scalars(text("SELECT id FROM jobs ORDER BY seq")).all()
+    assert stored == [first["id"], second["id"]], "a rejected job was persisted"

@@ -569,6 +569,7 @@ def test_chriek_serve_links_ignore_host_and_forwarded_headers(tmp_path):
         assert Image.open(io.BytesIO(download.content)).size == (16, 16)
 
 
+@pytest.mark.sqlite
 def test_chriek_serve_refuses_a_shared_database_directory_without_changing_it(tmp_path):
     shared = tmp_path / "shared"
     shared.mkdir()
@@ -602,7 +603,12 @@ def read_only_directory(tmp_path: Path) -> Path:
 @pytest.mark.parametrize(
     ("variable", "below"),
     [
-        pytest.param("CHRIEK_DB_PATH", regular_file, id="database below a regular file"),
+        pytest.param(
+            "CHRIEK_DB_PATH",
+            regular_file,
+            id="database below a regular file",
+            marks=pytest.mark.sqlite,
+        ),
         pytest.param("CHRIEK_STORAGE_DIR", regular_file, id="images below a regular file"),
         pytest.param(
             "CHRIEK_STORAGE_DIR",
@@ -626,6 +632,7 @@ def test_chriek_serve_reports_an_unusable_storage_path_without_a_traceback(
     assert tree_state(tmp_path) == before, "no database or directory may be created"
 
 
+@pytest.mark.sqlite
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
 def test_chriek_serve_reports_a_database_it_cannot_create_without_a_traceback(tmp_path):
     # Both preflights pass (the read-only directory is service-owned and not group- or

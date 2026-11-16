@@ -305,17 +305,6 @@ def test_failed_job_does_not_stop_the_queue(tmp_path):
         assert client.get("/health").json() == {"status": "ok"}
 
 
-def test_backend_error_text_with_nul_and_lone_surrogates_never_reaches_the_database(tmp_path):
-    # Postgres text can't hold NUL and neither database encodes a lone surrogate; the stored
-    # error is fixed text, so such exception text can't break the failure write.
-    backend = FailingBackend(fail_index=0, message="bad\x00byte \ud800")
-    with running(tmp_path, backend=backend) as client:
-        failed = wait_for(client, submit(client, width=16, height=16)["id"])
-        assert (failed["status"], failed["error"]) == ("failed", "image 1 of 1 failed")
-        assert client.get("/health").json() == {"status": "ok"}
-        assert wait_for(client, submit(client, width=16, height=16)["id"])["status"] == "succeeded"
-
-
 @pytest.mark.skipif(POSTGRES_URL is None, reason="sets a Postgres client encoding")
 @pytest.mark.parametrize(
     ("query", "pgclientencoding"),

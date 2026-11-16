@@ -7,19 +7,18 @@ then each test not marked `sqlite` gets its own fresh database there, dropped af
 """
 
 import os
-import sqlite3
 import stat
 import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, create_engine, make_url, text
+from sqlalchemy import URL, Connection, Engine, create_engine, make_url, text
 
 from chriek.api import create_app
 from chriek.backend import FakeBackend
@@ -90,13 +89,27 @@ def database(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[str | N
     assert not (tmp_path / "db").exists(), "a Postgres test wrote a SQLite database"
 
 
-def connect_db(tmp_path: Path) -> closing[sqlite3.Connection]:
-    return closing(sqlite3.connect(base_env(tmp_path)["CHRIEK_DB_PATH"]))
+@contextmanager
+def connect_db(tmp_path: Path) -> Iterator[Connection]:
+    """A transaction on this test's database, SQLite file or Postgres; commits on success."""
+    env = base_env(tmp_path)
+    url = env.get("CHRIEK_DATABASE_URL") or URL.create("sqlite", database=env["CHRIEK_DB_PATH"])
+    engine = create_engine(url)
+    try:
+        with engine.begin() as db:
+            yield db
+    finally:
+        engine.dispose()
 
 
 def db_dump(tmp_path: Path) -> str:
+    """Every stored row, in a stable order."""
     with connect_db(tmp_path) as db:
-        return "\n".join(db.iterdump())
+        return "\n".join(
+            repr(tuple(row))
+            for query in ("SELECT * FROM jobs ORDER BY seq", "SELECT * FROM images ORDER BY 1, 2")
+            for row in db.execute(text(query))
+        )
 
 
 def modes(root: Path) -> dict[str, int]:
@@ -126,9 +139,9 @@ def proxy_env(tmp_path: Path) -> dict[str, str]:
 
 
 def stored_owners(tmp_path: Path) -> list[str]:
-    """Owner of every stored job, oldest first, read from the SQLite file."""
+    """Owner of every stored job, oldest first, read from this test's database."""
     with connect_db(tmp_path) as db:
-        return [row[0] for row in db.execute("SELECT owner FROM jobs ORDER BY seq")]
+        return list(db.scalars(text("SELECT owner FROM jobs ORDER BY seq")))
 
 
 class FakeClock:
@@ -187,18 +200,16 @@ class PausingBackend(FakeBackend):
 
 class FailingBackend(FakeBackend):
     """Fake backend that fails only render number `fail_index` (0-based, counted across all
-    jobs, never reset) with `message`; counts renders. Jobs rendered after that one failure
-    succeed."""
+    jobs, never reset); counts renders. Jobs rendered after that one failure succeed."""
 
-    def __init__(self, fail_index: int, message: str = BACKEND_SECRET) -> None:
+    def __init__(self, fail_index: int) -> None:
         self.fail_index = fail_index
-        self.message = message
         self.renders = 0
 
     def render(self, prompt, width, height, seed):
         self.renders += 1
         if self.renders - 1 == self.fail_index:
-            raise RuntimeError(self.message) from OSError(f"cause: {self.message}")
+            raise RuntimeError(BACKEND_SECRET) from OSError(f"cause: {BACKEND_SECRET}")
         return super().render(prompt, width, height, seed)
 
 
