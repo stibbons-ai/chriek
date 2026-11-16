@@ -23,14 +23,19 @@ from conftest import (
     ALICE,
     BOB,
     SIGNING_SECRET,
+    SMALL,
     CountingBackend,
     FailingBackend,
     GatedBackend,
+    StepBackend,
     base_env,
     connect_db,
     db_dump,
     make_image_bytes,
+    post_job,
+    proxy_env,
     running,
+    stored_owners,
     submit,
     wait_for,
 )
@@ -42,6 +47,7 @@ from sqlalchemy.orm import Session
 
 import chriek.api
 from chriek.api import create_app
+from chriek.auth import PROXY_OWNER
 from chriek.backend import FakeBackend
 from chriek.config import Settings
 from chriek.signing import UrlSigner
@@ -449,6 +455,7 @@ def _draft_db_with_queued_edit_job(tmp_path: Path, refs: list[bytes]) -> str:
         seed=55,
         reference_count=len(refs),
         now=1_800_000_000.0,
+        max_queued=1,
     )
     store.close()
     with connect_db(tmp_path) as db, db:
@@ -2439,3 +2446,90 @@ def test_multi_image_uploads_keep_only_the_first_picture(client, tmp_path, fmt, 
     assert wait_for(client, job["id"])["status"] == "succeeded"
     red, green, blue = _stored_reference(tmp_path, job["id"]).getpixel((8, 8))
     assert red > 190 and green < 40 and blue < 40  # MPO is lossy JPEG
+
+
+class RecordingStepBackend(StepBackend):
+    """StepBackend that also records each render's reference top-left pixels, in order."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.references: dict[str, list[tuple[int, ...]]] = {}
+
+    def render(self, prompt, width, height, seed, references=()):
+        self.references[prompt] = [ref.getpixel((0, 0)) for ref in references]
+        return super().render(prompt, width, height, seed, references)
+
+
+def _reference_file(name: str, color: tuple[int, int, int]):
+    return ("references", (name, make_image_bytes(color), "image/png"))
+
+
+def test_full_queue_rejects_every_transport_and_leaves_no_reference_artifacts(tmp_path):
+    red, blue, green = (200, 0, 0), (0, 0, 200), (0, 200, 0)
+    storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
+    backend = RecordingStepBackend()
+    with running(tmp_path, backend=backend, CHRIEK_MAX_QUEUED_JOBS="1") as client:
+        first = submit(client, prompt="running", **SMALL)
+        backend.wait_started(1)  # running jobs free their slot
+        queued = submit_multipart(
+            client,
+            data=FORM_16 | {"prompt": "queued"},
+            files=[_reference_file("a.png", red), _reference_file("b.png", blue)],
+        )
+        before = (db_dump(tmp_path), sorted(p.relative_to(storage) for p in storage.rglob("*")))
+
+        rejected = [
+            post_job(client, "json", **SMALL),
+            post_multipart(client, data=FORM_16 | {"prompt": "text-only"}),
+            post_multipart(
+                client, data=FORM_16 | {"prompt": "edit"}, files=[_reference_file("c.png", green)]
+            ),
+        ]
+
+        for response in rejected:
+            assert response.status_code == 429, response.text
+            assert "location" not in response.headers
+        after = (db_dump(tmp_path), sorted(p.relative_to(storage) for p in storage.rglob("*")))
+        assert after == before, "a rejected admission must leave no row or reference file"
+        other_owner = submit_multipart(
+            client,
+            headers=BOB,
+            data=FORM_16 | {"prompt": "bob"},
+            files=[_reference_file("d", green)],
+        )
+
+        backend.step(3)
+        for job, owner in ((first, ALICE), (queued, ALICE), (other_owner, BOB)):
+            assert wait_for(client, job["id"], headers=owner)["status"] == "succeeded"
+        follow_up = submit_multipart(
+            client, data=FORM_16 | {"prompt": "follow-up"}, files=[_reference_file("e", blue)]
+        )
+        backend.step()
+        assert wait_for(client, follow_up["id"])["params"]["reference_count"] == 1
+    assert backend.prompts == ["running", "queued", "bob", "follow-up"]
+    assert backend.references == {
+        "running": [],
+        "queued": [red, blue],
+        "bob": [green],
+        "follow-up": [blue],
+    }
+
+
+def test_proxy_mode_edit_jobs_use_the_shared_owner_and_the_host_check(tmp_path):
+    storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
+    files = [_reference_file("a.png", (200, 0, 0))]
+    with running(tmp_path, env_base=proxy_env) as client:
+        job = submit_multipart(
+            client, headers={"X-Forwarded-User": "carol"}, data=FORM_16, files=files
+        )
+        body = wait_for(client, job["id"], headers={})
+        assert (body["status"], body["params"]["reference_count"]) == ("succeeded", 1)
+        jobs_before = sorted(p.name for p in storage.iterdir())
+
+        hostile = post_multipart(
+            client, headers={"Host": "evil.example"}, data=FORM_16, files=files
+        )
+
+        assert (hostile.status_code, hostile.text) == (400, "Invalid host header")
+        assert sorted(p.name for p in storage.iterdir()) == jobs_before
+    assert stored_owners(tmp_path) == [PROXY_OWNER]

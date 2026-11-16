@@ -259,7 +259,7 @@ In `multipart/form-data`, scalar fields use the same names with decimal integer 
 
 Multipart text parts have fixed bounds too, not configurable: at most 32 per request, counting every part without a filename whatever its name (unknown and repeated names included; `references` files count against `CHRIEK_MAX_REFERENCES` instead), each at most 1,048,576 bytes (1 MiB). Exceeding either returns `422` while the request is still being received.
 
-chriek parses multipart bodies itself rather than through Starlette's `Request.form()`, which spools file parts to temporary files and answers malformed bodies with `400`: its own parser reads the body only after the API key check, stops reading at the first chunk that crosses `CHRIEK_MAX_UPLOAD_BYTES`, the reference count or a text-part bound, and answers malformed or over-limit bodies with `422` whose `loc` names the field or the reference index (`["body", "references", 1]`).
+chriek parses multipart bodies itself rather than through Starlette's `Request.form()`, which spools file parts to temporary files and answers malformed bodies with `400`: its own parser reads the body only after authentication, stops reading at the first chunk that crosses `CHRIEK_MAX_UPLOAD_BYTES`, the reference count or a text-part bound, and answers malformed or over-limit bodies with `422`. The error's `loc` is `["body"]` for multipart framing errors and the `CHRIEK_MAX_UPLOAD_BYTES` cap, or names the field or the reference index where one applies (`["body", "references", 1]`).
 
 Two fixed byte budgets apply; neither is configurable:
 
@@ -270,7 +270,7 @@ An early rejection can leave the request body unread. Clients that finish upload
 
 Once the worker has [stopped on an unsaved result](#job-behaviour), a request that passes authentication, the body-size limit and validation returns `503 {"detail": "worker stopped: a job result could not be saved; restart chriek"}` instead of `202`: no `Location` header, no job stored, nothing run. Authentication (`401`), the body-size limit (`413`) and validation (`422`, `400`) are checked first and keep their answers. The check sees the worker state at the time of the request, so a job accepted just before a result fails to save stays `queued` until restart. This `503` takes precedence over a full-queue `429`.
 
-A valid request whose owner already has `CHRIEK_MAX_QUEUED_JOBS` queued jobs returns `429` instead and is not queued; see [Queue limit](#queue-limit). Validation comes first, so an invalid request gets `422` or `400` even when the queue is full.
+A valid request whose owner already has `CHRIEK_MAX_QUEUED_JOBS` queued jobs returns `429` instead and is not queued; see [Queue limit](#queue-limit). Validation comes first, so an invalid request gets `422` or `400` even when the queue is full. This holds for every transport: JSON, multipart without references and edit jobs with references alike. A rejected edit job's references are decoded and validated, then removed again: no job, no association and no reference files remain.
 
 ### `GET /jobs/{id}`
 

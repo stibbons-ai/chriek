@@ -242,12 +242,12 @@ class StepBackend(FakeBackend):
                 f"only {len(self.prompts)} of {renders} renders started"
             )
 
-    def render(self, prompt, width, height, seed):
+    def render(self, prompt, width, height, seed, references=()):
         with self._started:
             self.prompts.append(prompt)
             self._started.notify_all()
         assert self._steps.acquire(timeout=10), "render step never released"
-        return super().render(prompt, width, height, seed)
+        return super().render(prompt, width, height, seed, references)
 
 
 @contextmanager
