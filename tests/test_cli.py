@@ -64,11 +64,26 @@ def exit_output(process: subprocess.Popen) -> str:
 
 
 EMOJI_KEY = "\N{OTTER}" * 32
+DB_PASSWORD = "db-password-0123456789"
 LATIN1_KEY = "\N{LATIN SMALL LETTER E WITH ACUTE}" * 32
 CONTROL_KEY = ALICE_KEY + "\x07"
 MARKER = "public-url-secret-marker"
 URL_FORM = "CHRIEK_PUBLIC_URL must be an absolute http or https URL"
 PRINTABLE = "CHRIEK_PUBLIC_URL must contain only printable ASCII"
+# Password, host and database fragments a misplaced raw `@` would expose.
+AT_FRAGMENTS = (
+    "S3cr",
+    "tTail-9999",
+    "Pa55frag",
+    "MidSecret",
+    "TailSecret",
+    "SECa",
+    "SECb",
+    "Zq9pw",
+    "Tail-Secret99",
+)
+AT_ERROR = "CHRIEK_DATABASE_URL must percent-encode every @ as %40, except the one before the host"
+CONNINFO_ERROR = "CHRIEK_DATABASE_URL must not contain NUL characters (also as %00) or raw invalid"
 
 
 def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str) -> str:
@@ -78,11 +93,20 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
     assert process.returncode == 2
     assert output.startswith("chriek: configuration error: ")
     assert message in output
-    for secret in (ALICE_KEY, BOB_KEY, SIGNING_SECRET, "short-secret-key", "short-signing-secret"):
+    for secret in (
+        ALICE_KEY,
+        BOB_KEY,
+        SIGNING_SECRET,
+        "short-secret-key",
+        "short-signing-secret",
+        DB_PASSWORD,
+        *AT_FRAGMENTS,
+    ):
         assert secret not in output
     for secret in (EMOJI_KEY, LATIN1_KEY):
         assert secret[:2] not in output
     assert "PRIVATE KEY" not in output
+    assert "Traceback" not in output
     assert not (tmp_path / "db").exists(), "nothing may start on invalid configuration"
     return output
 
@@ -237,6 +261,49 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
             {"CHRIEK_AUTH_MODE": "proxy", "CHRIEK_API_KEYS": None, "CHRIEK_ALLOWED_HOSTS": "*"},
             "CHRIEK_ALLOWED_HOSTS entry 1",
         ),
+        (
+            {"CHRIEK_DATABASE_URL": f"postgresql://chriek:{DB_PASSWORD}@db:port/chriek"},
+            "CHRIEK_DATABASE_URL is not a valid database URL",
+        ),
+        ({"CHRIEK_DATABASE_URL": ""}, "CHRIEK_DATABASE_URL is not a valid database URL"),
+        (
+            {"CHRIEK_DATABASE_URL": f"mysql://chriek:{DB_PASSWORD}@db/chriek"},
+            "CHRIEK_DATABASE_URL must start with postgresql:// or postgresql+psycopg://",
+        ),
+        *(
+            ({"CHRIEK_DATABASE_URL": url}, AT_ERROR)
+            for url in (
+                "postgresql://chriek:S3cr@tTail-9999@db.invalid/chriek",
+                "postgresql://chriek:Pa55frag@MidSecret/TailSecret@db.invalid/chriek",
+                "postgresql://chriek:Pa55frag@MidSecret?TailSecret@db.invalid/chriek",
+                "postgresql://chriek:SECa@[SECb]@h.invalid/db",
+                # A reachable host would print the rest as a database name.
+                "postgresql://chriek:Pa55frag@127.0.0.1:1/TailSecret@db.invalid/chriek",
+                # A lone `@` the parser cannot place leaves the credentials in the database name.
+                "postgresql:///chriek:Zq9pw-Secret@db.invalid/chriek",
+                "postgresql://127.0.0.1/iek:Zq9pw-Secret@db.invalid/chriek",
+                # Without a database slash, `?` ends the authority: the query password splits.
+                "postgresql://db.internal?user=chriek&password=Zq9pw@Tail-Secret99",
+                "postgresql://?host=db.internal&user=chriek&password=Zq9pw@Tail-Secret99",
+                "postgresql://db.internal:5432?password=Zq9pw@Tail-Secret99",
+            )
+        ),
+        # %00 would truncate libpq's connection settings; \udcff is an undecodable 0xff byte.
+        *(
+            ({"CHRIEK_DATABASE_URL": f"postgresql://{rest}"}, CONNINFO_ERROR)
+            for rest in (
+                f"chriek:{DB_PASSWORD}%00@127.0.0.1:1/chriek",
+                f"chriek:{DB_PASSWORD}\udcff@127.0.0.1:1/chriek",
+                f"chr%00iek:{DB_PASSWORD}@127.0.0.1:1/chriek",
+                f"chr\udcffiek:{DB_PASSWORD}@127.0.0.1:1/chriek",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chr%00iek",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chr\udcffiek",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chriek?app%00name=x",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chriek?application_name=a%00b",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chriek?application_name=a\udcffb",
+                f"chriek:{DB_PASSWORD}@127.0.0.1:1/chriek?options=a&options=b%00",
+            )
+        ),
     ],
 )
 def test_invalid_configuration_exits_2_without_leaking_secrets(tmp_path, overrides, message):
@@ -270,6 +337,47 @@ def test_missing_public_url_exits_2_without_fallback(tmp_path):
     assert process.returncode == 2
     assert output.startswith("chriek: configuration error: CHRIEK_PUBLIC_URL is required")
     assert not (tmp_path / "db").exists(), "nothing may start without a public URL"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"postgresql://chriek:{DB_PASSWORD}@127.0.0.1:1/chriek",
+        # A driver message that echoes a password-bearing host name still hides the password.
+        f"postgresql://chriek:{DB_PASSWORD}@{DB_PASSWORD}.invalid/chriek",
+        # Percent-encoded reserved and non-ASCII characters are valid configuration.
+        "postgresql://chriek:db-%40%25%3F-%C3%A9-0123456789@127.0.0.1:1/chriek",
+        f"postgresql://chriek:{DB_PASSWORD}@[::1]:1/chriek",
+        "postgresql://chriek@/chriek?host=127.0.0.1&port=1&application_name=a%40b"
+        f"&password={DB_PASSWORD}",
+        # Query parameters straight after the authority, with and without user info.
+        f"postgresql://127.0.0.1:1?user=chriek&password={DB_PASSWORD}",
+        f"postgresql://chriek@127.0.0.1:1?password={DB_PASSWORD}",
+        # Host names Python's IDNA codec refuses (empty or 64-character label).
+        f"postgresql://chriek:{DB_PASSWORD}@a..b/chriek",
+        f"postgresql://chriek:{DB_PASSWORD}@{'a' * 64}.invalid/chriek",
+    ],
+    ids=[
+        "refused",
+        "echoed",
+        "encoded-unicode",
+        "ipv6",
+        "query",
+        "query-no-slash",
+        "userinfo-query-no-slash",
+        "empty-label",
+        "long-label",
+    ],
+)
+def test_unreachable_postgres_exits_1_without_leaking_the_password(tmp_path, url):
+    process = serve(base_env(tmp_path) | {"CHRIEK_DATABASE_URL": url})
+    output, _ = process.communicate(timeout=60)
+
+    assert process.returncode == 1, output
+    assert output.startswith("chriek: database error: "), output
+    assert "0123456789" not in output
+    assert "Traceback" not in output
+    assert not (tmp_path / "db").exists(), "CHRIEK_DATABASE_URL takes precedence over the path"
 
 
 def free_port() -> int:
@@ -320,29 +428,49 @@ def served(env: dict[str, str], **kwargs) -> Iterator[httpx2.Client]:
 
 # A non-ASCII signing secret stays valid: only API keys travel in headers.
 @pytest.mark.parametrize("signing_secret", [SIGNING_SECRET, EMOJI_KEY])
-def test_chriek_serve_round_trip(tmp_path, signing_secret):
+def test_chriek_serve_walkthrough_across_restart(tmp_path, signing_secret):
+    """Operator starts, stops and restarts `chriek serve`; alice submits, polls and downloads;
+    bob can't see her job. Runs on SQLite, or on Postgres with CHRIEK_TEST_POSTGRES_URL."""
     env = base_env(tmp_path) | {"CHRIEK_HOST": "127.0.0.1", "CHRIEK_SIGNING_SECRET": signing_secret}
     with served(env) as client:
         body = wait_for(client, submit(client, prompt="otter", image_count=2, seed=1)["id"])
 
         assert body["status"] == "succeeded", body
+        downloads = []
         for image in body["images"]:
             assert image["url"].startswith(f"{client.base_url}/images/{body['id']}/")
-            png = Image.open(io.BytesIO(client.get(image["url"]).content))
+            downloads.append(client.get(image["url"]).content)
+            png = Image.open(io.BytesIO(downloads[-1]))
             assert png.size == (1024, 1024)
             assert png.text["Seed"] == str(image["seed"])
+        assert client.get(f"/jobs/{body['id']}", headers=BOB).status_code == 404
         job = body["id"]
-        # Checked while serving, so the open database's WAL and SHM sidecars exist.
-        assert modes(tmp_path) == {
-            "db": 0o700,
-            "db/chriek.db": 0o600,
-            "db/chriek.db-wal": 0o600,
-            "db/chriek.db-shm": 0o600,
+        expected = {
             "images": 0o700,
             f"images/{job}": 0o700,
             f"images/{job}/0.png": 0o600,
             f"images/{job}/1.png": 0o600,
         }
+        if "CHRIEK_DATABASE_URL" not in env:
+            # Checked while serving, so the open database's WAL and SHM sidecars exist.
+            expected |= {
+                "db": 0o700,
+                "db/chriek.db": 0o600,
+                "db/chriek.db-wal": 0o600,
+                "db/chriek.db-shm": 0o600,
+            }
+        assert modes(tmp_path) == expected
+
+    with served(env) as client:
+        again = client.get(f"/jobs/{body['id']}", headers=ALICE).json()
+
+        assert {key: again[key] for key in body if key != "images"} == {
+            key: body[key] for key in body if key != "images"
+        }
+        assert [(image["index"], image["seed"]) for image in again["images"]] == [(0, 1), (1, 2)]
+        assert [client.get(image["url"]).content for image in again["images"]] == downloads
+        # Bob gets the same 404 as for a missing job, so he never receives a download URL.
+        assert client.get(f"/jobs/{body['id']}", headers=BOB).status_code == 404
 
 
 def test_chriek_serve_shipped_defaults_keep_jobs_private_across_restart(tmp_path):
@@ -364,15 +492,19 @@ def test_chriek_serve_shipped_defaults_keep_jobs_private_across_restart(tmp_path
         assert again["status"] == "succeeded"
         download = client.get(again["images"][0]["url"])
         job = body["id"]
-        assert modes(project) == {
+        expected = {
             "chriek-data": 0o700,
-            "chriek-data/chriek.db": 0o600,
-            "chriek-data/chriek.db-wal": 0o600,
-            "chriek-data/chriek.db-shm": 0o600,
             "chriek-data/images": 0o700,
             f"chriek-data/images/{job}": 0o700,
             f"chriek-data/images/{job}/0.png": 0o600,
         }
+        if "CHRIEK_DATABASE_URL" not in env:
+            expected |= {
+                "chriek-data/chriek.db": 0o600,
+                "chriek-data/chriek.db-wal": 0o600,
+                "chriek-data/chriek.db-shm": 0o600,
+            }
+        assert modes(project) == expected
 
     assert download.status_code == 200
     assert download.content == first
@@ -380,6 +512,7 @@ def test_chriek_serve_shipped_defaults_keep_jobs_private_across_restart(tmp_path
     assert stat.S_IMODE(project.stat().st_mode) == 0o755
 
 
+@pytest.mark.sqlite
 def test_chriek_serve_memory_database_runs_jobs_and_resets_on_restart(tmp_path):
     env = base_env(tmp_path) | {"CHRIEK_DB_PATH": ":memory:"}
     with served(env, cwd=tmp_path) as client:
@@ -436,6 +569,7 @@ def test_chriek_serve_links_ignore_host_and_forwarded_headers(tmp_path):
         assert Image.open(io.BytesIO(download.content)).size == (16, 16)
 
 
+@pytest.mark.sqlite
 def test_chriek_serve_refuses_a_shared_database_directory_without_changing_it(tmp_path):
     shared = tmp_path / "shared"
     shared.mkdir()
@@ -469,7 +603,12 @@ def read_only_directory(tmp_path: Path) -> Path:
 @pytest.mark.parametrize(
     ("variable", "below"),
     [
-        pytest.param("CHRIEK_DB_PATH", regular_file, id="database below a regular file"),
+        pytest.param(
+            "CHRIEK_DB_PATH",
+            regular_file,
+            id="database below a regular file",
+            marks=pytest.mark.sqlite,
+        ),
         pytest.param("CHRIEK_STORAGE_DIR", regular_file, id="images below a regular file"),
         pytest.param(
             "CHRIEK_STORAGE_DIR",
@@ -493,6 +632,7 @@ def test_chriek_serve_reports_an_unusable_storage_path_without_a_traceback(
     assert tree_state(tmp_path) == before, "no database or directory may be created"
 
 
+@pytest.mark.sqlite
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
 def test_chriek_serve_reports_a_database_it_cannot_create_without_a_traceback(tmp_path):
     # Both preflights pass (the read-only directory is service-owned and not group- or
@@ -508,6 +648,22 @@ def test_chriek_serve_reports_a_database_it_cannot_create_without_a_traceback(tm
     )
     assert "Traceback" not in output
     assert list(read_only.iterdir()) == [], "nothing may be created below the read-only directory"
+
+
+@pytest.mark.sqlite
+def test_chriek_serve_reports_a_corrupt_database_file_without_a_traceback(tmp_path):
+    # Private file in a private directory: the storage preflight passes, the driver refuses.
+    env = base_env(tmp_path)
+    database = Path(env["CHRIEK_DB_PATH"])
+    database.parent.mkdir(mode=0o700)
+    database.write_bytes(b"not a sqlite database " * 64)
+    database.chmod(0o600)
+    process = serve(env)
+    output, _ = process.communicate(timeout=30)
+
+    assert process.returncode == 1, output
+    assert output.startswith("chriek: database error: "), output
+    assert "Traceback" not in output
 
 
 def openssl(*args: str) -> None:

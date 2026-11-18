@@ -2,12 +2,26 @@
 
 import sqlite3
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import closing
 
 import pytest
-from conftest import ALICE, BOB, SMALL, StepBackend, base_env, post_job, running, submit, wait_for
+from conftest import (
+    ALICE,
+    BOB,
+    POSTGRES_URL,
+    SMALL,
+    StepBackend,
+    base_env,
+    connect_db,
+    post_job,
+    running,
+    submit,
+    wait_for,
+)
+from sqlalchemy import event, text
 
+from chriek.config import Settings
 from chriek.store import JobStore
 
 
@@ -27,8 +41,8 @@ def db_file(tmp_path) -> str:
 
 
 def stored_prompts(tmp_path) -> list[str]:
-    with sqlite3.connect(db_file(tmp_path)) as db:
-        return [row[0] for row in db.execute("SELECT prompt FROM jobs ORDER BY seq")]
+    with connect_db(tmp_path) as db:
+        return list(db.scalars(text("SELECT prompt FROM jobs ORDER BY seq")))
 
 
 @pytest.mark.parametrize(
@@ -37,7 +51,11 @@ def stored_prompts(tmp_path) -> list[str]:
         ({"CHRIEK_MAX_QUEUED_JOBS": "2"}, 2),
         ({}, 100),
         ({"CHRIEK_MAX_QUEUED_JOBS": "150"}, 150),
-        ({"CHRIEK_MAX_QUEUED_JOBS": "2", "CHRIEK_DB_PATH": ":memory:"}, 2),
+        pytest.param(
+            {"CHRIEK_MAX_QUEUED_JOBS": "2", "CHRIEK_DB_PATH": ":memory:"},
+            2,
+            marks=pytest.mark.sqlite,
+        ),
     ],
     ids=["configured", "default", "above-default", "memory-db"],
 )
@@ -65,6 +83,7 @@ def test_full_queue_rejects_with_429_without_storing_or_running_the_job(tmp_path
     assert backend.prompts == ["running", *(f"queued-{n}" for n in range(cap)), "after"]
 
 
+@pytest.mark.sqlite  # holds SQLite's write lock; Postgres admission takes no table lock
 def test_full_queue_rejects_while_another_connection_holds_the_write_lock(tmp_path):
     backend = StepBackend()
     with running(tmp_path, backend=backend, CHRIEK_MAX_QUEUED_JOBS="1") as client:
@@ -202,6 +221,7 @@ def test_concurrent_submissions_through_separate_connections_never_exceed_the_ca
             assert wait_for(one, job["id"])["status"] == "succeeded"
 
 
+@pytest.mark.sqlite  # reads SQLite's index catalog
 def test_existing_database_gains_the_owner_queue_index_and_keeps_its_jobs(tmp_path):
     # A database file from before the owner/status index: same schema, no such index.
     path = tmp_path / "existing.db"
@@ -252,3 +272,48 @@ def test_existing_database_gains_the_owner_queue_index_and_keeps_its_jobs(tmp_pa
         assert store.create(owner="alice", now=21.0, max_queued=2, **job) is not None
     finally:
         store.close()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        None,
+        pytest.param(
+            r"-c default_transaction_isolation=repeatable\ read",
+            marks=pytest.mark.skipif(POSTGRES_URL is None, reason="sets a Postgres isolation"),
+        ),
+    ],
+    ids=["server-default", "repeatable-read-default"],
+)
+def test_admission_racing_an_uncommitted_admission_never_exceeds_the_cap(tmp_path, options):
+    # Two stores, so two independent connection pools on one database. The first admission is
+    # paused after its INSERT, before COMMIT; the second must not admit past it. A stricter
+    # server default must not change that (a REPEATABLE READ snapshot predates the lock wait).
+    database = Settings.from_env(base_env(tmp_path)).database
+    if options:
+        database = database.update_query_dict({"options": options})
+    first, second = JobStore(database), JobStore(database)
+    inserted, release = threading.Event(), threading.Event()
+
+    def pause_before_commit(_connection):
+        inserted.set()
+        release.wait(10)
+
+    event.listen(first._engine, "commit", pause_before_commit)
+    job = {"prompt": "p", "image_count": 1, "width": 16, "height": 16, "seed": 1}
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            paused = pool.submit(first.create, owner="alice", now=1.0, max_queued=1, **job)
+            assert inserted.wait(10)
+            racing = pool.submit(second.create, owner="alice", now=2.0, max_queued=1, **job)
+            wait([racing], timeout=1)  # an unserialized admission completes within this window
+            release.set()
+            admitted, raced = paused.result(10), racing.result(10)
+    finally:
+        release.set()
+        first.close()
+        second.close()
+
+    assert admitted is not None
+    assert raced is None, "two admissions shared the last queued slot"
+    assert stored_prompts(tmp_path) == ["p"]

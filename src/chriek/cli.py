@@ -4,8 +4,11 @@ import argparse
 import logging
 import os
 import sys
+from pathlib import Path
 
 import uvicorn
+from sqlalchemy.engine import URL
+from sqlalchemy.exc import SQLAlchemyError
 
 from chriek.api import create_app
 from chriek.config import AuthMode, ConfigError, Settings
@@ -31,6 +34,11 @@ def main(argv: list[str] | None = None) -> int:
     except StorageError as error:
         print(f"chriek: storage error: {error}", file=sys.stderr)
         return 2
+    except (SQLAlchemyError, UnicodeError) as error:  # psycopg's IDNA host encoding: UnicodeError
+        print(
+            f"chriek: database error: {_database_error(error, settings.database)}", file=sys.stderr
+        )
+        return 1
     log = logging.getLogger("chriek")
     if settings.auth_mode is AuthMode.PROXY:
         log.warning(
@@ -50,3 +58,13 @@ def main(argv: list[str] | None = None) -> int:
         ssl_keyfile=settings.tls.keyfile if settings.tls else None,
     )
     return 0
+
+
+def _database_error(error: SQLAlchemyError | UnicodeError, database: Path | URL) -> str:
+    """The driver's message without SQLAlchemy's wrapper, and never the database password."""
+    message = str(getattr(error, "orig", None) or error)
+    if isinstance(database, URL):
+        for secret in (database.password, database.query.get("password")):
+            if isinstance(secret, str) and secret:
+                message = message.replace(secret, "***")
+    return message

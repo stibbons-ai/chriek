@@ -19,6 +19,7 @@ from conftest import (
     with_query,
 )
 from PIL import Image
+from sqlalchemy import text
 
 TRAINED_ALGORITHMIC_MEDIA = "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
 IPTC_EXT = "{http://iptc.org/std/Iptc4xmpExt/2008-02-29/}"
@@ -92,8 +93,8 @@ def test_download_needs_no_api_key_and_returns_the_png(client):
 def test_validly_signed_url_of_an_unpublished_image_is_404(tmp_path):
     with running(tmp_path) as client:
         url = finished_job(client)["images"][0]["url"]
-        with connect_db(tmp_path) as db, db:
-            db.execute("DELETE FROM images")  # the PNG stays on disk, signed and unexpired
+        with connect_db(tmp_path) as db:
+            db.execute(text("DELETE FROM images"))  # the PNG stays on disk, signed and unexpired
         assert client.get(url).status_code == 404
 
 

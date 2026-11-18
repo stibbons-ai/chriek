@@ -2,17 +2,21 @@
 
 import io
 import logging
+import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 
 import pytest
 from conftest import (
     ALICE,
     BOB,
+    POSTGRES_URL,
     CountingBackend,
     FailingBackend,
+    FakeClock,
     GatedBackend,
     connect_db,
     db_dump,
@@ -22,6 +26,7 @@ from conftest import (
     wait_for,
 )
 from PIL import Image
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from chriek.api import WORKER_STOPPED
@@ -106,6 +111,95 @@ def test_jobs_and_downloads_survive_a_clean_restart(tmp_path):
         assert after.get(again["images"][0]["url"]).status_code == 200
 
 
+def test_boundary_seeds_and_precise_timestamps_survive_a_restart(tmp_path):
+    # The largest seeds overflow a 32-bit INTEGER; microseconds need double precision.
+    clock = FakeClock(1_800_000_000.123457)
+    with running(tmp_path, clock=clock) as before:
+        submitted = submit(before, image_count=2, seed=2**32 - 2, width=16, height=16)
+        body = wait_for(before, submitted["id"])
+        assert body["status"] == "succeeded", body
+
+    with running(tmp_path, clock=clock) as after:
+        again = after.get(f"/jobs/{body['id']}", headers=ALICE).json()
+
+    assert again["params"]["seed"] == 2**32 - 2
+    assert [image["seed"] for image in again["images"]] == [2**32 - 2, 2**32 - 1]
+    expected = datetime.fromtimestamp(clock.now, UTC).isoformat()
+    assert expected.endswith(".123457+00:00")
+    assert [again[key] for key in ("created_at", "started_at", "finished_at")] == [expected] * 3
+
+
+@pytest.mark.skipif(POSTGRES_URL is None, reason="terminates a Postgres server connection")
+def test_connection_dropped_during_a_render_does_not_stop_the_worker(
+    tmp_path, database, postgres_admin
+):
+    backend = GatedBackend()
+    with running(tmp_path, backend=backend) as client:
+        first = submit(client, prompt="first", width=16, height=16)
+        assert backend.rendering.wait(5)
+
+        # Act: the server drops every idle pooled connection of this test's own database.
+        with postgres_admin.connect() as admin:
+            dropped = admin.execute(
+                text(
+                    "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid)) "
+                    "FROM pg_stat_activity WHERE datname = :name AND state = 'idle'"
+                ),
+                {"name": database},
+            ).scalar_one()
+        assert dropped >= 1
+        backend.release()
+
+        assert wait_for(client, first["id"])["status"] == "succeeded"
+        second = submit(client, prompt="second", width=16, height=16)
+        assert wait_for(client, second["id"])["status"] == "succeeded"
+        assert client.get("/health").json() == {"status": "ok"}
+
+
+# The schema created by chriek before Postgres support (base 06f0fbe), reflowed.
+PRE_POSTGRES_SQLITE_SCHEMA = """
+CREATE TABLE jobs (
+    seq INTEGER NOT NULL, id VARCHAR(36) NOT NULL, owner VARCHAR(64) NOT NULL,
+    status VARCHAR(16) NOT NULL, prompt TEXT NOT NULL, image_count INTEGER NOT NULL,
+    width INTEGER NOT NULL, height INTEGER NOT NULL, seed INTEGER NOT NULL,
+    created_at DOUBLE NOT NULL, started_at DOUBLE, finished_at DOUBLE, error TEXT,
+    run_record JSON, PRIMARY KEY (seq),
+    CHECK (status IN ('queued', 'running', 'succeeded', 'failed')), UNIQUE (id)
+);
+CREATE INDEX ix_jobs_status ON jobs (status);
+CREATE TABLE images (
+    job_id VARCHAR(36) NOT NULL, "index" INTEGER NOT NULL, seed INTEGER NOT NULL,
+    PRIMARY KEY (job_id, "index"), FOREIGN KEY(job_id) REFERENCES jobs (id)
+);
+"""
+
+
+@pytest.mark.sqlite
+def test_existing_sqlite_database_keeps_working(tmp_path):
+    db_path = tmp_path / "db" / "chriek.db"
+    db_path.parent.mkdir(mode=0o700)
+    db_path.touch(mode=0o600)  # chriek refuses existing data that other users can access
+    job_id = str(uuid.uuid7())
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript(PRE_POSTGRES_SQLITE_SCHEMA)
+        connection.execute(
+            "INSERT INTO jobs (id, owner, status, prompt, image_count, width, height, seed,"
+            " created_at) VALUES (?, 'alice', 'queued', 'old', 2, 16, 16, ?, 1800000000.5)",
+            (job_id, 2**32 - 2),
+        )
+    connection.close()
+
+    with running(tmp_path) as client:
+        old = wait_for(client, job_id)
+        assert old["status"] == "succeeded", old
+        assert [image["seed"] for image in old["images"]] == [2**32 - 2, 2**32 - 1]
+        assert client.get(old["images"][1]["url"]).status_code == 200
+        assert client.get(f"/jobs/{job_id}", headers=BOB).status_code == 404
+        new = wait_for(client, submit(client, width=16, height=16)["id"])
+        assert new["status"] == "succeeded", new
+
+
+@pytest.mark.sqlite
 @pytest.mark.parametrize("filename", ["chriek?home.db", "chriek%20home.db"])
 def test_database_path_is_used_literally_across_restart(tmp_path, filename):
     db_dir = tmp_path / "db"
@@ -122,6 +216,7 @@ def test_database_path_is_used_literally_across_restart(tmp_path, filename):
     assert sorted(path.name for path in db_dir.iterdir() if path.is_file()) == [filename]
 
 
+@pytest.mark.sqlite
 @pytest.mark.parametrize("sentinel", [":memory:", "./:memory:"])
 def test_memory_database_serves_one_lifetime_and_resets_on_restart(tmp_path, monkeypatch, sentinel):
     # A shared (0755) working directory: the database checks must skip it, not refuse it.
@@ -148,6 +243,7 @@ def test_memory_database_serves_one_lifetime_and_resets_on_restart(tmp_path, mon
     assert tree_state(cwd) == before_cwd
 
 
+@pytest.mark.sqlite
 def test_memory_database_keeps_every_write_under_concurrent_polling(tmp_path):
     backend = GatedBackend()
     with running(tmp_path, backend=backend, CHRIEK_DB_PATH=":memory:") as client:
@@ -188,7 +284,7 @@ def test_memory_database_keeps_every_write_under_concurrent_polling(tmp_path):
 def test_unsaved_job_result_stops_the_worker_and_rejects_jobs_until_restart(
     tmp_path, monkeypatch, caplog, store_method, first_render_fails
 ):
-    # Arrange: the first final-state write raises, as if SQLite were locked or the disk full.
+    # Arrange: the first final-state write raises, as if the database were locked or the disk full.
     # It waits until the second job is queued, so that job is admitted before the failure.
     original = getattr(JobStore, store_method)
     calls = []
@@ -272,5 +368,5 @@ def test_unsaved_job_result_stops_the_worker_and_rejects_jobs_until_restart(
         assert wait_for(after, second["id"])["status"] == "succeeded"
     assert restarted.renders == 1
     with connect_db(tmp_path) as db:
-        stored = db.execute("SELECT id FROM jobs ORDER BY seq").fetchall()
-    assert stored == [(first["id"],), (second["id"],)], "a rejected job was persisted"
+        stored = db.scalars(text("SELECT id FROM jobs ORDER BY seq")).all()
+    assert stored == [first["id"], second["id"]], "a rejected job was persisted"

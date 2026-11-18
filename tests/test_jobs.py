@@ -6,14 +6,17 @@ import pytest
 from conftest import (
     ALICE,
     BACKEND_SECRET,
+    POSTGRES_URL,
     CountingBackend,
     FailingBackend,
     assert_nothing_queued,
+    base_env,
     db_dump,
     running,
     submit,
     wait_for,
 )
+from sqlalchemy import make_url
 
 MAX_SEED = 2**32 - 1
 
@@ -89,6 +92,7 @@ INVALID_REQUESTS = {
     "missing-prompt": {"prompt": None},
     "blank-prompt": {"prompt": "   "},
     "prompt-too-long": {"prompt": "x" * 2001},
+    "nul-in-prompt": {"prompt": "a\x00b"},
     "prompt-not-string": {"prompt": 7},
     "width-not-multiple-of-16": {"width": 1000},
     "height-not-multiple-of-16": {"height": 17},
@@ -298,4 +302,28 @@ def test_failed_job_does_not_stop_the_queue(tmp_path):
         assert wait_for(client, failed["id"])["status"] == "failed"
         succeeded = submit(client, width=16, height=16)
         assert wait_for(client, succeeded["id"])["status"] == "succeeded"
+        assert client.get("/health").json() == {"status": "ok"}
+
+
+@pytest.mark.skipif(POSTGRES_URL is None, reason="sets a Postgres client encoding")
+@pytest.mark.parametrize(
+    ("query", "pgclientencoding"),
+    [
+        ({"client_encoding": "latin1"}, None),
+        ({"client_encoding": "SQL_ASCII"}, None),
+        ({}, "LATIN1"),
+    ],
+    ids=["url-latin1", "url-sql-ascii", "env-latin1"],
+)
+def test_unicode_survives_a_non_utf8_client_encoding_setting(
+    tmp_path, monkeypatch, query, pgclientencoding
+):
+    if pgclientencoding:
+        monkeypatch.setenv("PGCLIENTENCODING", pgclientencoding)
+    url = make_url(base_env(tmp_path)["CHRIEK_DATABASE_URL"]).update_query_dict(query)
+    prompt = "otter \N{OTTER}"
+    env = {"CHRIEK_DATABASE_URL": url.render_as_string(hide_password=False)}
+    with running(tmp_path, **env) as client:
+        job = wait_for(client, submit(client, prompt=prompt, width=16, height=16)["id"])
+        assert (job["status"], job["params"]["prompt"]) == ("succeeded", prompt)
         assert client.get("/health").json() == {"status": "ok"}

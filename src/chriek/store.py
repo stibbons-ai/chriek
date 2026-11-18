@@ -1,11 +1,14 @@
-"""SQLite job store. Status changes are conditional updates; a stale writer can't override them."""
+"""Job store on SQLite or Postgres. Status changes are conditional updates; a stale writer can't
+override them."""
 
+import hashlib
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     CheckConstraint,
     ForeignKey,
     Index,
@@ -29,6 +32,8 @@ from chriek.storage import private_database
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
 MEMORY_DATABASE = ":memory:"  # SQLite's sentinel for an ephemeral database
+# Seeds reach 2**32 - 1, which overflows a Postgres INTEGER.
+Seed = Annotated[int, mapped_column(BigInteger)]
 
 
 class Base(DeclarativeBase):
@@ -52,7 +57,7 @@ class Job(Base):
     image_count: Mapped[int]
     width: Mapped[int]
     height: Mapped[int]
-    seed: Mapped[int]
+    seed: Mapped[Seed]
     created_at: Mapped[float]
     started_at: Mapped[float | None]
     finished_at: Mapped[float | None]
@@ -68,13 +73,12 @@ class Image(Base):
 
     job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), primary_key=True)
     index: Mapped[int] = mapped_column(primary_key=True)
-    seed: Mapped[int]
+    seed: Mapped[Seed]
 
 
 class JobStore:
-    def __init__(self, db_path: Path) -> None:
-        self._engine = _create_engine(db_path)
-        event.listen(self._engine, "connect", _configure_sqlite)
+    def __init__(self, database: Path | URL) -> None:
+        self._engine = _create_engine(database)
         Base.metadata.create_all(self._engine)
         # create_all skips existing tables and so their indexes: add indexes introduced
         # after a database file was created. Idempotent; existing rows stay untouched.
@@ -101,16 +105,18 @@ class JobStore:
     ) -> Job | None:
         """Queue a job unless `owner` already has `max_queued` queued jobs; None if full.
 
-        A queue that is already full when read is rejected by that read alone, without the
-        write lock, so a flood of submissions against a full queue doesn't hold up other
-        writers (the worker saving results). That read only rejects; it never admits.
-        Submissions that pass it while the queue is near the cap wait for the write lock
-        and may still be rejected there: admission counts again inside the one
-        INSERT ... SELECT statement, which SQLite runs under the write lock, so the count
-        always sees the rows it races with and concurrent submissions, even through other
-        connections, can't overshoot the cap. Keep that count inside the statement; an
-        unconditional insert after a separate count would let two submissions both see
-        room.
+        A queue that is already full when read is rejected by that read alone, without
+        locks, so a flood of submissions against a full queue doesn't hold up other writers
+        (the worker saving results). That read only rejects; it never admits. Submissions
+        that pass it while the queue is near the cap may still be rejected by the count
+        inside the one INSERT ... SELECT statement. SQLite runs that statement under its
+        write lock. Postgres doesn't: a statement doesn't see rows of transactions still in
+        flight, so admission first takes a transaction-scoped advisory lock for `owner`,
+        and the statement's fresh READ COMMITTED snapshot then sees every earlier admission
+        for that owner. Either way the count sees the rows it races with, and concurrent
+        submissions, even through other connections, can't overshoot the cap. Other owners
+        and the worker never take that lock. Keep that count inside the statement; an
+        unconditional insert after a separate count would let two submissions both see room.
         """
         jobs = Job.__table__
         queued = (
@@ -135,6 +141,8 @@ class JobStore:
         row = select(*(literal(value, jobs.c[name].type) for name, value in values.items()))
         has_room = queued.correlate(None).scalar_subquery() < max_queued
         with self._session.begin() as session:
+            if self._engine.dialect.name == "postgresql":
+                session.execute(select(func.pg_advisory_xact_lock(_owner_lock_key(owner))))
             seq = session.scalar(
                 insert(jobs).from_select(list(values), row.where(has_room)).returning(jobs.c.seq)
             )
@@ -201,21 +209,47 @@ class JobStore:
         ).one_or_none()
 
 
-def _create_engine(db_path: Path) -> Engine:
-    if str(db_path) == MEMORY_DATABASE:  # Path("./:memory:") normalizes to ":memory:" too
+def _create_engine(database: Path | URL) -> Engine:
+    if isinstance(database, URL):
+        # The worker holds no connection while rendering; pre-ping replaces one the server dropped
+        # meanwhile (restart, failover, idle timeout), but can't save a result while the database
+        # stays unreachable. A forced UTF-8 client encoding overrides URL and PGCLIENTENCODING
+        # settings, so every prompt and error text reaches a UTF8 database. READ COMMITTED
+        # overrides a stricter server default: queue admission needs each statement's fresh
+        # snapshot (see JobStore.create).
+        return create_engine(
+            database.set(drivername="postgresql+psycopg"),
+            pool_pre_ping=True,
+            connect_args={"client_encoding": "utf8"},
+            isolation_level="READ COMMITTED",
+        )
+    return _sqlite_engine(database)
+
+
+def _owner_lock_key(owner: str) -> int:
+    """Stable signed 64-bit advisory-lock key; a collision only serializes two owners."""
+    digest = hashlib.blake2b(owner.encode(errors="surrogatepass"), digest_size=8).digest()
+    return int.from_bytes(digest, signed=True)
+
+
+def _sqlite_engine(path: Path) -> Engine:
+    if str(path) == MEMORY_DATABASE:  # Path("./:memory:") normalizes to ":memory:" too
         # An in-memory database exists only inside its one connection. A single-slot pool
         # keeps that connection for the store's lifetime and lends it to one session at a
         # time, so HTTP and worker threads share the data without interleaving transactions.
-        return create_engine(
+        engine = create_engine(
             URL.create("sqlite", database=MEMORY_DATABASE),
             poolclass=QueuePool,
             pool_size=1,
             max_overflow=0,
             connect_args={"check_same_thread": False},
         )
-    db_path = private_database(db_path)
-    # URL.create keeps the filename literal; an f-string URL would parse '?' and '%xx'.
-    return create_engine(URL.create("sqlite", database=str(db_path)))
+    else:
+        path = private_database(path)
+        # URL.create keeps the filename literal; an f-string URL would parse '?' and '%xx'.
+        engine = create_engine(URL.create("sqlite", database=str(path)))
+    event.listen(engine, "connect", _configure_sqlite)
+    return engine
 
 
 def _configure_sqlite(dbapi_connection, _record) -> None:

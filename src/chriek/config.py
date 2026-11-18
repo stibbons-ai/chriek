@@ -4,13 +4,17 @@ import ipaddress
 import os
 import re
 import ssl
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from sqlalchemy.engine import URL, make_url
+from sqlalchemy.exc import ArgumentError
+
 MIN_SECRET_LENGTH = 32
+POSTGRES_DRIVERS = ("postgresql", "postgresql+psycopg")
 KEY_NAME_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 # Host is a DNS name, an IPv4 address or a bracketed IPv6 literal; port is optional digits.
 # The bracket class excludes IPvFuture and zone IDs; urlsplit rejects other invalid literals.
@@ -31,6 +35,7 @@ SETTING_NAMES = frozenset(
         "CHRIEK_ALLOWED_HOSTS",
         "CHRIEK_API_KEYS",
         "CHRIEK_AUTH_MODE",
+        "CHRIEK_DATABASE_URL",
         "CHRIEK_DB_PATH",
         "CHRIEK_HOST",
         "CHRIEK_MAX_DIMENSION",
@@ -79,7 +84,7 @@ class Tls:
 
 @dataclass(frozen=True)
 class Settings:
-    db_path: Path
+    database: Path | URL  # SQLite file (or ":memory:") or a Postgres URL
     public_url: str  # scheme://authority[/prefix], no trailing slash
     storage_dir: Path
     auth_mode: AuthMode
@@ -123,7 +128,7 @@ class Settings:
             )
         return cls(
             public_url=_public_url(env.get("CHRIEK_PUBLIC_URL", "")),
-            db_path=Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db")),
+            database=_database(env),
             storage_dir=Path(env.get("CHRIEK_STORAGE_DIR", "chriek-data/images")),
             auth_mode=auth_mode,
             api_keys=api_keys,
@@ -139,6 +144,51 @@ class Settings:
                 else ()
             ),
         )
+
+
+def _database(env: Mapping[str, str]) -> Path | URL:
+    """CHRIEK_DATABASE_URL (Postgres) takes precedence over CHRIEK_DB_PATH (SQLite)."""
+    raw = env.get("CHRIEK_DATABASE_URL")
+    if raw is None:
+        return Path(env.get("CHRIEK_DB_PATH", "chriek-data/chriek.db"))
+    # The URL carries the database password: errors name the variable, never the value.
+    # A raw `@` outside the authority (a second one, or one after the first `/` or `?` past
+    # `://`) makes the parser split credentials into host or database names, which drivers echo.
+    if raw.count("@") > 1 or re.search(r"://[^/?]*[/?].*@", raw, re.DOTALL):
+        raise ConfigError(
+            "CHRIEK_DATABASE_URL must percent-encode every @ as %40, except the one before the host"
+        )
+    try:
+        url = make_url(raw)
+    except ArgumentError, ValueError:
+        raise ConfigError("CHRIEK_DATABASE_URL is not a valid database URL") from None
+    if url.drivername not in POSTGRES_DRIVERS:
+        raise ConfigError(
+            "CHRIEK_DATABASE_URL must start with postgresql:// or postgresql+psycopg://"
+        )
+    if not all(_is_conninfo_text(text) for text in _url_texts(url)):
+        raise ConfigError(
+            "CHRIEK_DATABASE_URL must not contain NUL characters (also as %00) or raw invalid UTF-8"
+        )
+    return url
+
+
+def _url_texts(url: URL) -> Iterator[str]:
+    """Every URL part the driver receives (percent-decoded except the host); repeated query
+    keys hold tuples."""
+    yield from (text for text in (url.username, url.password, url.host, url.database) if text)
+    for key, value in url.query.items():
+        yield key
+        yield from (value,) if isinstance(value, str) else value
+
+
+def _is_conninfo_text(text: str) -> bool:
+    """libpq takes NUL-terminated UTF-8 strings: a NUL truncates the connection settings."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return "\x00" not in text
 
 
 def _int(env: Mapping[str, str], name: str, default: int, low: int, high: int) -> int:
