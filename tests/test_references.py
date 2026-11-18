@@ -863,14 +863,19 @@ def test_json_and_multipart_body_caps_are_independent(tmp_path):
         download_pixels(client, job)
 
 
+# Media types are case-insensitive: a mixed-case multipart body must still stream under the
+# upload cap, not fall through to the (buffered) JSON path.
+@pytest.mark.parametrize("media_type", ["multipart/form-data", "Multipart/Form-Data"])
 def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_small_chunks(
-    tmp_path,
+    tmp_path, media_type
 ):
     ref_png = make_image_bytes((50, 100, 150), (16, 16))
-    ct_header, valid_body = encode_multipart(
+    _, valid_body = encode_multipart(
         {"prompt": "chunked edit", "seed": "9", "width": "16", "height": "16"},
         files=[("references", ("ref.png", ref_png, "image/png"))],
+        boundary="bound",
     )
+    ct_header = {"Content-Type": f"{media_type}; boundary=bound"}
     small_chunks = [valid_body[i : i + 7] for i in range(0, len(valid_body), 7)]
     assert len(small_chunks) > 20
 
@@ -879,9 +884,11 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
         status_code, created, consumed = asgi_post_jobs(client, ALICE | ct_header, small_chunks)
         assert status_code == 202, created
         assert consumed == len(small_chunks)
+        assert created["params"]["reference_count"] == 1
         finished = wait_for(client, created["id"])
         assert finished["status"] == "succeeded"
         assert finished["params"]["reference_count"] == 1
+        download_pixels(client, finished)
 
         # Over-limit multipart (with no files) aborts at chunk 6 (58-byte part header +
         # 5 * 400 = 2058 > 2048), leaving 16 of 22 chunks unread; whole-body loc ["body"].
@@ -889,7 +896,7 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
         mp_chunks = [mp_header] + [b"a" * 400 for _ in range(20)] + [b"\r\n--bound--\r\n"]
         mp_status, mp_err, mp_consumed = asgi_post_jobs(
             client,
-            ALICE | {"Content-Type": "multipart/form-data; boundary=bound"},
+            ALICE | ct_header,
             mp_chunks,
         )
         assert mp_status == 422
@@ -912,7 +919,7 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
         assert len(b"".join(count_chunks)) < 2048
         count_status, count_err, count_consumed = asgi_post_jobs(
             client,
-            ALICE | {"Content-Type": "multipart/form-data; boundary=bound"},
+            ALICE | ct_header,
             count_chunks,
         )
         assert count_status == 422
