@@ -1,5 +1,7 @@
-"""Exercise the image backend against stand-ins for the optional inference packages."""
+"""Exercise the MLX backend and its consumers without the optional inference packages."""
 
+import json
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,7 +10,7 @@ import pytest
 from conftest import running, submit, wait_for
 from PIL import Image
 
-from chriek import mlx_backend
+from chriek import cli, mlx_backend
 
 
 class Inference:
@@ -35,7 +37,7 @@ class Inference:
 
     def load(self, root, *, low_memory):
         self.loads.append((root, low_memory))
-        self.peak = 100
+        self.peak = max(self.peak, 100)
         if self.load_error is not None:
             raise self.load_error("load failed")
         return self.render
@@ -181,6 +183,31 @@ def test_measurements_are_per_job_not_per_image_or_process(inference, monkeypatc
     backend.render("a cat", 32, 16, 7)
     details = backend.run_details()
     assert (details["load_seconds"], details["peak_memory_bytes"]) == (0.0, 50)
+
+
+def test_smoke_prints_mlx_job_metrics(inference, tmp_path, monkeypatch, capsys):
+    for name in os.environ:
+        if name.upper().startswith("CHRIEK_"):
+            monkeypatch.delenv(name)
+    monkeypatch.setenv("CHRIEK_BACKEND", "mlx")
+    monkeypatch.setattr(mlx_backend, "perf_counter", iter([2.0, 3.25]).__next__)
+    inference.peak = 200  # Prior process activity must not count toward this job's peak.
+    output = tmp_path / "smoke.png"
+
+    assert cli.main(["smoke", "--out", str(output), "--width", "16", "--height", "16"]) == 0
+
+    record = json.loads(capsys.readouterr().out)
+    assert record["load_seconds"] == 1.25
+    assert record["peak_memory_bytes"] == 100
+    assert record["hardware"] == {
+        "chip": "Test chip",
+        "gpu_cores": 12,
+        "memory_gb": 64,
+        "macos_version": "27.2",
+    }
+    assert record["runtime"] == {"flux3_mlx": "0.1.0", "mlx": "0.32.4"}
+    assert record["precision"] == "BF16"
+    assert record["steps"] == 16
 
 
 @pytest.mark.parametrize("counter_failure", ["reset", "read"])
