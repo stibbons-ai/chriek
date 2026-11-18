@@ -38,6 +38,7 @@ SETTING_NAMES = frozenset(
         "CHRIEK_DATABASE_URL",
         "CHRIEK_DB_PATH",
         "CHRIEK_HOST",
+        "CHRIEK_JOB_TIMEOUT_SECONDS",
         "CHRIEK_MAX_DIMENSION",
         "CHRIEK_MAX_IMAGES",
         "CHRIEK_MAX_PIXELS",
@@ -91,6 +92,7 @@ class Settings:
     api_keys: Mapping[str, str]  # owner name -> key; empty in proxy mode
     signing_secret: str
     url_ttl_seconds: int
+    job_timeout_seconds: int  # running time, from started_at, after which a job fails
     limits: Limits
     host: str
     port: int
@@ -134,6 +136,7 @@ class Settings:
             api_keys=api_keys,
             signing_secret=signing_secret,
             url_ttl_seconds=_int(env, "CHRIEK_URL_TTL_SECONDS", 900, 1, 7 * 24 * 3600),
+            job_timeout_seconds=_int(env, "CHRIEK_JOB_TIMEOUT_SECONDS", 3600, 1, 7 * 24 * 3600),
             limits=limits,
             host=env.get("CHRIEK_HOST", "127.0.0.1"),
             port=_int(env, "CHRIEK_PORT", 8000, 1, 65535),

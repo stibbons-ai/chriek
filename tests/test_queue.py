@@ -14,10 +14,12 @@ from conftest import (
     ALICE,
     BOB,
     POSTGRES_URL,
+    SIGNING_SECRET,
     CountingBackend,
     FailingBackend,
     FakeClock,
     GatedBackend,
+    base_env,
     connect_db,
     db_dump,
     running,
@@ -30,6 +32,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from chriek.api import WORKER_STOPPED
+from chriek.signing import UrlSigner
 from chriek.store import JobStore
 from chriek.worker import Worker
 
@@ -66,7 +69,10 @@ def test_jobs_run_one_at_a_time_in_submission_order(tmp_path):
 
 def test_restart_fails_running_job_and_runs_queued_job(tmp_path):
     crashed_backend = GatedBackend()
-    with running(tmp_path, backend=crashed_backend) as before:
+    stale_clock = FakeClock()
+    with running(
+        tmp_path, backend=crashed_backend, clock=stale_clock, CHRIEK_JOB_TIMEOUT_SECONDS="60"
+    ) as before:
         running_job = submit(before, prompt="interrupted", width=16, height=16)
         assert crashed_backend.rendering.wait(5)
         queued_job = submit(before, prompt="survivor", image_count=2, seed=8, width=16, height=16)
@@ -87,13 +93,17 @@ def test_restart_fails_running_job_and_runs_queued_job(tmp_path):
             assert after.get(survivor["images"][1]["url"]).status_code == 200
             assert after.get(f"/jobs/{queued_job['id']}", headers=BOB).status_code == 404
 
-            # Let the stale process finish its render; stopping it waits for that.
+            # Let the stale process finish its render past its own deadline; stopping it waits
+            # for that. Its timeout check must not overwrite the interrupted failure.
+            stale_clock.advance(61)
             crashed_backend.release()
 
-    # The stale process's late result must not resurrect the failed job.
+    assert not [t for t in threading.enumerate() if t.name == "chriek-worker"], "worker not drained"
+    # The stale process's late result must not resurrect or relabel the failed job.
     with running(tmp_path) as later:
         stale = later.get(f"/jobs/{running_job['id']}", headers=ALICE).json()
         assert stale["status"] == "failed"
+        assert stale["error"] == "interrupted: the server stopped while this job was running"
         assert stale["images"] == []
     assert crashed_backend.prompts == ["interrupted"]
     assert not (tmp_path / "images" / running_job["id"]).exists()
@@ -370,3 +380,185 @@ def test_unsaved_job_result_stops_the_worker_and_rejects_jobs_until_restart(
     with connect_db(tmp_path) as db:
         stored = db.scalars(text("SELECT id FROM jobs ORDER BY seq")).all()
     assert stored == [first["id"], second["id"]], "a rejected job was persisted"
+
+
+class StepBackend(GatedBackend):
+    """Gated backend whose `release()` lets exactly one render through; `started` counts
+    renders waiting at the gate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._steps = threading.Semaphore(0)
+        self.started = threading.Semaphore(0)
+        super().release()  # the base gate stays open; `_steps` gates instead
+
+    def release(self) -> None:
+        self._steps.release()
+
+    def render(self, prompt, width, height, seed):
+        self.started.release()
+        assert self._steps.acquire(timeout=10), "gated render never released"
+        return super().render(prompt, width, height, seed)
+
+
+TIMED_OUT = "timed out: the job ran longer than CHRIEK_JOB_TIMEOUT_SECONDS"
+
+
+def test_stuck_job_times_out_and_its_late_result_is_discarded(tmp_path):
+    clock = FakeClock()
+    backend = StepBackend()
+    with running(tmp_path, backend=backend, clock=clock, CHRIEK_JOB_TIMEOUT_SECONDS="60") as client:
+        stuck = submit(client, prompt="stuck", width=16, height=16)
+        assert backend.started.acquire(timeout=5)
+        successor = submit(client, prompt="successor", width=16, height=16)
+
+        clock.advance(60)  # exactly at the deadline: still running
+        assert status(client, stuck["id"]) == "running"
+        clock.advance(1)
+        assert client.get(f"/jobs/{stuck['id']}", headers=BOB).status_code == 404
+        clock.advance(1)  # a write by Bob's poll would carry the earlier finished_at
+        failed = client.get(f"/jobs/{stuck['id']}", headers=ALICE).json()
+        assert (failed["status"], failed["error"], failed["images"]) == ("failed", TIMED_OUT, [])
+        assert failed["finished_at"] == datetime.fromtimestamp(clock.now, UTC).isoformat()
+        # Timing out frees nothing: the successor waits for the stuck render, never beside it.
+        assert status(client, successor["id"]) == "queued"
+
+        backend.release()
+        assert backend.started.acquire(timeout=5)  # successor claimed after 62 s queued
+        clock.advance(30)  # 92 s since submission, 30 s since claim
+        # Queued time does not count: only the time since the successor's claim does.
+        assert status(client, successor["id"]) == "running"
+        backend.release()
+        done = wait_for(client, successor["id"])
+        assert done["status"] == "succeeded", done
+        assert client.get(done["images"][0]["url"]).status_code == 200
+        late = client.get(f"/jobs/{stuck['id']}", headers=ALICE).json()
+        assert late == failed
+        assert client.get(signed_url(stuck["id"], clock)).status_code == 404
+
+    assert backend.max_active == 1
+    assert not (tmp_path / "images" / stuck["id"]).exists()
+
+
+@pytest.mark.sqlite  # holds SQLite's write lock; reads still pass under WAL
+def test_overdue_poll_under_a_write_lock_returns_running_then_fails_after_release(tmp_path, caplog):
+    clock = FakeClock()
+    backend = StepBackend()
+    with running(tmp_path, backend=backend, clock=clock, CHRIEK_JOB_TIMEOUT_SECONDS="60") as client:
+        stuck = submit(client, prompt="stuck", width=16, height=16)
+        assert backend.started.acquire(timeout=5)
+        clock.advance(61)
+
+        writer = sqlite3.connect(
+            base_env(tmp_path)["CHRIEK_DB_PATH"], timeout=0, isolation_level=None
+        )
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            with caplog.at_level(logging.ERROR, logger="chriek.api"):
+                held = client.get(f"/jobs/{stuck['id']}", headers=ALICE)
+        finally:
+            writer.close()
+        # Only the timeout write failed: the readable state comes back, details only in the log.
+        assert held.status_code == 200
+        assert (held.json()["status"], held.json()["error"]) == ("running", None)
+        assert "locked" not in held.text
+        assert f"could not time out job {stuck['id']}" in caplog.text
+        assert "database is locked" in caplog.text
+
+        polled = client.get(f"/jobs/{stuck['id']}", headers=ALICE)
+        assert polled.status_code == 200
+        assert (polled.json()["status"], polled.json()["error"]) == ("failed", TIMED_OUT)
+        backend.release()
+
+
+class LateBackend(GatedBackend):
+    """Gated render that may fail once, after release; then every clock read advances 1 s."""
+
+    def __init__(self, clock: TickingClock, fails: bool) -> None:
+        super().__init__()
+        self.clock = clock
+        self.fails = fails
+
+    def render(self, prompt, width, height, seed):
+        image = super().render(prompt, width, height, seed)
+        self.clock.tick = 1
+        fails, self.fails = self.fails, False
+        if fails:
+            raise RuntimeError("render failed after release")
+        return image
+
+
+class TickingClock(FakeClock):
+    tick = 0
+
+    def __call__(self) -> float:
+        now = self.now
+        self.now += self.tick
+        return now
+
+
+def wait_for_worker(tmp_path, job_id: str) -> None:
+    """Wait for the worker's own final write, read from the database so no poll can time out."""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with connect_db(tmp_path) as db:
+            query = text("SELECT status FROM jobs WHERE id = :id")
+            if db.scalar(query, {"id": job_id}) != "running":
+                return
+        time.sleep(0.01)
+    raise AssertionError(f"worker never finished job {job_id}")
+
+
+@pytest.mark.parametrize("fails", [False, True], ids=["late-success", "late-failure"])
+def test_result_finished_after_the_deadline_without_a_poll_fails_the_job(tmp_path, fails):
+    clock = TickingClock()
+    backend = LateBackend(clock, fails)
+    with running(tmp_path, backend=backend, clock=clock, CHRIEK_JOB_TIMEOUT_SECONDS="60") as client:
+        job = submit(client, width=16, height=16)
+        assert backend.rendering.wait(5)
+        clock.advance(61)
+        backend.release()  # nobody polls before the worker finishes
+        wait_for_worker(tmp_path, job["id"])
+
+        body = client.get(f"/jobs/{job['id']}", headers=ALICE).json()
+        assert (body["status"], body["error"]) == ("failed", TIMED_OUT)
+        assert (body["run"], body["images"]) == (None, [])
+        assert client.get(signed_url(job["id"], clock)).status_code == 404
+        assert wait_for(client, submit(client, width=16, height=16)["id"])["status"] == "succeeded"
+
+    assert not (tmp_path / "images" / job["id"]).exists()
+
+
+@pytest.mark.parametrize(
+    ("fails", "outcome"),
+    [(False, ("succeeded", None)), (True, ("failed", "image 1 of 1 failed"))],
+    ids=["success", "failure"],
+)
+def test_result_finished_exactly_at_the_deadline_keeps_its_outcome(tmp_path, fails, outcome):
+    # Every clock read after the render advances 1 s, so the worker must decide and persist
+    # with one completion time: within the limit, never a later one past it.
+    clock = TickingClock()
+    backend = LateBackend(clock, fails)
+    with running(tmp_path, backend=backend, clock=clock, CHRIEK_JOB_TIMEOUT_SECONDS="60") as client:
+        job = submit(client, width=16, height=16)
+        assert backend.rendering.wait(5)
+        clock.advance(60)
+        backend.release()
+        wait_for_worker(tmp_path, job["id"])
+
+        body = client.get(f"/jobs/{job['id']}", headers=ALICE).json()
+        assert (body["status"], body["error"]) == outcome
+        elapsed = datetime.fromisoformat(body["finished_at"]) - datetime.fromisoformat(
+            body["started_at"]
+        )
+        assert elapsed.total_seconds() == 60
+        assert len(body["images"]) == (0 if fails else 1)
+        if not fails:
+            assert client.get(body["images"][0]["url"]).status_code == 200
+
+
+def signed_url(job_id: str, clock: FakeClock) -> str:
+    """A valid, unexpired download URL for image 0, as if one had been issued."""
+    expires = int(clock()) + 60
+    signature = UrlSigner(SIGNING_SECRET).sign(uuid.UUID(job_id), 0, expires)
+    return f"/images/{job_id}/0.png?expires={expires}&sig={signature}"

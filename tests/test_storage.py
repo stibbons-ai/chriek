@@ -58,7 +58,7 @@ job = store.create(
     owner="alice", prompt="p", image_count=2, width=16, height=16, seed=0, now=0.0, max_queued=9
 )
 backend = PausingBackend()
-worker = Worker(store, backend, root / "data" / "images", time.time)
+worker = Worker(store, backend, root / "data" / "images", time.time, 3600)
 worker.start()
 assert backend.paused.wait(10)
 seen = {"job": job.id, "paused": modes(root)}
@@ -263,7 +263,7 @@ def test_a_worker_used_directly_refuses_unsafe_storage_before_touching_it(
     try:
         before = tree_state(tmp_path)
         with pytest.raises(StorageError, match="never changes existing permissions"):
-            Worker(store, FakeBackend(), tmp_path / images, lambda: 0.0)
+            Worker(store, FakeBackend(), tmp_path / images, lambda: 0.0, 3600)
         assert tree_state(tmp_path) == before, "nothing created or changed"
     finally:
         store.close()
@@ -537,7 +537,7 @@ store = JobStore(root / "alias" / ".." / "db" / "chriek.db")
 job = store.create(
     owner="alice", prompt="p", image_count=1, width=16, height=16, seed=0, now=0.0, max_queued=9
 )
-worker = Worker(store, FakeBackend(), root / "alias" / ".." / "images", time.time)
+worker = Worker(store, FakeBackend(), root / "alias" / ".." / "images", time.time, 3600)
 worker.start()
 deadline = time.monotonic() + 10
 try:

@@ -1,6 +1,7 @@
 """HTTP API: job submission and polling (authenticated), signed image downloads (no key)."""
 
 import json
+import logging
 import re
 import secrets
 import time
@@ -17,6 +18,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy.exc import OperationalError
 from starlette.types import Message
 
 from chriek.auth import Authenticate, authenticator
@@ -24,9 +26,10 @@ from chriek.backend import FakeBackend, ImageBackend
 from chriek.config import AuthMode, Limits, Settings
 from chriek.signing import UrlSigner
 from chriek.storage import check_database, private_image_root
-from chriek.store import MEMORY_DATABASE, SUCCEEDED, Job, JobStore
+from chriek.store import MEMORY_DATABASE, RUNNING, SUCCEEDED, Job, JobStore
 from chriek.worker import Worker, image_path
 
+log = logging.getLogger(__name__)
 MAX_SEED = 2**32 - 1
 WORKER_STOP_TIMEOUT_SECONDS = 30.0
 INDEX_PATTERN = re.compile(r"[0-9]{1,6}")
@@ -80,7 +83,9 @@ def create_app(
     storage_dir = private_image_root(settings.storage_dir)
     store = JobStore(settings.database)
     try:
-        worker = Worker(store, backend or FakeBackend(), storage_dir, clock)
+        worker = Worker(
+            store, backend or FakeBackend(), storage_dir, clock, settings.job_timeout_seconds
+        )
     except BaseException:
         store.close()
         raise
@@ -192,6 +197,17 @@ def create_app(
         job = store.get(owner, str(job_uuid)) if job_uuid else None
         if job is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+        now = clock()
+        if job.status == RUNNING and job.started_at < now - settings.job_timeout_seconds:
+            # A stuck render can't finish the job; the poll fails it. The conditional update
+            # loses to a result saved meanwhile, so the job is read again after it.
+            try:
+                store.fail_timed_out(job.id, settings.job_timeout_seconds, now)
+            except OperationalError:
+                # The row was readable: report it as read; a later poll retries the write.
+                log.exception("could not time out job %s", job.id)
+            else:
+                job = store.get(owner, job.id)
         return job_body(job)
 
     @app.get("/images/{job_id}/{index}.png")
