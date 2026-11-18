@@ -35,7 +35,7 @@ from sqlalchemy.exc import OperationalError
 from chriek.api import WORKER_STOPPED
 from chriek.signing import UrlSigner
 from chriek.store import JobStore
-from chriek.worker import Worker
+from chriek.worker import Worker, reference_path
 
 
 def status(client, job_id, headers=ALICE):
@@ -504,7 +504,7 @@ def wait_for_worker(tmp_path, job_id: str) -> None:
     while time.monotonic() < deadline:
         with connect_db(tmp_path) as db:
             query = text("SELECT status FROM jobs WHERE id = :id")
-            if db.scalar(query, {"id": job_id}) != "running":
+            if db.scalar(query, {"id": job_id}) not in ("queued", "running"):
                 return
         time.sleep(0.01)
     raise AssertionError(f"worker never finished job {job_id}")
@@ -595,6 +595,42 @@ def test_timed_out_edit_job_keeps_its_references_and_never_publishes_outputs(
         "references/0.png",
         "references/1.png",
     ]
+
+
+@pytest.mark.parametrize(
+    ("tick", "outcome"),
+    [
+        (31, ("failed", TIMED_OUT, False)),
+        (30, ("failed", "reference 2 of 2 could not be loaded", True)),
+    ],
+    ids=["past-deadline", "exact-deadline"],
+)
+def test_reference_load_failure_decides_and_persists_one_completion_time(tmp_path, tick, outcome):
+    clock = TickingClock()
+    backend = GatedBackend()
+    refs = [("references", (f"{i}.png", make_image_bytes((i, 0, 0)), "image/png")) for i in (1, 2)]
+    with running(tmp_path, backend=backend, clock=clock, CHRIEK_JOB_TIMEOUT_SECONDS="60") as client:
+        submit(client, prompt="hold", width=16, height=16)
+        assert backend.rendering.wait(5)
+        form = {"prompt": "edit", "width": "16", "height": "16"}
+        response = client.post("/jobs", headers=ALICE, data=form, files=refs)
+        assert response.status_code == 202, response.text
+        job = response.json()
+        reference_path(tmp_path / "images", job["id"], 1).unlink()
+        # From here each worker clock read advances `tick`: claim T, start T+tick, failure T+2*tick.
+        clock.tick = tick
+        backend.release()
+        wait_for_worker(tmp_path, job["id"])
+        clock.tick = 0
+
+        body = client.get(f"/jobs/{job['id']}", headers=ALICE).json()
+        assert (body["status"], body["error"], body["run"] is not None) == outcome
+        assert (body["images"], body["params"]["reference_count"]) == ([], 2)
+        elapsed = datetime.fromisoformat(body["finished_at"]) - datetime.fromisoformat(
+            body["started_at"]
+        )
+        assert elapsed.total_seconds() == 2 * tick
+        assert backend.prompts == ["hold"]
 
 
 def signed_url(job_id: str, clock: FakeClock) -> str:
