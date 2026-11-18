@@ -22,6 +22,7 @@ from conftest import (
     base_env,
     connect_db,
     db_dump,
+    make_image_bytes,
     running,
     submit,
     tree_state,
@@ -395,10 +396,10 @@ class StepBackend(GatedBackend):
     def release(self) -> None:
         self._steps.release()
 
-    def render(self, prompt, width, height, seed):
+    def render(self, prompt, width, height, seed, references=()):
         self.started.release()
         assert self._steps.acquire(timeout=10), "gated render never released"
-        return super().render(prompt, width, height, seed)
+        return super().render(prompt, width, height, seed, references)
 
 
 TIMED_OUT = "timed out: the job ran longer than CHRIEK_JOB_TIMEOUT_SECONDS"
@@ -479,8 +480,8 @@ class LateBackend(GatedBackend):
         self.clock = clock
         self.fails = fails
 
-    def render(self, prompt, width, height, seed):
-        image = super().render(prompt, width, height, seed)
+    def render(self, prompt, width, height, seed, references=()):
+        image = super().render(prompt, width, height, seed, references)
         self.clock.tick = 1
         fails, self.fails = self.fails, False
         if fails:
@@ -555,6 +556,45 @@ def test_result_finished_exactly_at_the_deadline_keeps_its_outcome(tmp_path, fai
         assert len(body["images"]) == (0 if fails else 1)
         if not fails:
             assert client.get(body["images"][0]["url"]).status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("polled", "fails"),
+    [(True, False), (False, False), (False, True)],
+    ids=["poll-then-late-success", "worker-late-success", "worker-late-failure"],
+)
+def test_timed_out_edit_job_keeps_its_references_and_never_publishes_outputs(
+    tmp_path, polled, fails
+):
+    clock = TickingClock()
+    backend = LateBackend(clock, fails)
+    refs = [("references", (f"{i}.png", make_image_bytes((i, 0, 0)), "image/png")) for i in (1, 2)]
+    with running(tmp_path, backend=backend, clock=clock, CHRIEK_JOB_TIMEOUT_SECONDS="60") as client:
+        form = {"prompt": "edit", "width": "16", "height": "16"}
+        response = client.post("/jobs", headers=ALICE, data=form, files=refs)
+        assert response.status_code == 202, response.text
+        job = response.json()
+        assert backend.rendering.wait(5)
+        clock.advance(61)
+        if polled:
+            assert status(client, job["id"]) == "failed"
+        backend.release()
+        wait_for_worker(tmp_path, job["id"])
+        assert backend.prompts == ["edit"]
+
+        body = client.get(f"/jobs/{job['id']}", headers=ALICE).json()
+        assert (body["status"], body["error"]) == ("failed", TIMED_OUT)
+        assert (body["run"], body["images"], body["params"]["reference_count"]) == (None, [], 2)
+        assert client.get(signed_url(job["id"], clock)).status_code == 404
+        assert client.get(f"/jobs/{job['id']}", headers=BOB).status_code == 404
+        assert wait_for(client, submit(client, width=16, height=16)["id"])["status"] == "succeeded"
+
+    # The private references outlive the timeout; no output was left beside them.
+    stored = tmp_path / "images" / job["id"]
+    assert sorted(p.relative_to(stored).as_posix() for p in stored.rglob("*.png")) == [
+        "references/0.png",
+        "references/1.png",
+    ]
 
 
 def signed_url(job_id: str, clock: FakeClock) -> str:
