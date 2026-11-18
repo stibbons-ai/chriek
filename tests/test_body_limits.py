@@ -71,8 +71,12 @@ def asgi_request(
     return start["status"], calls, dict(start["headers"]), body
 
 
+# multipart/mixed is not the multipart/form-data upload lane: the JSON body cap applies.
+NON_FORM_TYPES = ["application/json", "text/plain", "multipart/mixed; boundary=x"]
+
+
 @ROUTES
-@pytest.mark.parametrize("content_type", ["application/json", "text/plain"])
+@pytest.mark.parametrize("content_type", NON_FORM_TYPES)
 def test_declared_oversize_is_413_without_reading_the_body(tmp_path, method, path, content_type):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
@@ -83,7 +87,7 @@ def test_declared_oversize_is_413_without_reading_the_body(tmp_path, method, pat
         assert_nothing_queued(client, backend)
 
 
-@pytest.mark.parametrize("content_type", ["application/json", "text/plain"])
+@pytest.mark.parametrize("content_type", NON_FORM_TYPES)
 @pytest.mark.parametrize(
     "length", [None, "10", "not-a-number"], ids=["absent", "understated", "malformed"]
 )

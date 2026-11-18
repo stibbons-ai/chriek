@@ -56,6 +56,9 @@ from chriek.storage import StorageError
 from chriek.store import JobStore
 from chriek.worker import reference_path, write_references
 
+MAX_SEED = 2**32 - 1
+SMALL_FORM = {"width": "16", "height": "16"}
+
 
 def encode_multipart(
     data: dict[str, str],
@@ -218,6 +221,13 @@ def test_multipart_defaults_and_blank_seed_choose_random_seed(client):
     assert submitted["params"]["height"] == 1024
     assert submitted["params"]["reference_count"] == 0
     assert isinstance(submitted["params"]["seed"], int)
+
+
+def test_multipart_accepts_the_highest_valid_seed(client):
+    form = {"prompt": "harbor", "image_count": "2", "seed": str(MAX_SEED - 1)}
+    body = wait_for(client, submit_multipart(client, data=form | SMALL_FORM)["id"])
+    assert body["status"] == "succeeded"
+    assert [image["seed"] for image in body["images"]] == [MAX_SEED - 1, MAX_SEED]
 
 
 def test_references_change_fake_backend_output_deterministically_and_preserve_order(client):
@@ -924,6 +934,14 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
         ({"prompt": "hi", "width": "1000"}, None, ["body", "width"]),
         ({"prompt": "hi", "image_count": "0"}, None, ["body", "image_count"]),
         ({"prompt": "hi", "seed": "not-an-int"}, None, ["body", "seed"]),
+        ({"prompt": "hi", "seed": str(MAX_SEED + 1)} | SMALL_FORM, None, ["body", "seed"]),
+        (
+            {"prompt": "hi", "seed": str(MAX_SEED), "image_count": "2"} | SMALL_FORM,
+            None,
+            ["body", "seed"],
+        ),
+        ({"prompt": "hi", "seed": "9" * 5000} | SMALL_FORM, None, ["body", "seed"]),
+        ({"prompt": "hi", "width": "9" * 5000}, None, ["body", "width"]),
         ({"prompt": "hi", "unknown": "1"}, None, ["body", "unknown"]),
         (
             {"prompt": "hi"},
@@ -954,6 +972,10 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
         "non-multiple-width",
         "zero-images",
         "non-int-seed",
+        "seed-above-max",
+        "seed-overflows-with-count",
+        "5000-digit-seed",
+        "5000-digit-width",
         "unknown-field",
         "empty-reference",
         "corrupt-reference",
@@ -969,8 +991,7 @@ def test_invalid_multipart_requests_return_422_and_leave_no_files(
         response = post_multipart(client, headers=ALICE, data=data, files=files)
         assert response.status_code == 422, response.text
         assert expected_loc in [err["loc"] for err in response.json()["detail"]]
-        assert not any((tmp_path / "images").iterdir())
-        assert backend.renders == 0
+        _assert_nothing_persisted(tmp_path, backend)
 
 
 @pytest.mark.parametrize(
@@ -1285,7 +1306,7 @@ def test_non_rgb_and_transparent_references_are_stored_as_plain_rgb(tmp_path):
 def test_reference_pixel_limit_includes_exact_boundary(tmp_path, monkeypatch):
     form = {"prompt": "boundary", "width": "16", "height": "16"}
     exact_png = make_image_bytes(size=(32, 32))
-    over_png = make_image_bytes(size=(32, 33))
+    over_png = make_image_bytes(size=(25, 41))  # 1025 pixels, one over the limit
     loaded = []
     original_load = ImageFile.ImageFile.load
 
