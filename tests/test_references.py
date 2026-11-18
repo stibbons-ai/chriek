@@ -833,7 +833,9 @@ def test_reference_count_and_upload_byte_limits_are_configurable_and_enforced(tm
         assert job["params"]["reference_count"] == 16
 
 
-def test_json_and_multipart_body_caps_are_independent(tmp_path):
+# Media types are case-insensitive: a mixed-case multipart body above 2 MiB is still exempt.
+@pytest.mark.parametrize("media_type", ["multipart/form-data", "Multipart/Form-Data"])
+def test_json_and_multipart_body_caps_are_independent(tmp_path, media_type):
     """JSON keeps the fixed 2 MiB cap whatever CHRIEK_MAX_UPLOAD_BYTES says, and vice versa."""
     json_body = json.dumps({"prompt": "small cap", "width": 16, "height": 16}).encode()
     json_body = json_body[:-1] + b" " * (4096 - len(json_body)) + b"}"
@@ -849,15 +851,14 @@ def test_json_and_multipart_body_caps_are_independent(tmp_path):
 
     with running(tmp_path) as client:
         _, body = encode_multipart(
-            FORM_16, files=[("references", ("big.png", _BIG_PNG, "image/png"))]
+            FORM_16, files=[("references", ("big.png", _BIG_PNG, "image/png"))], boundary="big"
         )
         assert len(body) > 2 * 1024 * 1024
-        job = wait_for(
-            client,
-            submit_multipart(
-                client, data=FORM_16, files=[("references", ("big.png", _BIG_PNG, "image/png"))]
-            )["id"],
+        response = client.post(
+            "/jobs", headers=ALICE | {"Content-Type": f"{media_type}; boundary=big"}, content=body
         )
+        assert response.status_code == 202, response.text
+        job = wait_for(client, response.json()["id"])
         assert job["status"] == "succeeded"
         assert job["params"]["reference_count"] == 1
         download_pixels(client, job)
@@ -2016,6 +2017,8 @@ _PNG_ZTXT = _png_chunk(b"zTXt", b"k\x00\x00" + zlib.compress(b"text"))
 _PNG_ICCP = _png_chunk(b"iCCP", b"icc\x00\x00" + zlib.compress(b"\x00" * 128))
 # Nonzero compression flag, invalid UTF-8 text: Pillow inflates it, then drops it.
 _PNG_ITXT_ZIP = _png_chunk(b"iTXt", b"k\x00\x01\x00\x00\x00" + zlib.compress(b"\xff\xfe"))
+# Nonstandard nonzero flag: Pillow inflates any nonzero flag, so it must count as compressed.
+_PNG_ITXT_FLAG_2 = _png_chunk(b"iTXt", b"k\x00\x02\x00\x00\x00" + zlib.compress(b"\xff\xfe"))
 _PNG_ITXT_PLAIN = _png_chunk(b"iTXt", b"k\x00\x00\x00\x00\x00text")
 _PNG_EMPTY_IDAT = _png_chunk(b"IDAT", b"")
 # IHDR and IEND count towards MAX_PNG_CHUNKS too.
@@ -2251,6 +2254,11 @@ _BASELINE_16 = _jpeg(_noise_image((16, 16)))
                 id=f"png-{chunk[4:8].decode()}-flood-ending-after-idat",
             )
             for chunk in (_PNG_ZTXT, _PNG_ICCP, _PNG_ITXT_ZIP)
+        ),
+        pytest.param(
+            _png_around_idat(_PNG_ITXT_FLAG_2 * _PNG_MAX_COMPRESSED, _PNG_ITXT_FLAG_2),
+            "too many PNG chunks",
+            id="png-iTXt-flag-2-flood-ending-after-idat",
         ),
         pytest.param(
             _png_around_idat(_PNG_ZTXT * 3 + _PNG_ICCP * 3, _PNG_ITXT_ZIP * 3),
