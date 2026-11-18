@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import httpx2
 import pytest
+import uvicorn
 from conftest import (
     ALICE,
     ALICE_KEY,
@@ -37,6 +38,7 @@ from conftest import (
 from PIL import Image
 
 from chriek.auth import PROXY_OWNER
+from chriek.cli import main
 
 CHRIEK = Path(sys.executable).parent / "chriek"
 
@@ -109,6 +111,26 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
     assert "Traceback" not in output
     assert not (tmp_path / "db").exists(), "nothing may start on invalid configuration"
     return output
+
+
+@pytest.mark.parametrize(("setting", "value"), [("CHRIEK_BACKEND", "MLX"), ("CHRIEK_OFFLOAD", "")])
+def test_invalid_backend_configuration_stops_server(tmp_path, setting, value):
+    assert_config_error(serve(base_env(tmp_path) | {setting: value}), tmp_path, f"{setting} must")
+
+
+def test_mlx_without_extra_stops_before_opening_storage(tmp_path, monkeypatch, capsys):
+    for name, value in (base_env(tmp_path) | {"CHRIEK_BACKEND": "mlx"}).items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setitem(sys.modules, "mlx", None)
+    monkeypatch.setitem(sys.modules, "mlx.core", None)
+    monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: pytest.fail("server must not start"))
+
+    assert main(["serve"]) == 2
+    error = capsys.readouterr().err
+    assert "uv sync --locked --extra mlx" in error
+    assert "Traceback" not in error
+    assert not (tmp_path / "db").exists()
+    assert not (tmp_path / "images").exists()
 
 
 @pytest.mark.parametrize(

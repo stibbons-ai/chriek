@@ -13,6 +13,12 @@ dependencies = [
     "uvicorn>=0.54.0",
 ]
 
+[project.optional-dependencies]
+mlx = [
+    "flux3-mlx==0.1.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "huggingface-hub>=0.30; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
 [project.scripts]
 chriek = "chriek.cli:main"
 

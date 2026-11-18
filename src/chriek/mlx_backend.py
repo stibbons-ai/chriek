@@ -1,0 +1,155 @@
+"""Pinned BF16 FLUX 3 Image Klein inference on Apple Silicon."""
+
+import json
+import platform
+import subprocess
+from collections.abc import Sequence
+from importlib.metadata import version
+from pathlib import Path
+from time import perf_counter
+
+from PIL import Image
+
+from chriek.config import ConfigError
+
+# HF caches created before tree listings were recorded may return a partial snapshot.
+_MODEL_FILES = (
+    "model.safetensors",
+    "ae.safetensors",
+    "config.json",
+    "text_encoder/config.json",
+    "text_encoder/tokenizer.json",
+    "text_encoder/model-00001-of-00002.safetensors",
+    "text_encoder/model-00002-of-00002.safetensors",
+)
+_ALLOW_PATTERNS = (
+    "model.safetensors",
+    "ae.safetensors",
+    "config.json",
+    "LICENSE.md",
+    "NOTICE.md",
+    "text_encoder/*",
+)
+
+
+def _complete(root: Path) -> bool:
+    return all((root / name).is_file() for name in _MODEL_FILES)
+
+
+def _hardware() -> dict[str, object]:
+    import mlx.core as mx
+
+    device = mx.device_info()
+    display = subprocess.run(  # noqa: S603 -- fixed macOS executable and arguments
+        ["/usr/sbin/system_profiler", "SPDisplaysDataType", "-json"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    gpu_cores = next(
+        (
+            int(gpu["sppci_cores"])
+            for gpu in json.loads(display.stdout)["SPDisplaysDataType"]
+            if "sppci_cores" in gpu
+        ),
+        None,
+    )
+    return {
+        "chip": device["device_name"],
+        "gpu_cores": gpu_cores,
+        "memory_gb": round(device["memory_size"] / 2**30),
+        "macos_version": platform.mac_ver()[0],
+    }
+
+
+class MlxBackend:
+    name = "mlx"
+    model = "black-forest-labs/flux-3-image-klein"
+    revision = "09561231f44e41381c461caf53d5452005a60ac9"
+    steps = 16
+
+    def __init__(self, *, low_memory: bool):
+        try:
+            import mlx.core as mx
+            from flux3_mlx import Flux3Klein
+            from huggingface_hub import snapshot_download
+            from huggingface_hub.errors import LocalEntryNotFoundError
+        except (ImportError, OSError) as error:
+            raise ConfigError(
+                "CHRIEK_BACKEND=mlx requires the MLX extra on Apple Silicon: "
+                "uv sync --locked --extra mlx"
+            ) from error
+
+        self._mx = mx
+        self._load = Flux3Klein.from_pretrained
+        self._download = snapshot_download
+        self._cache_miss = LocalEntryNotFoundError
+        try:
+            self._hardware = _hardware()
+        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as error:
+            raise ConfigError("cannot read MLX hardware information") from error
+        self._runtime = {"flux3_mlx": version("flux3-mlx"), "mlx": version("mlx")}
+        self._low_memory = low_memory
+        self._pipeline = None
+        self._load_seconds = 0.0
+
+    def _snapshot(self) -> str:
+        try:
+            root = self._download(
+                self.model,
+                revision=self.revision,
+                allow_patterns=_MODEL_FILES,
+                local_files_only=True,
+            )
+            if _complete(Path(root)):
+                return root
+        except self._cache_miss:
+            pass
+        root = self._download(self.model, revision=self.revision, allow_patterns=_ALLOW_PATTERNS)
+        if not _complete(Path(root)):
+            raise RuntimeError("FLUX weights are incomplete; check HF_HOME and HF_HUB_OFFLINE")
+        return root
+
+    def start_job(self) -> None:
+        self._load_seconds = 0.0
+        self._mx.reset_peak_memory()
+
+    def run_details(self) -> dict[str, object]:
+        return {
+            "load_seconds": self._load_seconds,
+            "peak_memory_bytes": self._mx.get_peak_memory(),
+            "hardware": self._hardware,
+            "runtime": self._runtime,
+            "precision": "BF16",
+            "steps": self.steps,
+        }
+
+    def render(
+        self,
+        prompt: str,
+        width: int,
+        height: int,
+        seed: int,
+        references: Sequence[Image.Image] = (),
+    ) -> Image.Image:
+        if self._pipeline is None:
+            started = perf_counter()
+            try:
+                self._pipeline = self._load(self._snapshot(), low_memory=self._low_memory)
+            except SystemExit as error:
+                # flux3-mlx uses SystemExit for model format errors; don't terminate the worker.
+                raise RuntimeError("flux3-mlx could not load the model") from error
+            finally:
+                self._load_seconds = round(perf_counter() - started, 3)
+        image, _ = self._pipeline(
+            prompt,
+            list(references),
+            width=width,
+            height=height,
+            steps=self.steps,
+            guidance=None,
+            seed=seed,
+            upsample=False,
+        )
+        return image if image.mode == "RGB" else image.convert("RGB")

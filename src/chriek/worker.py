@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from chriek.backend import ImageBackend
+from chriek.backend import ImageBackend, JobMetrics, run_record
 from chriek.png import encode_png
 from chriek.storage import PRIVATE_DIR_MODE, private_image_root, write_private
 from chriek.store import Job, JobStore
@@ -77,17 +77,25 @@ class Worker:
         started = self._clock()
         partial = self._storage_dir / f"{job.id}.partial"
         final = self._storage_dir / job.id
+        metrics = self._backend if isinstance(self._backend, JobMetrics) else None
+        details: dict[str, object] = {}
         index = 0
         try:
-            shutil.rmtree(partial, ignore_errors=True)
-            partial.mkdir(mode=PRIVATE_DIR_MODE)
-            for index in range(job.image_count):
-                seed = job.seed + index
-                image = self._backend.render(job.prompt, job.width, job.height, seed)
-                png = encode_png(
-                    image, model=self._backend.model, revision=self._backend.revision, seed=seed
-                )
-                write_private(partial / f"{index}.png", png)
+            if metrics is not None:
+                metrics.start_job()
+            try:
+                shutil.rmtree(partial, ignore_errors=True)
+                partial.mkdir(mode=PRIVATE_DIR_MODE)
+                for index in range(job.image_count):
+                    seed = job.seed + index
+                    image = self._backend.render(job.prompt, job.width, job.height, seed)
+                    png = encode_png(
+                        image, model=self._backend.model, revision=self._backend.revision, seed=seed
+                    )
+                    write_private(partial / f"{index}.png", png)
+            finally:
+                if metrics is not None:
+                    details = metrics.run_details()
             partial.rename(final)
         except Exception:
             # Any image failure fails the whole job; already rendered images are discarded.
@@ -98,11 +106,13 @@ class Worker:
             finished = self._clock()
             error = f"image {index + 1} of {job.image_count} failed"
             if not self._fail_if_timed_out(job, finished):
-                self._store.fail(job.id, error, self._run_record(started, finished), finished)
+                self._store.fail(
+                    job.id, error, run_record(self._backend, finished - started, details), finished
+                )
             return
         finished = self._clock()
         if self._fail_if_timed_out(job, finished) or not self._store.succeed(
-            job.id, self._run_record(started, finished), finished
+            job.id, run_record(self._backend, finished - started, details), finished
         ):
             # The job is no longer running (timed out, or failed by restart recovery); never
             # publish it.
@@ -114,11 +124,3 @@ class Worker:
         return job.started_at < now - self._timeout_seconds and self._store.fail_timed_out(
             job.id, self._timeout_seconds, now
         )
-
-    def _run_record(self, started: float, finished: float) -> dict[str, object]:
-        return {
-            "backend": self._backend.name,
-            "model": self._backend.model,
-            "revision": self._backend.revision,
-            "render_seconds": round(finished - started, 3),
-        }
