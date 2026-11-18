@@ -173,6 +173,20 @@ def _palette_png_without_plte() -> bytes:
     )
 
 
+def _png_16x16(*middle: bytes, ihdr_size: int = 13) -> bytes:
+    """Real 16x16 RGB PNG; `middle` chunks go between two halves of its IDAT data."""
+    ihdr = struct.pack(">IIBBBBB", 16, 16, 8, 2, 0, 0, 0)[:ihdr_size]
+    idat = zlib.compress(b"\x00" * (16 * 3 + 1) * 16)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", idat[:10])
+        + b"".join(middle)
+        + _png_chunk(b"IDAT", idat[10:])
+        + _png_chunk(b"IEND", b"")
+    )
+
+
 def _png_bytes(image: Image.Image, **save_args) -> bytes:
     buf = io.BytesIO()
     image.save(buf, format="PNG", **save_args)
@@ -971,6 +985,18 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
             [("references", ("huge.png", make_image_bytes(size=(64, 64)), "image/png"))],
             ["body", "references", 0],
         ),
+        # Real corrupt PNGs: Pillow raises SyntaxError (bad chunk type between IDATs, during
+        # load) and ValueError (IHDR shorter than 13 bytes, during open).
+        (
+            {"prompt": "hi"},
+            [("references", ("x.png", _png_16x16(_png_chunk(b"-\xf4\0\0", b"")), "image/png"))],
+            ["body", "references", 0],
+        ),
+        (
+            {"prompt": "hi"},
+            [("references", ("x.png", _png_16x16(ihdr_size=12), "image/png"))],
+            ["body", "references", 0],
+        ),
     ],
     ids=[
         "missing-prompt",
@@ -989,6 +1015,8 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
         "corrupt-reference",
         "unexpected-file-field",
         "reference-exceeds-max-pixels",
+        "png-bad-chunk-type-syntax-error",
+        "png-truncated-ihdr-value-error",
     ],
 )
 def test_invalid_multipart_requests_return_422_and_leave_no_files(
@@ -1051,6 +1079,28 @@ def test_malformed_raw_multipart_returns_422(tmp_path, content_type, body):
         assert backend.renders == 0
         assert not any((tmp_path / "images").iterdir())
     assert stored_owners(tmp_path) == []
+
+
+def test_multipart_part_header_names_are_case_insensitive(client):
+    form = {"prompt": "lowercase headers", "seed": "7"} | SMALL_FORM
+    files = [("references", ("ref.png", make_image_bytes((200, 30, 90)), "image/png"))]
+    content_type, body = encode_multipart(form, files)
+    lowered = body.replace(b"Content-Disposition:", b"content-disposition:").replace(
+        b"Content-Type:", b"content-type:"
+    )
+    assert b"Content-" not in lowered
+
+    response = client.post("/jobs", headers=ALICE | content_type, content=lowered)
+    assert response.status_code == 202, response.text
+    assert response.json()["params"]["reference_count"] == 1
+    done = wait_for(client, response.json()["id"])
+    assert done["status"] == "succeeded"
+    assert done["params"]["reference_count"] == 1
+    # Same output as canonical header names: the reference reached the backend unchanged.
+    canonical = wait_for(client, submit_multipart(client, data=form, files=files)["id"])
+    text_only = wait_for(client, submit_multipart(client, data=form)["id"])
+    assert download_pixels(client, done) == download_pixels(client, canonical)
+    assert download_pixels(client, done) != download_pixels(client, text_only)
 
 
 def test_form_field_count_and_scalar_size_are_rejected_during_receipt(tmp_path):
