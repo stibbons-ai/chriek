@@ -1590,6 +1590,35 @@ def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_u
             path.chmod(0o700)
 
 
+def test_second_reference_write_failure_removes_the_first_and_stores_no_job(tmp_path, monkeypatch):
+    original_write = chriek.worker.write_private
+    failed_at: list[Path] = []
+
+    def fail_second_reference(path: Path, data: bytes) -> None:
+        if path.name == "1.png" and path.parent.name == "references":
+            # Only now, with reference 0 really on disk, does the write fail.
+            assert path.with_name("0.png").is_file()
+            failed_at.append(path)
+            raise OSError(28, "No space left on device")
+        original_write(path, data)
+
+    monkeypatch.setattr(chriek.worker, "write_private", fail_second_reference)
+    backend = CountingBackend()
+    app = create_app(Settings.from_env(base_env(tmp_path)), backend=backend)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = post_multipart(
+            client,
+            data=FORM_16,
+            files=[
+                _reference_file("a.png", (15, 85, 195)),
+                _reference_file("b.png", (195, 85, 15)),
+            ],
+        )
+    assert len(failed_at) == 1
+    assert resp.status_code == 500
+    _assert_nothing_persisted(tmp_path, backend)
+
+
 def test_submit_decodes_and_persists_off_the_event_loop(tmp_path, monkeypatch):
     threads: dict[str, int] = {}
     original_decode = chriek.api._decode_reference_png
