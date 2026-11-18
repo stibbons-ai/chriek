@@ -19,6 +19,7 @@ from conftest import (
     FailingBackend,
     FakeClock,
     GatedBackend,
+    base_env,
     connect_db,
     db_dump,
     running,
@@ -437,6 +438,37 @@ def test_stuck_job_times_out_and_its_late_result_is_discarded(tmp_path):
 
     assert backend.max_active == 1
     assert not (tmp_path / "images" / stuck["id"]).exists()
+
+
+@pytest.mark.sqlite  # holds SQLite's write lock; reads still pass under WAL
+def test_overdue_poll_under_a_write_lock_returns_running_then_fails_after_release(tmp_path, caplog):
+    clock = FakeClock()
+    backend = StepBackend()
+    with running(tmp_path, backend=backend, clock=clock, CHRIEK_JOB_TIMEOUT_SECONDS="60") as client:
+        stuck = submit(client, prompt="stuck", width=16, height=16)
+        assert backend.started.acquire(timeout=5)
+        clock.advance(61)
+
+        writer = sqlite3.connect(
+            base_env(tmp_path)["CHRIEK_DB_PATH"], timeout=0, isolation_level=None
+        )
+        try:
+            writer.execute("BEGIN IMMEDIATE")
+            with caplog.at_level(logging.ERROR, logger="chriek.api"):
+                held = client.get(f"/jobs/{stuck['id']}", headers=ALICE)
+        finally:
+            writer.close()
+        # Only the timeout write failed: the readable state comes back, details only in the log.
+        assert held.status_code == 200
+        assert (held.json()["status"], held.json()["error"]) == ("running", None)
+        assert "locked" not in held.text
+        assert f"could not time out job {stuck['id']}" in caplog.text
+        assert "database is locked" in caplog.text
+
+        polled = client.get(f"/jobs/{stuck['id']}", headers=ALICE)
+        assert polled.status_code == 200
+        assert (polled.json()["status"], polled.json()["error"]) == ("failed", TIMED_OUT)
+        backend.release()
 
 
 class LateBackend(GatedBackend):
