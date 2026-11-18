@@ -1945,8 +1945,13 @@ def _webp_chunk(kind: bytes, data: bytes) -> bytes:
     return kind + len(data).to_bytes(4, "little") + data + b"\x00" * (len(data) & 1)
 
 
-def _webp_with_chunks(*chunks: bytes, in_first_frame: bool = False) -> bytes:
-    """Extended-format WebP with `chunks` after VP8X, or after the first ANMF's frame data."""
+def _webp_with_chunks(
+    *chunks: bytes, in_first_frame: bool = False, top_level: bytes = b""
+) -> bytes:
+    """Extended-format WebP with `chunks` after VP8X, or after the first ANMF's frame data.
+
+    `top_level` is inserted after VP8X as well, so one file can carry both.
+    """
     frames = [_noise_image((24, 16)), Image.new("RGB", (24, 16), (30, 30, 200))]
     # A small EXIF makes Pillow write the extended format, with its VP8X header first.
     webp = bytearray(
@@ -1967,8 +1972,23 @@ def _webp_with_chunks(*chunks: bytes, in_first_frame: bool = False) -> bytes:
     else:
         at = 30  # RIFF header (12) + VP8X chunk (18)
     webp[at:at] = extra
+    webp[30:30] = top_level
     webp[4:8] = (len(webp) - 8).to_bytes(4, "little")
     return bytes(webp)
+
+
+def _webp_chunk_count(webp: bytes) -> int:
+    """Chunks in a WebP: top-level, each ANMF frame and the chunks inside the frames."""
+    pos, count = 12, 0
+    while pos < len(webp):
+        count += 1
+        size = (
+            16
+            if webp.startswith(b"ANMF", pos)
+            else int.from_bytes(webp[pos + 4 : pos + 8], "little")
+        )
+        pos += 8 + size + (size & 1)
+    return count
 
 
 def _reserved_jpeg_marker(code: int, payload: bytes) -> bytes:
@@ -2026,6 +2046,27 @@ _PNG_SPARE_CHUNKS = chriek.api.MAX_PNG_CHUNKS - 2
 _PNG_MAX_COMPRESSED = chriek.api.MAX_PNG_COMPRESSED_CHUNKS
 # Fixed, not derived from MAX_PNG_CHUNKS, so a loosened budget fails the tests.
 _PNG_FLOOD = 1000
+_WEBP_UNKNOWN = _webp_chunk(b"XTRA", b"")
+# A frame header with no image data: counted as a chunk although the walk steps into it.
+_WEBP_EMPTY_FRAME = _webp_chunk(b"ANMF", b"\x00" * 16)
+# The documented bound; fixed, not read from chriek.api, so a loosened budget fails the tests.
+_WEBP_MAX_CHUNKS = 256
+_WEBP_FLOOD = 1000
+
+
+def _webp_shared_budget(extra: int) -> bytes:
+    """Animated WebP with `_WEBP_MAX_CHUNKS + extra` chunks, the unknown ones split between
+    the top level and the first frame so that neither half alone comes near the budget."""
+
+    def animated(nested: int, top: int) -> bytes:
+        return _webp_with_chunks(
+            _WEBP_UNKNOWN * nested, in_first_frame=True, top_level=_WEBP_UNKNOWN * top
+        )
+
+    spare = _WEBP_MAX_CHUNKS - _webp_chunk_count(animated(0, 0))
+    webp = animated(spare // 2 + extra, spare - spare // 2)
+    assert _webp_chunk_count(webp) == _WEBP_MAX_CHUNKS + extra
+    return webp
 
 
 def _ordinary_png_with_profile_and_text() -> bytes:
@@ -2247,6 +2288,26 @@ _BASELINE_16 = _jpeg(_noise_image((16, 16)))
             "too much EXIF",
             id="webp-exif-inside-animation-frame",
         ),
+        pytest.param(
+            _webp_with_chunks(_WEBP_UNKNOWN * _WEBP_FLOOD),
+            "too many WebP chunks",
+            id="webp-unknown-chunk-flood",
+        ),
+        pytest.param(
+            _webp_with_chunks(_WEBP_UNKNOWN * _WEBP_FLOOD, in_first_frame=True),
+            "too many WebP chunks",
+            id="webp-unknown-chunk-flood-inside-animation-frame",
+        ),
+        pytest.param(
+            _webp_with_chunks(_WEBP_EMPTY_FRAME * _WEBP_FLOOD),
+            "too many WebP chunks",
+            id="webp-empty-frame-flood",
+        ),
+        pytest.param(
+            _webp_shared_budget(1),
+            f"too many WebP chunks (at most {_WEBP_MAX_CHUNKS},",
+            id="webp-top-level-and-frame-chunks-one-over-budget",
+        ),
         *(
             pytest.param(
                 _png_around_idat(chunk * _PNG_MAX_COMPRESSED, chunk),
@@ -2311,6 +2372,36 @@ def test_costly_uploads_are_rejected_before_pillow_opens_them(
         assert reason in error["msg"]
         assert decoder_entries == []
         _assert_nothing_persisted(tmp_path, backend)
+
+
+# FastAPI's JSON rule, which chriek's own body decoding keeps: main type `application`,
+# subtype `json` or `*+json`, case-insensitive.
+@pytest.mark.parametrize(
+    ("content_type", "accepted"),
+    [
+        ("application/vnd.api+json", True),
+        ("Application/VND.API+JSON", True),
+        ("text/x+json", False),
+        ("text/plain", False),
+    ],
+)
+def test_json_body_media_types_follow_fastapi_rule(tmp_path, content_type, accepted):
+    body = json.dumps({"prompt": "media type", **SMALL}).encode()
+    backend = CountingBackend()
+    with running(tmp_path, backend=backend) as client:
+        response = client.post(
+            "/jobs", headers=ALICE | {"Content-Type": content_type}, content=body
+        )
+        if not accepted:
+            assert response.status_code == 422, response.text
+            _assert_nothing_persisted(tmp_path, backend)
+            return
+        assert response.status_code == 202, response.text
+        done = wait_for(client, response.json()["id"])
+        assert done["status"] == "succeeded"
+        assert done["params"]["reference_count"] == 0
+        assert done["params"]["prompt"] == "media type"
+        download_pixels(client, done)
 
 
 def test_bug_in_the_structure_walk_is_logged_and_not_reported_as_an_invalid_image(
@@ -2419,6 +2510,7 @@ def test_compressed_exif_text_inflates_only_up_to_the_remaining_budget(
             _webp_with_chunks(_webp_chunk(b"EXIF", _ordinary_exif(1)), in_first_frame=True),
             id="webp-small-exif-inside-animation-frame",
         ),
+        pytest.param(_webp_shared_budget(0), id="webp-top-level-and-frame-chunks-at-budget"),
         pytest.param(_ordinary_png_with_profile_and_text(), id="png-icc-profile-and-text"),
         pytest.param(_BIG_PNG, id="png-many-8k-idat-chunks"),
         pytest.param(

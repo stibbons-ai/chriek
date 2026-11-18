@@ -91,6 +91,9 @@ _PNG_EXIF_TEXT_KEYWORDS = (b"exif", b"Raw profile type exif")
 MAX_PNG_CHUNKS = 256
 MAX_PNG_COMPRESSED_CHUNKS = 8
 MIN_UNCOUNTED_IDAT_BYTES = 1024
+# libwebp's demuxer keeps a record per chunk and the walk below loops once per chunk, so
+# empty chunks or frames cost work without pixel data; frames and their chunks count too.
+MAX_WEBP_CHUNKS = 256
 # A marker outside entropy-coded data: optional 0xFF fill bytes, then the marker code.
 _JPEG_MARKER = re.compile(rb"\xff(\xff*+)([^\x00\xff])")
 # End of entropy-coded scan data: the next marker that is neither stuffing (FF00), fill
@@ -788,6 +791,16 @@ def _decode_reference_png(
             ),
             "input": None,
         }
+    except _WebpTooComplex:
+        return None, {
+            "type": "value_error",
+            "loc": loc,
+            "msg": (
+                f"reference image {index} has too many WebP chunks (at most {MAX_WEBP_CHUNKS}, "
+                "counting each ANMF animation frame and every chunk inside it)"
+            ),
+            "input": None,
+        }
     except _ExifTooLarge:
         return None, {
             "type": "value_error",
@@ -829,6 +842,10 @@ class _PngTooComplex(_RejectedBeforeDecoding):
     pass
 
 
+class _WebpTooComplex(_RejectedBeforeDecoding):
+    pass
+
+
 class _ExifTooLarge(_RejectedBeforeDecoding):
     pass
 
@@ -848,7 +865,7 @@ def _check_before_decoding(data: bytes) -> None:
     elif data.startswith(_PNG_SIGNATURE):
         _check_png_structure(data)
     elif data.startswith(b"RIFF") and data.startswith(b"WEBP", 8):
-        _check_webp_exif(data)
+        _check_webp_structure(data)
 
 
 def _check_jpeg_structure(data: bytes) -> None:
@@ -987,15 +1004,20 @@ def _png_exif_text_size(kind: bytes, data: bytes, start: int, end: int, budget: 
         return 0
 
 
-def _check_webp_exif(data: bytes) -> None:
-    """Raise `_ExifTooLarge` when a WebP's `EXIF` chunks total more than `MAX_EXIF_BYTES`.
+def _check_webp_structure(data: bytes) -> None:
+    """Walk WebP chunks, top-level and inside `ANMF` frames, without decoding anything.
 
-    Counts top-level chunks and those inside `ANMF` frames: libwebp reads on after a frame's
-    image data as if at the top level, so an `EXIF` there is the image's EXIF too. A chunk cut
-    off by the end of the file counts what is there.
+    Raises `_WebpTooComplex` above `MAX_WEBP_CHUNKS` chunks, counting every top-level chunk,
+    every `ANMF` frame and every chunk inside one, and `_ExifTooLarge` when the `EXIF` chunks
+    total more than `MAX_EXIF_BYTES`. libwebp reads on after a frame's image data as if at
+    the top level, so an `EXIF` there is the image's EXIF too. A chunk cut off by the end of
+    the file counts what is there.
     """
-    pos, exif = 12, 0  # after RIFF, size, WEBP
+    pos, chunks, exif = 12, 0, 0  # after RIFF, size, WEBP
     while pos + 8 <= len(data):
+        chunks += 1
+        if chunks > MAX_WEBP_CHUNKS:
+            raise _WebpTooComplex
         if data.startswith(b"ANMF", pos):
             pos += 8 + 16  # chunk header, frame header; then the frame's chunks
             continue
