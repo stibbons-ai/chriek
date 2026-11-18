@@ -27,11 +27,13 @@ class Worker:
         backend: ImageBackend,
         storage_dir: Path,
         clock: Callable[[], float],
+        timeout_seconds: float,
     ) -> None:
         self._store = store
         self._backend = backend
         self._storage_dir = private_image_root(storage_dir)
         self._clock = clock
+        self._timeout_seconds = timeout_seconds
         self._wake = threading.Event()
         self._stopping = False
         self.stopped_on_error = False
@@ -91,15 +93,28 @@ class Worker:
             # The traceback stays in the server log; the public error never carries exception text.
             log.exception("job %s failed at image %d", job.id, index)
             shutil.rmtree(partial, ignore_errors=True)
+            # One completion time decides the timeout and is the one persisted.
+            finished = self._clock()
             error = f"image {index + 1} of {job.image_count} failed"
-            self._store.fail(job.id, error, self._run_record(started), self._clock())
+            if not self._fail_if_timed_out(job, finished):
+                self._store.fail(job.id, error, self._run_record(started, finished), finished)
             return
-        if not self._store.succeed(job.id, self._run_record(started), self._clock()):
-            # The job is no longer running (failed by a restart recovery); never publish it.
+        finished = self._clock()
+        if self._fail_if_timed_out(job, finished) or not self._store.succeed(
+            job.id, self._run_record(started, finished), finished
+        ):
+            # The job is no longer running (timed out, or failed by restart recovery); never
+            # publish it.
             shutil.rmtree(final, ignore_errors=True)
 
-    def _run_record(self, started: float) -> dict[str, object]:
-        finished = self._clock()
+    def _fail_if_timed_out(self, job: Job, now: float) -> bool:
+        """A result finished past the deadline fails the job as timed out, polled or not."""
+        # Local check first: a job finished in time costs no extra write.
+        return job.started_at < now - self._timeout_seconds and self._store.fail_timed_out(
+            job.id, self._timeout_seconds, now
+        )
+
+    def _run_record(self, started: float, finished: float) -> dict[str, object]:
         return {
             "backend": self._backend.name,
             "model": self._backend.model,

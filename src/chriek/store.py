@@ -31,6 +31,7 @@ from chriek.storage import private_database
 
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
+TIMED_OUT_ERROR = "timed out: the job ran longer than CHRIEK_JOB_TIMEOUT_SECONDS"
 MEMORY_DATABASE = ":memory:"  # SQLite's sentinel for an ephemeral database
 # Seeds reach 2**32 - 1, which overflows a Postgres INTEGER.
 Seed = Annotated[int, mapped_column(BigInteger)]
@@ -187,6 +188,20 @@ class JobStore:
                 .where(Job.status == RUNNING)
                 .values(status=FAILED, error=INTERRUPTED_ERROR, finished_at=now)
             )
+
+    def fail_timed_out(self, job_id: str, timeout_seconds: float, now: float) -> bool:
+        """Fail the job if it is still running more than `timeout_seconds` after it started."""
+        with self._session.begin() as session:
+            result = session.execute(
+                update(Job)
+                .where(
+                    Job.id == job_id,
+                    Job.status == RUNNING,
+                    Job.started_at < now - timeout_seconds,
+                )
+                .values(status=FAILED, error=TIMED_OUT_ERROR, finished_at=now)
+            )
+            return result.rowcount == 1
 
     def is_published(self, job_id: str, index: int) -> bool:
         with self._session() as session:

@@ -24,7 +24,7 @@ from chriek.backend import FakeBackend, ImageBackend
 from chriek.config import AuthMode, Limits, Settings
 from chriek.signing import UrlSigner
 from chriek.storage import check_database, private_image_root
-from chriek.store import MEMORY_DATABASE, SUCCEEDED, Job, JobStore
+from chriek.store import MEMORY_DATABASE, RUNNING, SUCCEEDED, Job, JobStore
 from chriek.worker import Worker, image_path
 
 MAX_SEED = 2**32 - 1
@@ -80,7 +80,9 @@ def create_app(
     storage_dir = private_image_root(settings.storage_dir)
     store = JobStore(settings.database)
     try:
-        worker = Worker(store, backend or FakeBackend(), storage_dir, clock)
+        worker = Worker(
+            store, backend or FakeBackend(), storage_dir, clock, settings.job_timeout_seconds
+        )
     except BaseException:
         store.close()
         raise
@@ -192,6 +194,12 @@ def create_app(
         job = store.get(owner, str(job_uuid)) if job_uuid else None
         if job is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+        now = clock()
+        if job.status == RUNNING and job.started_at < now - settings.job_timeout_seconds:
+            # A stuck render can't finish the job; the poll fails it. The conditional update
+            # loses to a result saved meanwhile, so the job is read again either way.
+            store.fail_timed_out(job.id, settings.job_timeout_seconds, now)
+            job = store.get(owner, job.id)
         return job_body(job)
 
     @app.get("/images/{job_id}/{index}.png")
