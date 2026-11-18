@@ -27,7 +27,7 @@ class Worker:
         backend: ImageBackend,
         storage_dir: Path,
         clock: Callable[[], float],
-        timeout_seconds: float,
+        timeout_seconds: int,
     ) -> None:
         self._store = store
         self._backend = backend
@@ -67,7 +67,8 @@ class Worker:
                 self._run(job)
             except Exception:
                 # Only the final state write can raise here. Fail closed: the job stays
-                # `running` until a restart fails it, and no later job may run alongside it.
+                # `running` until a restart or an overdue poll fails it, and no later job may run
+                # alongside it.
                 log.exception("could not record the result of job %s; worker stopped", job.id)
                 self.stopped_on_error = True
                 return

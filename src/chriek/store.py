@@ -189,7 +189,7 @@ class JobStore:
                 .values(status=FAILED, error=INTERRUPTED_ERROR, finished_at=now)
             )
 
-    def fail_timed_out(self, job_id: str, timeout_seconds: float, now: float) -> bool:
+    def fail_timed_out(self, job_id: str, timeout_seconds: int, now: float) -> bool:
         """Fail the job if it is still running more than `timeout_seconds` after it started."""
         with self._session.begin() as session:
             result = session.execute(

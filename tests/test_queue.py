@@ -381,21 +381,41 @@ def test_unsaved_job_result_stops_the_worker_and_rejects_jobs_until_restart(
     assert stored == [first["id"], second["id"]], "a rejected job was persisted"
 
 
+class StepBackend(GatedBackend):
+    """Gated backend whose `release()` lets exactly one render through; `started` counts
+    renders waiting at the gate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._steps = threading.Semaphore(0)
+        self.started = threading.Semaphore(0)
+        super().release()  # the base gate stays open; `_steps` gates instead
+
+    def release(self) -> None:
+        self._steps.release()
+
+    def render(self, prompt, width, height, seed):
+        self.started.release()
+        assert self._steps.acquire(timeout=10), "gated render never released"
+        return super().render(prompt, width, height, seed)
+
+
 TIMED_OUT = "timed out: the job ran longer than CHRIEK_JOB_TIMEOUT_SECONDS"
 
 
 def test_stuck_job_times_out_and_its_late_result_is_discarded(tmp_path):
     clock = FakeClock()
-    backend = GatedBackend()
+    backend = StepBackend()
     with running(tmp_path, backend=backend, clock=clock, CHRIEK_JOB_TIMEOUT_SECONDS="60") as client:
         stuck = submit(client, prompt="stuck", width=16, height=16)
-        assert backend.rendering.wait(5)
+        assert backend.started.acquire(timeout=5)
         successor = submit(client, prompt="successor", width=16, height=16)
 
         clock.advance(60)  # exactly at the deadline: still running
         assert status(client, stuck["id"]) == "running"
         clock.advance(1)
         assert client.get(f"/jobs/{stuck['id']}", headers=BOB).status_code == 404
+        clock.advance(1)  # a write by Bob's poll would carry the earlier finished_at
         failed = client.get(f"/jobs/{stuck['id']}", headers=ALICE).json()
         assert (failed["status"], failed["error"], failed["images"]) == ("failed", TIMED_OUT, [])
         assert failed["finished_at"] == datetime.fromtimestamp(clock.now, UTC).isoformat()
@@ -403,7 +423,11 @@ def test_stuck_job_times_out_and_its_late_result_is_discarded(tmp_path):
         assert status(client, successor["id"]) == "queued"
 
         backend.release()
-        # Queued time does not count: the successor waited past 60 s and still succeeds.
+        assert backend.started.acquire(timeout=5)  # successor claimed after 62 s queued
+        clock.advance(30)  # 92 s since submission, 30 s since claim
+        # Queued time does not count: only the time since the successor's claim does.
+        assert status(client, successor["id"]) == "running"
+        backend.release()
         done = wait_for(client, successor["id"])
         assert done["status"] == "succeeded", done
         assert client.get(done["images"][0]["url"]).status_code == 200
