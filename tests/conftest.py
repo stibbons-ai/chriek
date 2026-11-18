@@ -109,7 +109,11 @@ def db_dump(tmp_path: Path) -> str:
     with connect_db(tmp_path) as db:
         return "\n".join(
             repr(tuple(row))
-            for query in ("SELECT * FROM jobs ORDER BY seq", "SELECT * FROM images ORDER BY 1, 2")
+            for query in (
+                "SELECT * FROM jobs ORDER BY seq",
+                "SELECT * FROM images ORDER BY 1, 2",
+                "SELECT * FROM job_references ORDER BY 1, 2",
+            )
             for row in db.execute(text(query))
         )
 

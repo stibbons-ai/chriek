@@ -41,7 +41,7 @@ from conftest import (
 )
 from fastapi.testclient import TestClient
 from PIL import Image, ImageCms, ImageFile, ImageOps, PngImagePlugin
-from sqlalchemy import Select, event
+from sqlalchemy import Select, event, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -391,6 +391,7 @@ def test_reference_count_reported_across_all_job_statuses(tmp_path):
         assert failed_poll["params"]["reference_count"] == 3
 
 
+@pytest.mark.sqlite  # a database file created before reference support
 def test_old_sqlite_jobs_without_references_report_zero_reference_count(tmp_path):
     db_path = tmp_path / "db" / "chriek.db"
     db_path.parent.mkdir(mode=0o700)
@@ -458,11 +459,12 @@ def _draft_db_with_queued_edit_job(tmp_path: Path, refs: list[bytes]) -> str:
         max_queued=1,
     )
     store.close()
-    with connect_db(tmp_path) as db, db:
-        db.execute('ALTER TABLE job_references RENAME TO "references"')
+    with connect_db(tmp_path) as db:
+        db.execute(text('ALTER TABLE job_references RENAME TO "references"'))
     return job_id
 
 
+@pytest.mark.sqlite  # only SQLite drafts had the old table name
 def test_draft_database_reference_table_is_renamed_keeping_associations_and_order(tmp_path):
     ref_a = make_image_bytes((111, 22, 33))
     ref_b = make_image_bytes((44, 155, 66))
@@ -488,27 +490,51 @@ def test_draft_database_reference_table_is_renamed_keeping_associations_and_orde
     with running(tmp_path) as client:  # a second startup finds nothing left to rename
         assert client.get(f"/jobs/{job_id}", headers=ALICE).json()["params"]["reference_count"] == 2
     with connect_db(tmp_path) as db:
-        tables = {
-            row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
-        }
+        tables = set(db.scalars(text("SELECT name FROM sqlite_master WHERE type = 'table'")))
         assert "references" not in tables
-        rows = db.execute("SELECT job_id, `index` FROM job_references WHERE job_id = ?", (job_id,))
-        assert sorted(rows) == [(job_id, 0), (job_id, 1)]
+        rows = db.execute(
+            text('SELECT job_id, "index" FROM job_references WHERE job_id = :id'), {"id": job_id}
+        )
+        assert sorted(map(tuple, rows)) == [(job_id, 0), (job_id, 1)]
 
 
+@pytest.mark.sqlite
 def test_startup_refuses_a_database_with_both_reference_tables(tmp_path):
     job_id = _draft_db_with_queued_edit_job(tmp_path, [make_image_bytes()])
-    with connect_db(tmp_path) as db, db:
+    with connect_db(tmp_path) as db:
         db.execute(
-            'CREATE TABLE job_references (job_id VARCHAR(36) NOT NULL, "index" INTEGER NOT NULL, '
-            'PRIMARY KEY (job_id, "index"))'
+            text(
+                "CREATE TABLE job_references (job_id VARCHAR(36) NOT NULL, "
+                '"index" INTEGER NOT NULL, PRIMARY KEY (job_id, "index"))'
+            )
         )
-        db.execute('INSERT INTO job_references (job_id, "index") VALUES (?, 0)', (job_id,))
+        db.execute(
+            text('INSERT INTO job_references (job_id, "index") VALUES (:id, 0)'), {"id": job_id}
+        )
     before = db_dump(tmp_path)
 
     with pytest.raises(StorageError, match="job_references"):
         create_app(Settings.from_env(base_env(tmp_path)), backend=FakeBackend())
     assert db_dump(tmp_path) == before
+
+
+def test_postgres_never_renames_an_unrelated_references_table(tmp_path, database):
+    if database is None:
+        pytest.skip("Postgres only: SQLite drafts' `references` table is renamed")
+    with connect_db(tmp_path) as db:
+        db.execute(text('CREATE TABLE "references" (note TEXT)'))
+        db.execute(text("INSERT INTO \"references\" VALUES ('keep me')"))
+
+    with running(tmp_path) as client:
+        job = submit_multipart(
+            client,
+            data={"prompt": "edit", "width": "16", "height": "16"},
+            files=[("references", ("r.png", make_image_bytes(), "image/png"))],
+        )
+        assert wait_for(client, job["id"])["status"] == "succeeded"
+    with connect_db(tmp_path) as db:
+        assert list(db.scalars(text('SELECT note FROM "references"'))) == ["keep me"]
+        assert db.scalar(text("SELECT count(*) FROM job_references")) == 1
 
 
 def test_references_stored_with_safe_names_and_persist_across_restart_for_queued_job(tmp_path):
@@ -989,8 +1015,7 @@ def test_malformed_raw_multipart_returns_422(tmp_path, content_type, body):
         assert response.status_code == 422, response.text
         assert backend.renders == 0
         assert not any((tmp_path / "images").iterdir())
-    with sqlite3.connect(tmp_path / "db" / "chriek.db") as conn:
-        assert conn.execute("SELECT count(*) FROM jobs").fetchone() == (0,)
+    assert stored_owners(tmp_path) == []
 
 
 def test_form_field_count_and_scalar_size_are_rejected_during_receipt(tmp_path):
@@ -1228,8 +1253,7 @@ def test_non_rgb_and_transparent_references_are_stored_as_plain_rgb(tmp_path):
         assert invalid.json()["detail"][0]["loc"] == ["body", "references", 0]
         assert "not a valid image" in invalid.json()["detail"][0]["msg"]
         assert not any((tmp_path / "images").iterdir())
-        with sqlite3.connect(tmp_path / "db" / "chriek.db") as conn:
-            assert conn.execute("SELECT count(*) FROM jobs").fetchone() == (0,)
+        assert stored_owners(tmp_path) == []
 
         for name, upload in (
             ("1-bit-trns", _png_bytes(Image.new("1", (16, 16), 1), transparency=0)),
@@ -1383,8 +1407,7 @@ def test_invalid_reference_returns_422_in_non_default_interpreter_modes(
     )
     assert result.stdout.split()[-1] == b"422", result.stderr.decode()
     assert not any((tmp_path / "images").iterdir())
-    with sqlite3.connect(tmp_path / "db" / "chriek.db") as conn:
-        assert conn.execute("SELECT count(*) FROM jobs").fetchone() == (0,)
+    assert stored_owners(tmp_path) == []
 
 
 def test_mid_publish_failure_cleans_already_moved_outputs_and_keeps_references(
@@ -1464,7 +1487,7 @@ def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_u
         # Keep the worker busy so only the observer can claim the next queued job.
         blocker = submit(client, prompt="hold worker", width=16, height=16)
         assert gated.rendering.wait(5)
-        observer = JobStore(tmp_path / "db" / "chriek.db")
+        observer = JobStore(Settings.from_env(base_env(tmp_path)).database)
         monkeypatch.setattr(JobStore, "create", observed_create)
         event.listen(Session, "after_commit", claim_on_first_commit)
         try:
@@ -1716,8 +1739,7 @@ def _with_fill(data: bytes, fill: int) -> bytes:
 
 def _assert_nothing_persisted(tmp_path: Path, backend: CountingBackend) -> None:
     assert not any((tmp_path / "images").iterdir())
-    with sqlite3.connect(tmp_path / "db" / "chriek.db") as conn:
-        assert conn.execute("SELECT count(*) FROM jobs").fetchone() == (0,)
+    assert stored_owners(tmp_path) == []
     assert backend.renders == 0
 
 
