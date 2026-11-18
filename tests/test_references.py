@@ -22,6 +22,7 @@ import pytest
 from conftest import (
     ALICE,
     BOB,
+    POSTGRES_URL,
     SIGNING_SECRET,
     SMALL,
     CountingBackend,
@@ -518,9 +519,8 @@ def test_startup_refuses_a_database_with_both_reference_tables(tmp_path):
     assert db_dump(tmp_path) == before
 
 
-def test_postgres_never_renames_an_unrelated_references_table(tmp_path, database):
-    if database is None:
-        pytest.skip("Postgres only: SQLite drafts' `references` table is renamed")
+@pytest.mark.skipif(POSTGRES_URL is None, reason="SQLite drafts' `references` table is renamed")
+def test_postgres_never_renames_an_unrelated_references_table(tmp_path):
     with connect_db(tmp_path) as db:
         db.execute(text('CREATE TABLE "references" (note TEXT)'))
         db.execute(text("INSERT INTO \"references\" VALUES ('keep me')"))
@@ -915,6 +915,11 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
     [
         ({}, None, ["body", "prompt"]),
         ({"prompt": "   "}, None, ["body", "prompt"]),
+        (
+            {"prompt": "a\x00b"},
+            [("references", ("ref.png", make_image_bytes(), "image/png"))],
+            ["body", "prompt"],
+        ),
         ({"prompt": "hi", "width": "1024.0"}, None, ["body", "width"]),
         ({"prompt": "hi", "width": "1000"}, None, ["body", "width"]),
         ({"prompt": "hi", "image_count": "0"}, None, ["body", "image_count"]),
@@ -944,6 +949,7 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
     ids=[
         "missing-prompt",
         "blank-prompt",
+        "nul-in-prompt",
         "float-width",
         "non-multiple-width",
         "zero-images",
