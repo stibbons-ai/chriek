@@ -1,5 +1,6 @@
 """The local smoke command needs backend settings, not server settings."""
 
+import io
 import json
 import os
 
@@ -63,6 +64,42 @@ def test_smoke_edits_with_repeated_references_and_writes_disclosed_png(tmp_path,
         assert image.info["Model-Revision"] == "fake-v1"
         assert image.info["Seed"] == "9"
         assert DIGITAL_SOURCE_TYPE in image.info[XMP_KEY]
+
+
+def test_smoke_keeps_in_place_reference_when_png_write_fails(tmp_path, monkeypatch, capsys):
+    output = tmp_path / "reference.png"
+    with Image.new("RGB", (16, 16), "red") as image:
+        image.save(output)
+    original = output.read_bytes()
+    real_open = io.open
+
+    def open_with_failed_write(path, mode="r", *args, **kwargs):
+        file = real_open(path, mode, *args, **kwargs)
+        if "w" in mode and "b" in mode:
+            write = file.write
+
+            def fail(data):
+                write(data[:16])
+                raise OSError("disk full")
+
+            file.write = fail
+        return file
+
+    monkeypatch.setattr(io, "open", open_with_failed_write)
+    args = ["smoke", "--out", str(output), "--reference", str(output)]
+    args += ["--width", "16", "--height", "16"]
+    assert main(args) == 1
+    assert "cannot write PNG" in capsys.readouterr().err
+    assert output.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [output]
+
+
+def test_smoke_rejects_sequential_offload(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CHRIEK_OFFLOAD", "sequential")
+    output = tmp_path / "output.png"
+    assert main(["smoke", "--out", str(output), "--width", "16", "--height", "16"]) == 2
+    assert "CHRIEK_OFFLOAD must" in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_smoke_rejects_unknown_chriek_settings(tmp_path, monkeypatch, capsys):

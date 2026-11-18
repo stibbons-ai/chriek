@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from conftest import running, submit, wait_for
 from PIL import Image
 
 from chriek import mlx_backend
@@ -17,7 +18,8 @@ class Inference:
     def __init__(self, snapshot: Path):
         self.snapshot = snapshot
         self.cache_miss = False
-        self.fail_load = False
+        self.load_error = None
+        self.counter_failure = None
         self.lookups = []
         self.loads = []
         self.renders = []
@@ -34,12 +36,19 @@ class Inference:
     def load(self, root, *, low_memory):
         self.loads.append((root, low_memory))
         self.peak = 100
-        if self.fail_load:
-            raise RuntimeError("load failed")
+        if self.load_error is not None:
+            raise self.load_error("load failed")
         return self.render
 
     def reset_peak(self):
+        if self.counter_failure == "reset":
+            raise RuntimeError("counter unavailable")
         self.peak = 0
+
+    def get_peak(self):
+        if self.counter_failure == "read":
+            raise RuntimeError("counter unavailable")
+        return self.peak
 
     def render(self, prompt, references, **options):
         self.renders.append((prompt, references, options))
@@ -62,7 +71,7 @@ def inference(monkeypatch, tmp_path):
         path.parent.mkdir(exist_ok=True)
         path.touch()
     fake = Inference(tmp_path)
-    core = SimpleNamespace(reset_peak_memory=fake.reset_peak, get_peak_memory=lambda: fake.peak)
+    core = SimpleNamespace(reset_peak_memory=fake.reset_peak, get_peak_memory=fake.get_peak)
     monkeypatch.setitem(sys.modules, "mlx", SimpleNamespace(core=core))
     monkeypatch.setitem(sys.modules, "mlx.core", core)
     monkeypatch.setitem(
@@ -93,7 +102,7 @@ def inference(monkeypatch, tmp_path):
 
 
 def test_text_and_edit_pass_exact_inference_parameters_and_share_one_load(inference):
-    backend = mlx_backend.MlxBackend(low_memory=False)
+    backend = mlx_backend.MlxBackend()
     assert inference.loads == []
     backend.start_job()
     assert backend.render("a cat", 32, 16, 7).mode == "RGB"
@@ -112,15 +121,16 @@ def test_text_and_edit_pass_exact_inference_parameters_and_share_one_load(infere
     assert set(options["allow_patterns"]) >= {"model.safetensors", "ae.safetensors"}
 
 
+@pytest.mark.parametrize("load_error", [RuntimeError, SystemExit])
 @pytest.mark.parametrize("cache_miss", [True, False], ids=["no-snapshot", "incomplete-snapshot"])
-def test_missing_weights_download_and_retry(inference, cache_miss, monkeypatch):
+def test_missing_weights_download_and_retry(inference, cache_miss, load_error, monkeypatch):
     monkeypatch.setattr(mlx_backend, "perf_counter", iter([0.0, 1.25, 2.0, 3.0]).__next__)
-    backend = mlx_backend.MlxBackend(low_memory=True)
+    backend = mlx_backend.MlxBackend()
     inference.cache_miss = cache_miss
     weights = inference.snapshot / "model.safetensors"
     if not cache_miss:
         weights.unlink()
-    inference.fail_load = True
+    inference.load_error = load_error
     backend.start_job()
     with pytest.raises(RuntimeError):
         backend.render("a cat", 32, 16, 7)
@@ -139,16 +149,17 @@ def test_missing_weights_download_and_retry(inference, cache_miss, monkeypatch):
     assert backend.run_details()["load_seconds"] == 1.25
     assert backend.run_details()["peak_memory_bytes"] == 100
 
-    inference.cache_miss = inference.fail_load = False
+    inference.cache_miss = False
+    inference.load_error = None
     backend.start_job()
     backend.render("a cat", 32, 16, 7)
-    assert inference.loads == [(str(inference.snapshot), True)] * 2
+    assert inference.loads == [(str(inference.snapshot), False)] * 2
     assert len(inference.lookups) == 3 and inference.lookups[-1][1]["local_files_only"] is True
 
 
 def test_measurements_are_per_job_not_per_image_or_process(inference, monkeypatch):
     monkeypatch.setattr(mlx_backend, "perf_counter", iter([2.0, 3.25]).__next__)
-    backend = mlx_backend.MlxBackend(low_memory=False)
+    backend = mlx_backend.MlxBackend()
     backend.start_job()
     backend.render("a cat", 32, 16, 7)
     backend.render("a cat", 32, 16, 8)
@@ -170,3 +181,26 @@ def test_measurements_are_per_job_not_per_image_or_process(inference, monkeypatc
     backend.render("a cat", 32, 16, 7)
     details = backend.run_details()
     assert (details["load_seconds"], details["peak_memory_bytes"]) == (0.0, 50)
+
+
+@pytest.mark.parametrize("counter_failure", ["reset", "read"])
+def test_peak_counter_failure_does_not_discard_images(inference, tmp_path, caplog, counter_failure):
+    backend = mlx_backend.MlxBackend()
+    with running(tmp_path, backend=backend) as client:
+        inference.counter_failure = counter_failure
+        job = wait_for(client, submit(client, width=16, height=16)["id"])
+        assert job["status"] == "succeeded"
+        assert job["error"] is None
+        assert [image["index"] for image in job["images"]] == [0]
+        assert client.get(job["images"][0]["url"]).content.startswith(b"\x89PNG")
+        run = job["run"]
+        assert run["peak_memory_bytes"] is None
+        assert run["load_seconds"] >= 0.0
+        assert run["hardware"]["chip"] == "Test chip"
+        assert run["runtime"] == {"flux3_mlx": "0.1.0", "mlx": "0.32.4"}
+        assert (run["precision"], run["steps"]) == ("BF16", 16)
+        assert "counter unavailable" in caplog.text
+
+        inference.counter_failure = None
+        recovered = wait_for(client, submit(client, width=16, height=16)["id"])
+        assert recovered["run"]["peak_memory_bytes"] == 50

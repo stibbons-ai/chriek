@@ -113,7 +113,10 @@ def assert_config_error(process: subprocess.Popen, tmp_path: Path, message: str)
     return output
 
 
-@pytest.mark.parametrize(("setting", "value"), [("CHRIEK_BACKEND", "MLX"), ("CHRIEK_OFFLOAD", "")])
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    [("CHRIEK_BACKEND", "MLX"), ("CHRIEK_OFFLOAD", ""), ("CHRIEK_OFFLOAD", "sequential")],
+)
 def test_invalid_backend_configuration_stops_server(tmp_path, setting, value):
     assert_config_error(serve(base_env(tmp_path) | {setting: value}), tmp_path, f"{setting} must")
 

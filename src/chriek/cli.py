@@ -7,6 +7,7 @@ import os
 import sys
 from contextlib import ExitStack
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from time import perf_counter
 
 import uvicorn
@@ -105,7 +106,7 @@ def _smoke(args: argparse.Namespace) -> int:
             print(f"chriek: smoke render failed ({type(error).__name__}): {error}", file=sys.stderr)
             return 1
         try:
-            args.out.write_bytes(png)
+            _write_smoke_png(args.out, png)
         except OSError as error:
             print(f"chriek: cannot write PNG: {error}", file=sys.stderr)
             return 1
@@ -122,6 +123,19 @@ def _smoke(args: argparse.Namespace) -> int:
         )
         print(json.dumps(record))
     return 0
+
+
+def _write_smoke_png(output: Path, png: bytes) -> None:
+    temporary = None
+    try:
+        with NamedTemporaryFile(dir=output.parent, delete=False) as file:
+            temporary = Path(file.name)
+            file.write(png)
+        os.replace(temporary, output)
+    except BaseException:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def _database_error(error: SQLAlchemyError | UnicodeError, database: Path | URL) -> str:

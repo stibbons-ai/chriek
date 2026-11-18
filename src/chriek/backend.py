@@ -81,5 +81,5 @@ def create_backend(settings: BackendSettings) -> ImageBackend:
     if settings.name == "mlx":
         from chriek.mlx_backend import MlxBackend
 
-        return MlxBackend(low_memory=settings.offload == "sequential")
+        return MlxBackend()
     return FakeBackend()

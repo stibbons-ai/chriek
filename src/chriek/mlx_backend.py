@@ -1,6 +1,7 @@
 """Pinned BF16 FLUX 3 Image Klein inference on Apple Silicon."""
 
 import json
+import logging
 import platform
 import subprocess
 from collections.abc import Sequence
@@ -11,6 +12,8 @@ from time import perf_counter
 from PIL import Image
 
 from chriek.config import ConfigError
+
+log = logging.getLogger(__name__)
 
 # HF caches created before tree listings were recorded may return a partial snapshot.
 _MODEL_FILES = (
@@ -69,7 +72,7 @@ class MlxBackend:
     revision = "09561231f44e41381c461caf53d5452005a60ac9"
     steps = 16
 
-    def __init__(self, *, low_memory: bool):
+    def __init__(self):
         try:
             import mlx.core as mx
             from flux3_mlx import Flux3Klein
@@ -90,9 +93,9 @@ class MlxBackend:
         except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as error:
             raise ConfigError("cannot read MLX hardware information") from error
         self._runtime = {"flux3_mlx": version("flux3-mlx"), "mlx": version("mlx")}
-        self._low_memory = low_memory
         self._pipeline = None
         self._load_seconds = 0.0
+        self._peak_reset = False
 
     def _snapshot(self) -> str:
         try:
@@ -113,12 +116,24 @@ class MlxBackend:
 
     def start_job(self) -> None:
         self._load_seconds = 0.0
-        self._mx.reset_peak_memory()
+        self._peak_reset = False
+        try:
+            self._mx.reset_peak_memory()
+        except Exception:
+            log.exception("could not reset the MLX peak memory counter")
+        else:
+            self._peak_reset = True
 
     def run_details(self) -> dict[str, object]:
+        peak = None
+        if self._peak_reset:
+            try:
+                peak = self._mx.get_peak_memory()
+            except Exception:
+                log.exception("could not read the MLX peak memory counter")
         return {
             "load_seconds": self._load_seconds,
-            "peak_memory_bytes": self._mx.get_peak_memory(),
+            "peak_memory_bytes": peak,
             "hardware": self._hardware,
             "runtime": self._runtime,
             "precision": "BF16",
@@ -136,7 +151,7 @@ class MlxBackend:
         if self._pipeline is None:
             started = perf_counter()
             try:
-                self._pipeline = self._load(self._snapshot(), low_memory=self._low_memory)
+                self._pipeline = self._load(self._snapshot(), low_memory=False)
             except SystemExit as error:
                 # flux3-mlx uses SystemExit for model format errors; don't terminate the worker.
                 raise RuntimeError("flux3-mlx could not load the model") from error
