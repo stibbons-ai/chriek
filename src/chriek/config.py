@@ -136,7 +136,8 @@ class Settings:
                 env, "CHRIEK_MAX_PROMPT_CHARS", Limits.max_prompt_chars, 1, 100_000
             ),
             max_queued_jobs=_int(env, "CHRIEK_MAX_QUEUED_JOBS", Limits.max_queued_jobs, 1, 100_000),
-            max_references=_int(env, "CHRIEK_MAX_REFERENCES", Limits.max_references, 0, 16),
+            # 10 is flux3-mlx's hard reference limit: never admit a job the backend cannot render.
+            max_references=_int(env, "CHRIEK_MAX_REFERENCES", Limits.max_references, 0, 10),
             max_upload_bytes=_int(
                 env, "CHRIEK_MAX_UPLOAD_BYTES", Limits.max_upload_bytes, 1024, 512 * 1024 * 1024
             ),

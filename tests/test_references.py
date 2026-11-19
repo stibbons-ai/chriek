@@ -842,17 +842,26 @@ def test_reference_count_and_upload_byte_limits_are_configurable_and_enforced(tm
             "at most 0 reference images" in e["msg"] for e in one_ref_rejected.json()["detail"]
         )
 
-    # Upper ends of the configurable ranges are usable: 16 references, a 512 MiB body cap.
-    sixteen = [("references", (f"{i}.png", small_png, "image/png")) for i in range(16)]
+    # Upper ends of the configurable ranges are usable: 10 references, a 512 MiB body cap.
+    refs = [("references", (f"{i}.png", small_png, "image/png")) for i in range(11)]
+    backend = CountingBackend()
     with running(
         tmp_path,
         backend=backend,
-        CHRIEK_MAX_REFERENCES="16",
+        CHRIEK_MAX_REFERENCES="10",
         CHRIEK_MAX_UPLOAD_BYTES=str(512 * 1024 * 1024),
     ) as client:
-        job = wait_for(client, submit_multipart(client, data=FORM_16, files=sixteen)["id"])
+        before = _admission_state(tmp_path)
+        eleven = post_multipart(client, data=FORM_16, files=refs)
+        assert eleven.status_code == 422
+        assert any("at most 10 reference images" in e["msg"] for e in eleven.json()["detail"])
+        assert _admission_state(tmp_path) == before
+        assert backend.renders == 0
+
+        job = wait_for(client, submit_multipart(client, data=FORM_16, files=refs[:10])["id"])
         assert job["status"] == "succeeded"
-        assert job["params"]["reference_count"] == 16
+        assert job["params"]["reference_count"] == 10
+        download_pixels(client, job)
 
 
 # Media types are case-insensitive: a mixed-case multipart body above 2 MiB is still exempt.
