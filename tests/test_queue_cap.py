@@ -156,8 +156,8 @@ def test_capacity_returns_once_a_queued_job_starts_running(tmp_path):
 class FailingStepBackend(StepBackend):
     """StepBackend whose render of the prompt "fails" raises once stepped."""
 
-    def render(self, prompt, width, height, seed):
-        image = super().render(prompt, width, height, seed)
+    def render(self, prompt, width, height, seed, references=()):
+        image = super().render(prompt, width, height, seed, references)
         if prompt == "fails":
             raise RuntimeError("injected backend failure")
         return image
