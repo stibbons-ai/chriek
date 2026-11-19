@@ -122,6 +122,9 @@ def test_invalid_backend_configuration_stops_server(tmp_path, setting, value):
 
 
 def test_mlx_without_extra_stops_before_opening_storage(tmp_path, monkeypatch, capsys):
+    for name in os.environ.copy():
+        if name.upper().startswith("CHRIEK_"):
+            monkeypatch.delenv(name)
     for name, value in (base_env(tmp_path) | {"CHRIEK_BACKEND": "mlx"}).items():
         monkeypatch.setenv(name, value)
     monkeypatch.setitem(sys.modules, "mlx", None)
