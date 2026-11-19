@@ -856,8 +856,10 @@ def test_reference_count_and_upload_byte_limits_are_configurable_and_enforced(tm
 
 
 # Media types are case-insensitive: a mixed-case multipart body above 2 MiB is still exempt.
+# A filename-less reference above the 1 MiB scalar-field cap is an upload too.
+@pytest.mark.parametrize("filename", ["big.png", None])
 @pytest.mark.parametrize("media_type", ["multipart/form-data", "Multipart/Form-Data"])
-def test_json_and_multipart_body_caps_are_independent(tmp_path, media_type):
+def test_json_and_multipart_body_caps_are_independent(tmp_path, media_type, filename):
     """JSON keeps the fixed 2 MiB cap whatever CHRIEK_MAX_UPLOAD_BYTES says, and vice versa."""
     json_body = json.dumps({"prompt": "small cap", "width": 16, "height": 16}).encode()
     json_body = json_body[:-1] + b" " * (4096 - len(json_body)) + b"}"
@@ -873,7 +875,7 @@ def test_json_and_multipart_body_caps_are_independent(tmp_path, media_type):
 
     with running(tmp_path) as client:
         _, body = encode_multipart(
-            FORM_16, files=[("references", ("big.png", _BIG_PNG, "image/png"))], boundary="big"
+            FORM_16, files=[("references", (filename, _BIG_PNG, "image/png"))], boundary="big"
         )
         assert len(body) > 2 * 1024 * 1024
         response = client.post(
@@ -988,6 +990,17 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
             [("other_file", ("ref.png", make_image_bytes(), "image/png"))],
             ["body", "other_file"],
         ),
+        # A file part under a valid scalar name is rejected, not read as that scalar's value.
+        (
+            SMALL_FORM,
+            [("prompt", ("p.txt", b"a lighthouse", "text/plain"))],
+            ["body", "prompt"],
+        ),
+        (
+            {"prompt": "hi"} | SMALL_FORM,
+            [("seed", ("s.txt", b"7", "text/plain"))],
+            ["body", "seed"],
+        ),
         (
             {"prompt": "hi"},
             [("references", ("huge.png", make_image_bytes(size=(64, 64)), "image/png"))],
@@ -1022,6 +1035,8 @@ def test_streaming_upload_bound_aborts_early_and_valid_multipart_streams_across_
         "empty-reference",
         "corrupt-reference",
         "unexpected-file-field",
+        "prompt-file-part",
+        "seed-file-part",
         "reference-exceeds-max-pixels",
         "png-bad-chunk-type-syntax-error",
         "png-truncated-ihdr-value-error",
