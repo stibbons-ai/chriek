@@ -95,7 +95,7 @@ uv run --locked --extra mlx chriek smoke --prompt "Move the bicycle into a sunny
   --reference bicycle.png --out garden.png
 ```
 
-MLX uses 16 steps, without guidance or prompt upsampling. The smoke record adds `prompt`, `seed`, `width`, `height`, `references` (count), `output` and `steps` (`null` for fake) to the normal run record.
+MLX uses 16 steps, without guidance or prompt upsampling. The smoke record adds `prompt`, `seed`, `width`, `height`, `references` (count), `output` and `steps` (`null` for fake) to the normal run record. If MLX cannot read the GPU core count, `hardware.gpu_cores` is `null` and rendering continues.
 
 Measured offline on an Apple M4 Max (40 GPU cores, 128 GB, macOS 27.2.1), with `CHRIEK_OFFLOAD=none`, MLX 0.32.4, `flux3-mlx` 0.1.0, 1024×1024, seed 7:
 

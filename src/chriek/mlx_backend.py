@@ -9,7 +9,7 @@ from importlib.metadata import version
 from pathlib import Path
 from time import perf_counter
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 from chriek.config import ConfigError
 
@@ -43,27 +43,47 @@ def _hardware() -> dict[str, object]:
     import mlx.core as mx
 
     device = mx.device_info()
-    display = subprocess.run(  # noqa: S603 -- fixed macOS executable and arguments
-        ["/usr/sbin/system_profiler", "SPDisplaysDataType", "-json"],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    gpu_cores = next(
-        (
-            int(gpu["sppci_cores"])
-            for gpu in json.loads(display.stdout)["SPDisplaysDataType"]
-            if "sppci_cores" in gpu
-        ),
-        None,
-    )
+    try:
+        display = subprocess.run(  # noqa: S603 -- fixed macOS executable and arguments
+            ["/usr/sbin/system_profiler", "SPDisplaysDataType", "-json"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+        gpu_cores = next(
+            (
+                int(gpu["sppci_cores"])
+                for gpu in json.loads(display.stdout)["SPDisplaysDataType"]
+                if "sppci_cores" in gpu
+            ),
+            None,
+        )
+    except (
+        OSError,
+        subprocess.SubprocessError,
+        ValueError,
+        KeyError,
+        TypeError,
+        OverflowError,
+    ) as error:
+        log.warning("could not read GPU core count from system_profiler: %s", error)
+        gpu_cores = None
     return {
         "chip": device["device_name"],
         "gpu_cores": gpu_cores,
         "memory_gb": round(device["memory_size"] / 2**30),
         "macos_version": platform.mac_ver()[0],
     }
+
+
+def _pad_multi_reference(image: Image.Image) -> Image.Image:
+    # flux3-mlx crops each side down to a multiple of 16.
+    if min(image.size) >= 16:
+        return image
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    dx, dy = max(16 - image.width, 0), max(16 - image.height, 0)
+    return ImageOps.expand(image, (dx // 2, dy // 2, dx - dx // 2, dy - dy // 2))
 
 
 class MlxBackend:
@@ -90,7 +110,7 @@ class MlxBackend:
         self._cache_miss = LocalEntryNotFoundError
         try:
             self._hardware = _hardware()
-        except (OSError, RuntimeError, subprocess.SubprocessError, ValueError, KeyError) as error:
+        except (OSError, RuntimeError, ValueError, KeyError) as error:
             raise ConfigError("cannot read MLX hardware information") from error
         self._runtime = {"flux3_mlx": version("flux3-mlx"), "mlx": version("mlx")}
         self._pipeline = None
@@ -159,7 +179,9 @@ class MlxBackend:
                 self._load_seconds = round(perf_counter() - started, 3)
         image, _ = self._pipeline(
             prompt,
-            list(references),
+            [_pad_multi_reference(ref) for ref in references]
+            if len(references) > 1
+            else list(references),
             width=width,
             height=height,
             steps=self.steps,

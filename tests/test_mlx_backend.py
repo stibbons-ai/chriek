@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ class Inference:
         self.cache_miss = False
         self.load_error = None
         self.counter_failure = None
+        self.probe_timeout = False
         self.lookups = []
         self.loads = []
         self.renders = []
@@ -52,6 +54,11 @@ class Inference:
             raise RuntimeError("counter unavailable")
         return self.peak
 
+    def probe_gpu(self, *args, **kwargs):
+        if self.probe_timeout:
+            raise subprocess.TimeoutExpired("system_profiler", 10)
+        return SimpleNamespace(stdout='{"SPDisplaysDataType": [{"sppci_cores": "12"}]}')
+
     def render(self, prompt, references, **options):
         self.renders.append((prompt, references, options))
         self.peak = max(self.peak, 50 + len(references))
@@ -73,7 +80,11 @@ def inference(monkeypatch, tmp_path):
         path.parent.mkdir(exist_ok=True)
         path.touch()
     fake = Inference(tmp_path)
-    core = SimpleNamespace(reset_peak_memory=fake.reset_peak, get_peak_memory=fake.get_peak)
+    core = SimpleNamespace(
+        reset_peak_memory=fake.reset_peak,
+        get_peak_memory=fake.get_peak,
+        device_info=lambda: {"device_name": "Test chip", "memory_size": 64 * 2**30},
+    )
     monkeypatch.setitem(sys.modules, "mlx", SimpleNamespace(core=core))
     monkeypatch.setitem(sys.modules, "mlx.core", core)
     monkeypatch.setitem(
@@ -92,14 +103,10 @@ def inference(monkeypatch, tmp_path):
     monkeypatch.setattr(mlx_backend, "version", {"flux3-mlx": "0.1.0", "mlx": "0.32.4"}.__getitem__)
     monkeypatch.setattr(
         mlx_backend,
-        "_hardware",
-        lambda: {
-            "chip": "Test chip",
-            "gpu_cores": 12,
-            "memory_gb": 64,
-            "macos_version": "27.2",
-        },
+        "subprocess",
+        SimpleNamespace(run=fake.probe_gpu, SubprocessError=subprocess.SubprocessError),
     )
+    monkeypatch.setattr(mlx_backend.platform, "mac_ver", lambda: ("27.2", (), ""))
     return fake
 
 
@@ -121,6 +128,26 @@ def test_text_and_edit_pass_exact_inference_parameters_and_share_one_load(infere
     assert options["revision"] == "09561231f44e41381c461caf53d5452005a60ac9"
     assert options["local_files_only"] is True
     assert set(options["allow_patterns"]) >= {"model.safetensors", "ae.safetensors"}
+
+
+def test_edit_pads_small_multi_reference_images(inference, tmp_path):
+    small_path = tmp_path / "small.png"
+    regular_path = tmp_path / "regular.png"
+    for path, size, color in (
+        (small_path, (12, 32), "red"),
+        (regular_path, (64, 64), "blue"),
+    ):
+        with Image.new("RGB", size, color) as image:
+            image.save(path)
+
+    backend = mlx_backend.MlxBackend()
+    with Image.open(small_path) as small, Image.open(regular_path) as regular:
+        assert backend.render("edit", 32, 16, 7, (small, regular)).size == (32, 16)
+        [(_, (padded, unchanged), _)] = inference.renders
+        assert padded.size == (16, 32)
+        assert padded.getpixel((8, 16)) == (255, 0, 0)
+        assert small.size == (12, 32)
+        assert unchanged is regular
 
 
 @pytest.mark.parametrize("load_error", [RuntimeError, SystemExit])
@@ -185,23 +212,30 @@ def test_measurements_are_per_job_not_per_image_or_process(inference, monkeypatc
     assert (details["load_seconds"], details["peak_memory_bytes"]) == (0.0, 50)
 
 
-def test_smoke_prints_mlx_job_metrics(inference, tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("probe_timeout", [False, True], ids=["gpu-cores", "probe-timeout"])
+def test_smoke_prints_mlx_job_metrics(
+    inference, tmp_path, monkeypatch, capsys, caplog, probe_timeout
+):
     for name in os.environ:
         if name.upper().startswith("CHRIEK_"):
             monkeypatch.delenv(name)
     monkeypatch.setenv("CHRIEK_BACKEND", "mlx")
     monkeypatch.setattr(mlx_backend, "perf_counter", iter([2.0, 3.25]).__next__)
     inference.peak = 200  # Prior process activity must not count toward this job's peak.
+    inference.probe_timeout = probe_timeout
     output = tmp_path / "smoke.png"
 
     assert cli.main(["smoke", "--out", str(output), "--width", "16", "--height", "16"]) == 0
+    with Image.open(output) as image:
+        assert (image.format, image.size) == ("PNG", (16, 16))
+    assert ("system_profiler" in caplog.text and "timed out" in caplog.text) == probe_timeout
 
     record = json.loads(capsys.readouterr().out)
     assert record["load_seconds"] == 1.25
     assert record["peak_memory_bytes"] == 100
     assert record["hardware"] == {
         "chip": "Test chip",
-        "gpu_cores": 12,
+        "gpu_cores": None if probe_timeout else 12,
         "memory_gb": 64,
         "macos_version": "27.2",
     }
