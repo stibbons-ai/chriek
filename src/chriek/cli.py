@@ -17,7 +17,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from chriek.api import create_app
 from chriek.backend import JobMetrics, create_backend, run_record
-from chriek.config import AuthMode, BackendSettings, ConfigError, Settings
+from chriek.config import AuthMode, BackendSettings, ConfigError, Limits, Settings
 from chriek.png import encode_png
 from chriek.storage import StorageError
 
@@ -41,8 +41,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "smoke":
             for axis in ("width", "height"):
                 size = getattr(args, axis)
-                if size < 16 or size % 16:
-                    smoke.error(f"--{axis} must be a positive multiple of 16")
+                if size < 16 or size > Limits.max_dimension or size % 16:
+                    smoke.error(
+                        f"--{axis} must be a multiple of 16 between 16 and {Limits.max_dimension}"
+                    )
+            if args.width * args.height > Limits.max_pixels:
+                smoke.error(f"width * height must be at most {Limits.max_pixels} pixels")
             if not 0 <= args.seed < 2**32:
                 smoke.error("--seed must be between 0 and 4294967295")
             return _smoke(args)

@@ -7,6 +7,7 @@ import os
 import pytest
 from PIL import Image
 
+from chriek.backend import FakeBackend
 from chriek.cli import main
 from chriek.png import DIGITAL_SOURCE_TYPE, XMP_KEY
 
@@ -117,4 +118,25 @@ def test_smoke_rejects_dimensions_outside_positive_16_pixel_grid(tmp_path, capsy
         main(["smoke", "--out", str(output), flag, value])
     assert error.value.code == 2
     assert "multiple of 16" in capsys.readouterr().err
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("width", "height", "message"),
+    [
+        ("32768", "32768", "--width must be"),
+        ("16", "32768", "--height must be"),
+        ("2048", "1024", "width * height must be at most 1048576 pixels"),
+    ],
+)
+def test_smoke_rejects_oversized_renders(tmp_path, monkeypatch, capsys, width, height, message):
+    def unexpected_render(*args, **kwargs):
+        pytest.fail("oversized render reached the backend")
+
+    monkeypatch.setattr(FakeBackend, "render", unexpected_render)
+    output = tmp_path / "oversized.png"
+    with pytest.raises(SystemExit) as error:
+        main(["smoke", "--out", str(output), "--width", width, "--height", height])
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
     assert not output.exists()

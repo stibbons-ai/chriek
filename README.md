@@ -87,7 +87,7 @@ To serve MLX jobs, also set the server settings from [Install and run](#install-
 
 ### Smoke test
 
-Generate a labeled PNG and print a JSON run record to stdout. The command uses the configured backend, defaults to 1024×1024 and seed 7, and needs no server settings. Dimensions must be positive multiples of 16; `--reference` is repeatable. An existing output is replaced only after the new PNG is fully written. The server API does not accept references yet.
+Generate a labeled PNG and print a JSON run record to stdout. The command uses the configured backend, defaults to 1024×1024 and seed 7, and needs no server settings. Dimensions must be positive multiples of 16 and obey the default server limits for each side and for total pixels. `--reference` is repeatable. An existing output is replaced only after the new PNG is fully written. The server API does not accept references yet.
 
 ```sh
 uv run --locked --extra mlx chriek smoke --prompt "A red bicycle in the rain" --out bicycle.png
