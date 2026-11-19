@@ -2,7 +2,7 @@
 
 Self-hostable image generation server for FLUX 3 Image Klein, with an asynchronous job API: submit a job, poll it, download the PNGs through signed, expiring URLs. Architecture: [ADR-0001](docs/adr/0001-mvp-architecture.md).
 
-> **Status: walking skeleton.** Only **home mode** with a **fake image backend** exists. The fake backend draws deterministic placeholder PNGs (two coloured rectangles derived from prompt, size and seed). It does **not** run FLUX or any other model, needs no GPU and downloads no weights. The real MLX (Apple Silicon) and CUDA backends come later; the HTTP contract below stays the same.
+> **Status: home mode.** The default fake backend draws deterministic placeholder PNGs without a GPU or model weights. On Apple Silicon, the optional MLX backend runs FLUX 3 Image Klein in BF16. CUDA and API reference uploads are not available yet; use the local smoke command to try edits with reference images.
 
 ## Install and run (uv)
 
@@ -67,13 +67,45 @@ uv run chriek serve
 
 ### Backend dependencies
 
-Today's supported installation remains `uv sync --locked`: only the fake backend is available, with no GPU runtimes or model weights.
-
-Shared runtime dependencies stay in `pyproject.toml` under `[project].dependencies`; development tools stay in `[dependency-groups].dev`. Real backend implementations will add `mlx` and `cuda` extras under `[project.optional-dependencies]`, containing their actual inference dependencies, not just a tensor library.
-
-The future commands `uv sync --locked --extra mlx` and `uv sync --locked --extra cuda` are **not available today**: neither extra exists yet. Extras install dependencies; they neither detect hardware nor select a runtime backend. CUDA wheel source and version configuration belongs with the real CUDA implementation; naming an extra `cuda` does not select a CUDA build.
+`uv sync --locked` installs the default fake backend, with no GPU runtime or model weights. `uv sync --locked --extra mlx` adds `flux3-mlx` and its inference dependencies on Apple Silicon. Installing the extra does not select the backend. There is no `cuda` extra yet.
 
 Keep the committed `uv.lock` as the single lockfile; do not introduce hand-maintained `requirements_mlx.txt` or `requirements_cuda.txt` copies.
+
+### Apple Silicon
+
+Preset: Apple Silicon with **at least 32 GB of unified memory**, `CHRIEK_BACKEND=mlx`, `CHRIEK_OFFLOAD=none` (the pipeline keeps all components loaded). Leave headroom for other apps; larger images and references can raise the peak.
+
+```sh
+uv sync --locked --extra mlx
+export CHRIEK_BACKEND=mlx CHRIEK_OFFLOAD=none
+export HF_HOME="$HOME/.cache/huggingface"
+```
+
+Before the first render, accept the [model license](https://huggingface.co/black-forest-labs/flux-3-image-klein) using your Hugging Face account and supply your own `HF_TOKEN` through the environment or secret store. The first render downloads the pinned BF16 weights if they are missing from `HF_HOME`. With the snapshot cached, the backend resolves it locally before trying the network; set `HF_HUB_OFFLINE=1` to prohibit online lookups.
+
+To serve MLX jobs, also set the server settings from [Install and run](#install-and-run-uv), then run `uv run --locked --extra mlx chriek serve`.
+
+### Smoke test
+
+Generate a labeled PNG and print a JSON run record to stdout. The command uses the configured backend, defaults to 1024×1024 and seed 7, and needs no server settings. Dimensions must be positive multiples of 16 and obey the default server limits for each side and for total pixels. `--reference` is repeatable. An existing output is replaced only after the new PNG is fully written. The server API does not accept references yet.
+
+```sh
+uv run --locked --extra mlx chriek smoke --prompt "A red bicycle in the rain" --out bicycle.png
+uv run --locked --extra mlx chriek smoke --prompt "Move the bicycle into a sunny garden" \
+  --reference bicycle.png --out garden.png
+```
+
+MLX uses 16 steps, without guidance or prompt upsampling. The smoke record adds `prompt`, `seed`, `width`, `height`, `references` (count), `output` and `steps` (`null` for fake) to the normal run record. If MLX cannot read the GPU core count, `hardware.gpu_cores` is `null` and rendering continues.
+
+Measured offline on an Apple M4 Max (40 GPU cores, 128 GB, macOS 27.2.1), with `CHRIEK_OFFLOAD=none`, MLX 0.32.4, `flux3-mlx` 0.1.0, 1024×1024, seed 7:
+
+| Mode | References | Load (s) | Wall (s) | MLX peak (bytes) |
+|---|---:|---:|---:|---:|
+| Text-to-image | 0 | 3.879 | 57.895 | 22,610,518,196 |
+| Edit | 1 | 0.542 | 112.444 | 22,615,761,072 |
+| Edit | 2 | 0.640 | 197.514 | 22,621,003,960 |
+
+Two offline 512×512 jobs in one server process recorded 3.662 s and 0.0 s of load time, respectively.
 
 ## Configuration
 
@@ -83,6 +115,8 @@ All configuration comes from environment variables.
 |---|---|---|
 | `CHRIEK_AUTH_MODE` | `api-key` | `api-key`: every `/jobs` request needs a key from `CHRIEK_API_KEYS`, and each key owns its jobs. `proxy`: no key check; a trusted reverse proxy authenticates, and all clients are one shared owner; see [Behind a reverse proxy](#behind-a-reverse-proxy-chriek_auth_modeproxy). Empty, differently cased or other values stop startup. |
 | `CHRIEK_API_KEYS` | required in `api-key` mode | Named static API keys, `name:key,name:key`. The name is the owner of the jobs created with that key. Names: 1–64 characters from `A-Z a-z 0-9 _ . -`, unique. Names are not secret: each job stores its owner's name in plain text, so never use a key or the signing secret as a name. Keys: at least 32 printable ASCII characters (`!` to `~`; no spaces, control or non-ASCII characters, no commas), unique. Keys travel in an HTTP header, so other characters are rejected at startup. Startup errors identify an invalid entry by its position, never by its name or key. Must be unset, empty or whitespace only in `proxy` mode. |
+| `CHRIEK_BACKEND` | `fake` | `fake`: deterministic placeholders. `mlx`: BF16 FLUX 3 Image Klein on Apple Silicon; requires the `mlx` extra. Exact lowercase values only. |
+| `CHRIEK_OFFLOAD` | `none` | Only exact lowercase `none` is supported today. MLX keeps the text encoder, DiT and VAE loaded. |
 | `CHRIEK_SIGNING_SECRET` | required | HMAC secret for download URLs, at least 32 characters. Changing it invalidates every issued URL (polling the job again mints new ones). Anyone who knows it can sign download URLs, so it must not be one of the API keys: startup rejects a signing secret equal to any key or name in `CHRIEK_API_KEYS`. |
 | `CHRIEK_PUBLIC_URL` | required | Public base URL of download links, `http(s)://host[:port][/prefix]`, for example `https://images.example/chriek`. Final `/` characters are optional and ignored. The host is a DNS name, a dotted-decimal IPv4 address such as `192.0.2.10` or a bracketed IPv6 address; a port must be 1–65535. Hosts that browsers would read as a different IPv4 address (`017.0.0.1`, `2130706433`, `0x7f.1`) or as an invalid one (`1.2.3.4.5`) are rejected. The prefix must not contain `\`, `.` or `..` segments (also percent-encoded as `%2e`), which clients rewrite. Only printable ASCII is accepted (no whitespace or control characters; write internationalized host names in punycode), with no user name or password, query (`?`) or fragment (`#`). See [Public URL and reverse proxies](#public-url-and-reverse-proxies). |
 | `CHRIEK_URL_TTL_SECONDS` | `900` | Lifetime of a download URL, 1–604800 seconds. |
@@ -243,7 +277,7 @@ curl -s http://127.0.0.1:8000/jobs/$JOB_ID -H "Authorization: Bearer $KEY"
 ```
 
 - `status` is `queued`, `running`, `succeeded` or `failed`.
-- `run` is the run record, set once the worker finishes the job: which backend, model and revision rendered it and how long rendering took. The fake backend reports no hardware or memory figures because it measures none. A job failed by restart recovery or by the running-time limit (see [Job behaviour](#job-behaviour)) has `run: null`, because no run record was persisted.
+- `run` records `backend`, `model`, `revision` and `render_seconds` (wall time including model load and PNG writes) when the worker finishes the job, whether it succeeded or an image failed. MLX also reports `load_seconds` (the initial pipeline load paid by this job; `0.0` after loading), `peak_memory_bytes` (MLX allocation peak for this job, not system RAM use; `null` if the counter could not be reset or read), `hardware` (`chip`, `gpu_cores`, `memory_gb`, `macos_version`), `runtime` (`flux3_mlx`, `mlx` versions), `precision` (`BF16`) and `steps` (`16`). A job failed by restart recovery or by the running-time limit has `run: null`; see [Job behaviour](#job-behaviour).
 - `images` is filled only when `succeeded`. Every poll mints fresh URLs that expire `CHRIEK_URL_TTL_SECONDS` later.
 - `error` is `null` unless the job `failed`. A failed image is reported as exactly `image N of M failed` (N is the one-based image that failed, M the requested `image_count`); a job failed by restart recovery or by the running-time limit carries the interrupted or timed-out message below. The error never includes exception text, classes or other backend details: the server log keeps the full traceback with the job ID and the zero-based image index.
 
@@ -277,7 +311,7 @@ Each owner may have at most `CHRIEK_MAX_QUEUED_JOBS` jobs (default `100`, config
 
 ## Operator obligations under the FLUX Kommunity License
 
-This section matters once a real FLUX backend runs; the fake backend uses no FLUX model. chriek is MIT-licensed, but the FLUX 3 Image Klein weights are licensed by Black Forest Labs under the **FLUX Kommunity License v1.0**. chriek never ships or redistributes the weights: you download them with your own Hugging Face account and accept that license yourself. Read the [license text](https://huggingface.co/black-forest-labs/flux-3-image-klein-comfy/blob/main/LICENSE.md) (wording below checked 2026-11-11); this summary is not legal advice.
+The fake backend uses no FLUX model. chriek is MIT-licensed, but the FLUX 3 Image Klein weights are licensed by Black Forest Labs under the **FLUX Kommunity License v1.0**. chriek never ships or redistributes the weights: you download them with your own Hugging Face account and accept that license yourself. Read the [license text](https://huggingface.co/black-forest-labs/flux-3-image-klein/blob/09561231f44e41381c461caf53d5452005a60ac9/LICENSE.md); this summary is not legal advice.
 
 - **Revenue cap.** Commercial use of outputs, and running the model in production to generate them, is allowed only for a "Qualifying User": you together with your affiliates have gross annualized revenue below US$5,000,000 (§1.e, §2.a). Otherwise the license covers only non-commercial purposes, and commercial use needs a separate license from Black Forest Labs (§2.b).
 - **Content filtering.** You must implement and maintain content filters that prevent unlawful, unsafe or infringing content, or review outputs for unlawful or infringing content before distributing or displaying them (§2.e(i)). chriek has no built-in filter; this is the operator's job.
@@ -358,3 +392,5 @@ uv run --locked python scripts/audit_dependencies.py --project tests/fixtures/de
 ```
 
 Recorded run, 2026-11-12, Python 3.14.6 on macOS 27.2.1 arm64, pip-audit 2.10.1, PyPI service, with PyPI response validation: this lock, 61 third-party packages, no known vulnerabilities (exit 0). Same day: clean fixture exit 0; vulnerable fixture exit 1 with 11 advisories for `urllib3==1.26.4` (PYSEC-2021-108, PYSEC-2023-192, PYSEC-2023-212, PYSEC-2026-141, PYSEC-2026-1994, PYSEC-2026-1995, PYSEC-2026-1996, PYSEC-2026-1998, PYSEC-2026-1999, PYSEC-2026-4175, PYSEC-2026-4177); unreachable service (`HTTPS_PROXY=http://127.0.0.1:9`) exit 2; stale lock exit 2. Malformed PyPI responses are demonstrated offline only (`tests/test_dependency_audit.py`); real PyPI was not observed serving one.
+
+The MLX lock was audited on 2026-11-18 on macOS 27.2.1 arm64 with Python 3.14.6: 73 locked third-party packages, no known vulnerabilities (exit 0).

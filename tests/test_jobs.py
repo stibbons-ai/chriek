@@ -66,7 +66,27 @@ def test_succeeded_job_reports_run_record_and_seed_per_image(client):
     assert body["run"]["model"] == "chriek-fake-backend"
     assert body["run"]["revision"] == "fake-v1"
     assert body["run"]["render_seconds"] >= 0
+    assert set(body["run"]) == {"backend", "model", "revision", "render_seconds"}
     assert body["created_at"] <= body["started_at"] <= body["finished_at"]
+
+
+def test_run_includes_job_metrics_after_success_and_failure(tmp_path):
+    class MeasuredBackend(FailingBackend):
+        def start_job(self):
+            self.initial_renders = self.renders
+
+        def run_details(self):
+            return {"peak_memory_bytes": (self.renders - self.initial_renders) * 4096}
+
+    with running(tmp_path, backend=MeasuredBackend(fail_index=2)) as client:
+        success = wait_for(client, submit(client, image_count=2)["id"])
+        failure = wait_for(client, submit(client)["id"])
+
+    assert success["status"] == "succeeded"
+    assert success["run"]["peak_memory_bytes"] == 8192
+    assert failure["status"] == "failed"
+    assert failure["error"] == "image 1 of 1 failed"
+    assert failure["run"]["peak_memory_bytes"] == 4096
 
 
 def test_omitted_seed_is_chosen_and_reported(client):

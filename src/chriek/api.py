@@ -22,7 +22,7 @@ from sqlalchemy.exc import OperationalError
 from starlette.types import Message
 
 from chriek.auth import Authenticate, authenticator
-from chriek.backend import FakeBackend, ImageBackend
+from chriek.backend import ImageBackend, create_backend
 from chriek.config import AuthMode, Limits, Settings
 from chriek.signing import UrlSigner
 from chriek.storage import check_database, private_image_root
@@ -74,6 +74,8 @@ def create_app(
     clock: Callable[[], float] = time.time,
 ) -> FastAPI:
     """Build the home-mode app. `backend` and `clock` are test seams; `chriek serve` omits them."""
+    if backend is None:
+        backend = create_backend(settings.backend)
     # Both storage sides are checked before either is created: the database side here without
     # creating anything, then the image side by private_image_root. JobStore and Worker check
     # their own side again, so they stay safe when used without the app. A Postgres URL has no
@@ -83,9 +85,7 @@ def create_app(
     storage_dir = private_image_root(settings.storage_dir)
     store = JobStore(settings.database)
     try:
-        worker = Worker(
-            store, backend or FakeBackend(), storage_dir, clock, settings.job_timeout_seconds
-        )
+        worker = Worker(store, backend, storage_dir, clock, settings.job_timeout_seconds)
     except BaseException:
         store.close()
         raise

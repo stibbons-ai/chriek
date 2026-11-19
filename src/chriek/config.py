@@ -35,6 +35,7 @@ SETTING_NAMES = frozenset(
         "CHRIEK_ALLOWED_HOSTS",
         "CHRIEK_API_KEYS",
         "CHRIEK_AUTH_MODE",
+        "CHRIEK_BACKEND",
         "CHRIEK_DATABASE_URL",
         "CHRIEK_DB_PATH",
         "CHRIEK_HOST",
@@ -44,6 +45,7 @@ SETTING_NAMES = frozenset(
         "CHRIEK_MAX_PIXELS",
         "CHRIEK_MAX_PROMPT_CHARS",
         "CHRIEK_MAX_QUEUED_JOBS",
+        "CHRIEK_OFFLOAD",
         "CHRIEK_PORT",
         "CHRIEK_PUBLIC_URL",
         "CHRIEK_SIGNING_SECRET",
@@ -84,6 +86,25 @@ class Tls:
 
 
 @dataclass(frozen=True)
+class BackendSettings:
+    name: str = "fake"
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str]) -> BackendSettings:
+        unknown = sorted(
+            name for name in env if name.upper().startswith("CHRIEK_") and name not in SETTING_NAMES
+        )
+        if unknown:
+            raise ConfigError(f"unknown setting {', '.join(unknown)}; see README.md for names")
+        name = env.get("CHRIEK_BACKEND", "fake")
+        if name not in ("fake", "mlx"):
+            raise ConfigError("CHRIEK_BACKEND must be 'fake' or 'mlx'")
+        if env.get("CHRIEK_OFFLOAD", "none") != "none":
+            raise ConfigError("CHRIEK_OFFLOAD must be 'none'")
+        return cls(name)
+
+
+@dataclass(frozen=True)
 class Settings:
     database: Path | URL  # SQLite file (or ":memory:") or a Postgres URL
     public_url: str  # scheme://authority[/prefix], no trailing slash
@@ -98,14 +119,11 @@ class Settings:
     port: int
     tls: Tls | None  # None serves plain HTTP
     allowed_hosts: tuple[str, ...]  # proxy mode's accepted Host names; empty in api-key mode
+    backend: BackendSettings = BackendSettings()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Settings:
-        unknown = sorted(
-            name for name in env if name.upper().startswith("CHRIEK_") and name not in SETTING_NAMES
-        )
-        if unknown:
-            raise ConfigError(f"unknown setting {', '.join(unknown)}; see README.md for names")
+        backend = BackendSettings.from_env(env)
         limits = Limits(
             max_images=_int(env, "CHRIEK_MAX_IMAGES", Limits.max_images, 1, 64),
             max_dimension=_int(env, "CHRIEK_MAX_DIMENSION", Limits.max_dimension, 16, 8192),
@@ -146,6 +164,7 @@ class Settings:
                 if auth_mode is AuthMode.PROXY
                 else ()
             ),
+            backend=backend,
         )
 
 
