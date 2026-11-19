@@ -2848,8 +2848,14 @@ def test_proxy_mode_edit_jobs_use_the_shared_owner_and_the_host_check(tmp_path):
     assert stored_owners(tmp_path) == [PROXY_OWNER]
 
 
+class _Interrupted(BaseException):
+    """A non-Exception failure, as a KeyboardInterrupt or SystemExit would be."""
+
+
 @contextmanager
-def _fault_in_create(monkeypatch, event_name: str) -> Iterator[list[str]]:
+def _fault_in_create(
+    monkeypatch, event_name: str, error: BaseException | None = None
+) -> Iterator[list[str]]:
     """Raise once from Session event `event_name` inside the next `JobStore.create` call.
 
     `after_flush` fails the admitting transaction before COMMIT (a definite rollback);
@@ -2865,7 +2871,7 @@ def _fault_in_create(monkeypatch, event_name: str) -> Iterator[list[str]]:
         if getattr(armed, "on", False):
             armed.on = False
             fired.append(event_name)
-            raise OperationalError("COMMIT", {}, ConnectionError("connection lost"))
+            raise error or OperationalError("COMMIT", {}, ConnectionError("connection lost"))
 
     def create(self: JobStore, *args, **kwargs):
         armed.on = True
@@ -2892,8 +2898,9 @@ def _reference_sizes(storage: Path, job_id: str, count: int) -> list[tuple[int, 
     return sizes
 
 
+@pytest.mark.parametrize("error", [None, _Interrupted()], ids=["lost-connection", "non-exception"])
 def test_lost_commit_acknowledgement_keeps_the_committed_job_and_its_references(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, error
 ):
     storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
     form = FORM_16 | {"prompt": "lost ack", "seed": "5"}
@@ -2906,7 +2913,7 @@ def test_lost_commit_acknowledgement_keeps_the_committed_job_and_its_references(
         patch.setattr(JobStore, "claim_next", lambda _self, now: None)
         app = create_app(Settings.from_env(base_env(tmp_path)))
         with (
-            _fault_in_create(patch, "after_commit") as fired,
+            _fault_in_create(patch, "after_commit", error) as fired,
             TestClient(app, raise_server_exceptions=False) as client,
         ):
             response = post_multipart(client, data=form, files=files)
@@ -2951,6 +2958,38 @@ def test_failed_commit_call_keeps_references_even_when_nothing_was_committed(tmp
         (job_dir,) = storage.iterdir()
         assert _reference_sizes(storage, job_dir.name, 1) == [(16, 16)]
         assert backend.renders == 0
+
+
+def test_failure_building_the_returned_job_rolls_back_rows_and_files(tmp_path, monkeypatch):
+    storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
+    built: list[str] = []
+
+    def init(self, **kwargs):  # create() builds the only Job here; ORM loads skip __init__
+        built.append(kwargs["id"])
+        raise MemoryError
+
+    with monkeypatch.context() as patch:
+        patch.setattr(JobStore, "claim_next", lambda _self, now: None)  # keep rows inspectable
+        patch.setattr(chriek.store.Job, "__init__", init)
+        app = create_app(Settings.from_env(base_env(tmp_path)))
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = post_multipart(
+                client,
+                data=FORM_16,
+                files=[
+                    _reference_file("a.png", (200, 0, 0)),
+                    _reference_file("b.png", (0, 0, 200)),
+                ],
+            )
+    assert len(built) == 1
+    assert response.status_code == 500
+    assert "location" not in response.headers
+    # Rows and files agree: a definite rollback leaves neither. Building the Job after
+    # COMMIT left a queued job and its reference rows while the API deleted the files.
+    assert stored_owners(tmp_path) == []
+    with connect_db(tmp_path) as db:
+        assert db.scalar(text("SELECT count(*) FROM job_references")) == 0
+    assert not any(storage.iterdir())
 
 
 def test_filename_less_reference_parts_upload_like_named_ones(tmp_path):

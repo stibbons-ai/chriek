@@ -146,9 +146,9 @@ class JobStore:
         Reference rows join the admitting transaction, so a visible queued job always has its
         full ordered association.
 
-        Raises `CommitOutcomeUnknown` when the COMMIT call itself fails (for example a lost
-        connection): the job may or may not have been committed. Any other exception means
-        nothing was committed.
+        Raises `CommitOutcomeUnknown` when the COMMIT call or the session exit after it fails
+        (for example a lost connection, or any BaseException): the job may or may not have
+        been committed. Any other exception means nothing was committed.
         """
         jobs = Job.__table__
         queued = (
@@ -174,7 +174,8 @@ class JobStore:
         row = select(*(literal(value, jobs.c[name].type) for name, value in values.items()))
         has_room = queued.correlate(None).scalar_subquery() < max_queued
         # A flag rather than a try around commit(): closing the session after COMMIT can
-        # fail too, and that must not read as a rollback either.
+        # fail too, and that must not read as a rollback either. BaseException too: callers
+        # delete the upload on anything but CommitOutcomeUnknown.
         committing = False
         try:
             with self._session() as session:
@@ -189,13 +190,15 @@ class JobStore:
                     return None
                 session.add_all(references)
                 session.flush()  # so that commit() below only sends COMMIT
+                # Built before COMMIT: failing here must still roll back.
+                job = Job(**values, seq=seq, images=[], references=references)
                 committing = True
                 session.commit()
-        except Exception as exc:
+        except BaseException as exc:
             if committing:
                 raise CommitOutcomeUnknown(values["id"]) from exc
             raise
-        return Job(**values, seq=seq, images=[], references=references)
+        return job
 
     def get(self, owner: str, job_id: str) -> Job | None:
         with self._session() as session:
