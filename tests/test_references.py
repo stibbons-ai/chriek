@@ -2727,6 +2727,64 @@ def _reference_file(name: str, color: tuple[int, int, int]):
     return ("references", (name, make_image_bytes(color), "image/png"))
 
 
+def test_edit_jobs_report_backend_metrics_only_when_the_backend_ran(tmp_path):
+    class MeasuredBackend(RecordingStepBackend):
+        """Counts `start_job` calls; reports them and the renders seen so far as run details."""
+
+        jobs_started = 0
+
+        def start_job(self):
+            self.jobs_started += 1
+
+        def run_details(self):
+            return {"jobs_started": self.jobs_started, "renders": len(self.prompts)}
+
+        def render(self, prompt, width, height, seed, references=()):
+            image = super().render(prompt, width, height, seed, references)
+            if prompt == "fail":
+                raise RuntimeError("render failed")
+            return image
+
+    backend = MeasuredBackend()
+    colors = [(200, 10, 10), (10, 10, 200)]
+    with running(tmp_path, backend=backend) as client:
+        submit(client, prompt="hold", width=16, height=16)
+        backend.wait_started(1)
+        edit = submit_multipart(
+            client,
+            data=FORM_16 | {"prompt": "edit", "image_count": "2"},
+            files=[_reference_file(f"{i}.png", color) for i, color in enumerate(colors)],
+        )
+        failing = submit_multipart(
+            client, data=FORM_16 | {"prompt": "fail"}, files=[_reference_file("r", colors[0])]
+        )
+        missing = submit_multipart(
+            client, data=FORM_16 | {"prompt": "missing"}, files=[_reference_file("r", colors[1])]
+        )
+        reference_path(tmp_path / "images", missing["id"], 0).unlink()
+        backend.step(4)
+
+        edited = wait_for(client, edit["id"])
+        assert (edited["status"], edited["params"]["reference_count"]) == ("succeeded", 2)
+        assert (edited["run"]["jobs_started"], edited["run"]["renders"]) == (2, 3)
+        assert backend.references["edit"] == colors
+        assert [client.get(image["url"]).status_code for image in edited["images"]] == [200, 200]
+
+        failed = wait_for(client, failing["id"])
+        assert (failed["status"], failed["error"]) == ("failed", "image 1 of 1 failed")
+        assert (failed["run"]["jobs_started"], failed["run"]["renders"]) == (3, 4)
+
+        unloaded = wait_for(client, missing["id"])
+        assert unloaded["error"] == "reference 1 of 1 could not be loaded"
+        assert set(unloaded["run"]) == {"backend", "model", "revision", "render_seconds"}
+        assert (backend.jobs_started, backend.prompts) == (3, ["hold", "edit", "edit", "fail"])
+
+    # The failed render published no output and kept its private reference.
+    stored = tmp_path / "images" / failing["id"]
+    assert [p.relative_to(stored).as_posix() for p in stored.rglob("*.png")] == ["references/0.png"]
+    assert _stored_reference(tmp_path, failing["id"]).getpixel((0, 0)) == colors[0]
+
+
 def _admission_state(tmp_path: Path) -> tuple[str, list[Path]]:
     """Database dump and storage tree, to prove a rejected admission changed neither."""
     storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
