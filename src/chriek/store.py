@@ -92,6 +92,13 @@ class Reference(Base):
     index: Mapped[int] = mapped_column(primary_key=True)
 
 
+class CommitOutcomeUnknown(Exception):
+    """A failed COMMIT call: the database may have committed the job anyway."""
+
+    def __init__(self, job_id: str) -> None:
+        super().__init__(f"commit outcome unknown for job {job_id}")
+
+
 class JobStore:
     def __init__(self, database: Path | URL) -> None:
         self._engine = _create_engine(database)
@@ -138,6 +145,10 @@ class JobStore:
         unconditional insert after a separate count would let two submissions both see room.
         Reference rows join the admitting transaction, so a visible queued job always has its
         full ordered association.
+
+        Raises `CommitOutcomeUnknown` when the COMMIT call itself fails (for example a lost
+        connection): the job may or may not have been committed. Any other exception means
+        nothing was committed.
         """
         jobs = Job.__table__
         queued = (
@@ -162,15 +173,28 @@ class JobStore:
         references = [Reference(job_id=values["id"], index=i) for i in range(reference_count)]
         row = select(*(literal(value, jobs.c[name].type) for name, value in values.items()))
         has_room = queued.correlate(None).scalar_subquery() < max_queued
-        with self._session.begin() as session:
-            if self._engine.dialect.name == "postgresql":
-                session.execute(select(func.pg_advisory_xact_lock(_owner_lock_key(owner))))
-            seq = session.scalar(
-                insert(jobs).from_select(list(values), row.where(has_room)).returning(jobs.c.seq)
-            )
-            if seq is None:
-                return None
-            session.add_all(references)
+        # A flag rather than a try around commit(): closing the session after COMMIT can
+        # fail too, and that must not read as a rollback either.
+        committing = False
+        try:
+            with self._session() as session:
+                if self._engine.dialect.name == "postgresql":
+                    session.execute(select(func.pg_advisory_xact_lock(_owner_lock_key(owner))))
+                seq = session.scalar(
+                    insert(jobs)
+                    .from_select(list(values), row.where(has_room))
+                    .returning(jobs.c.seq)
+                )
+                if seq is None:
+                    return None
+                session.add_all(references)
+                session.flush()  # so that commit() below only sends COMMIT
+                committing = True
+                session.commit()
+        except Exception as exc:
+            if committing:
+                raise CommitOutcomeUnknown(values["id"]) from exc
+            raise
         return Job(**values, seq=seq, images=[], references=references)
 
     def get(self, owner: str, job_id: str) -> Job | None:

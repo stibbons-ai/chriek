@@ -6,7 +6,15 @@ import json
 import uuid
 
 import pytest
-from conftest import ALICE, ALICE_KEY, CountingBackend, assert_nothing_queued, running, wait_for
+from conftest import (
+    ALICE,
+    ALICE_KEY,
+    CountingBackend,
+    assert_nothing_queued,
+    running,
+    submit,
+    wait_for,
+)
 
 MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_ERROR_BYTES = 16 * 1024
@@ -278,3 +286,22 @@ def test_422_omits_the_rejected_value_and_validation_context(client):
     [error] = response.json()["detail"]
     assert (error["type"], error["loc"]) == ("json_invalid", ["body", decoded.value.pos])
     assert error["msg"]
+
+
+@pytest.mark.parametrize(
+    "content_type", ["multipart/form-data; boundary=x", "Multipart/Form-Data; boundary=x"]
+)
+def test_multipart_poll_keeps_the_declared_length_cap(tmp_path, content_type):
+    # Only POST /jobs streams multipart uploads itself; a poll never reads its body, so the
+    # ordinary declared-length cap is all that bounds it.
+    with running(tmp_path) as client:
+        path = f"/jobs/{submit(client, width=16, height=16)['id']}"
+        oversized = {"Content-Type": content_type, "Content-Length": str(MAX_BODY_BYTES + 1)}
+
+        assert asgi_request(client.app, [b""], oversized, "GET", path)[:2] == (401, 0)
+        assert asgi_request(client.app, [b""], ALICE | oversized, "GET", path)[:2] == (413, 0)
+        status, _, _, body = asgi_request(
+            client.app, [b""], ALICE | {"Content-Type": content_type}, "GET", path
+        )
+        assert status == 200
+        assert json.loads(body)["id"] == path.removeprefix("/jobs/")

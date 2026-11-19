@@ -15,6 +15,8 @@ import threading
 import urllib.request
 import uuid
 import zlib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -62,7 +64,7 @@ SMALL_FORM = {"width": "16", "height": "16"}
 
 def encode_multipart(
     data: dict[str, str],
-    files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
+    files: list[tuple[str, tuple[str | None, bytes, str]]] | None = None,
     boundary: str = "chriek-multipart-boundary",
 ) -> tuple[dict[str, str], bytes]:
     parts: list[bytes] = []
@@ -70,9 +72,11 @@ def encode_multipart(
         header = f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
         parts.append(f"{header}{value}\r\n".encode())
     for field_name, (filename, content, content_type) in files or []:
+        # None omits the filename parameter, which RFC 7578 makes optional.
+        filename_param = "" if filename is None else f'; filename="{filename}"'
         parts.append(
-            f'--{boundary}\r\nContent-Disposition: form-data; name="{field_name}"; '
-            f'filename="{filename}"\r\nContent-Type: {content_type}\r\n\r\n'.encode()
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{field_name}"'
+            f"{filename_param}\r\nContent-Type: {content_type}\r\n\r\n".encode()
             + content
             + b"\r\n"
         )
@@ -706,13 +710,17 @@ def test_url_and_text_reference_fields_are_rejected_without_network_fetch(
             assert resp.status_code == 422
             assert resp.json()["detail"]
 
+        # A filename-less `references` part is an upload like any other: a URL in it is
+        # bytes that fail image validation, never an address chriek fetches.
         text_reference = post_multipart(
             client, headers=ALICE, data={"prompt": "hi", "references": url}
         )
         assert text_reference.status_code == 422
         [error] = text_reference.json()["detail"]
-        assert error["loc"] == ["body", "references"]
-        assert error["msg"] == "references must be uploaded as image files, not text or URLs"
+        assert error["loc"] == ["body", "references", 0]
+        assert error["msg"] == (
+            "reference image 0 is not a valid image (supported formats: PNG, JPEG, WebP)"
+        )
         assert url not in text_reference.text
 
         resp = post_multipart(client, headers=ALICE, data={"prompt": "hi", "reference_url": url})
@@ -1592,21 +1600,24 @@ def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_u
         assert claimed_at_first_commit == [(submitted["id"], [(0, (16, 16)), (1, (24, 16))])]
         assert wait_for(client, blocker["id"])["status"] == "succeeded"
 
-    # Now force `store.create` to fail after `write_references` has written the files.
-    def failing_create(self: JobStore, *args, **kwargs):
-        raise OperationalError("INSERT", {}, RuntimeError("database is full"))
-
-    monkeypatch.setattr(JobStore, "create", failing_create)
+    # A failure inside the admitting transaction, after `write_references` has written the
+    # files but before COMMIT, rolls everything back: the references are removed too.
     fail_dir = tmp_path / "fail_case"
     app = create_app(Settings.from_env(base_env(fail_dir)))
-    with TestClient(app, raise_server_exceptions=False) as fail_client:
+    with (
+        _fault_in_create(monkeypatch, "after_flush") as fired,
+        TestClient(app, raise_server_exceptions=False) as fail_client,
+    ):
+        owners_before = stored_owners(fail_dir)
         resp = post_multipart(
             fail_client,
             data={"prompt": "db failure", "width": "16", "height": "16"},
             files=[("references", ("a.png", ref_a, "image/png"))],
         )
+        assert fired == ["after_flush"]
         assert resp.status_code == 500
         assert list((fail_dir / "images").iterdir()) == []
+    assert stored_owners(fail_dir) == owners_before
 
     # Double fault: cleanup cannot remove the written reference. The client still sees the
     # original store failure, and the leftover file is logged.
@@ -2820,3 +2831,166 @@ def test_proxy_mode_edit_jobs_use_the_shared_owner_and_the_host_check(tmp_path):
         assert (hostile.status_code, hostile.text) == (400, "Invalid host header")
         assert sorted(p.name for p in storage.iterdir()) == jobs_before
     assert stored_owners(tmp_path) == [PROXY_OWNER]
+
+
+@contextmanager
+def _fault_in_create(monkeypatch, event_name: str) -> Iterator[list[str]]:
+    """Raise once from Session event `event_name` inside the next `JobStore.create` call.
+
+    `after_flush` fails the admitting transaction before COMMIT (a definite rollback);
+    `before_commit` fails the commit call before the database commits anything, and
+    `after_commit` loses the acknowledgement of a COMMIT the database did run. chriek can't
+    tell the last two apart. Other threads' sessions (the worker's) are left alone.
+    """
+    original = JobStore.create
+    armed = threading.local()
+    fired: list[str] = []
+
+    def fault(*_args) -> None:
+        if getattr(armed, "on", False):
+            armed.on = False
+            fired.append(event_name)
+            raise OperationalError("COMMIT", {}, ConnectionError("connection lost"))
+
+    def create(self: JobStore, *args, **kwargs):
+        armed.on = True
+        try:
+            return original(self, *args, **kwargs)
+        finally:
+            armed.on = False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(JobStore, "create", create)
+        event.listen(Session, event_name, fault)
+        try:
+            yield fired
+        finally:
+            event.remove(Session, event_name, fault)
+
+
+def _reference_sizes(storage: Path, job_id: str, count: int) -> list[tuple[int, int]]:
+    sizes = []
+    for index in range(count):
+        with Image.open(reference_path(storage, job_id, index)) as stored:
+            stored.load()
+            sizes.append(stored.size)
+    return sizes
+
+
+def test_lost_commit_acknowledgement_keeps_the_committed_job_and_its_references(
+    tmp_path, monkeypatch
+):
+    storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
+    form = FORM_16 | {"prompt": "lost ack", "seed": "5"}
+    files = [
+        ("references", ("a.png", make_image_bytes((15, 85, 195), (16, 16)), "image/png")),
+        ("references", ("b.png", make_image_bytes((195, 85, 15), (24, 16)), "image/png")),
+    ]
+    with monkeypatch.context() as patch:
+        # The job stays queued until the restart below runs it.
+        patch.setattr(JobStore, "claim_next", lambda _self, now: None)
+        app = create_app(Settings.from_env(base_env(tmp_path)))
+        with (
+            _fault_in_create(patch, "after_commit") as fired,
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            response = post_multipart(client, data=form, files=files)
+    assert fired == ["after_commit"]
+    assert response.status_code == 500
+    assert "location" not in response.headers
+
+    # The database committed: the job and its ordered association exist, so must the files.
+    (job_dir,) = storage.iterdir()
+    job_id = job_dir.name
+    with connect_db(tmp_path) as db:
+        rows = db.execute(
+            text('SELECT "index" FROM job_references WHERE job_id = :id ORDER BY "index"'),
+            {"id": job_id},
+        )
+        assert list(rows.scalars()) == [0, 1]
+    assert _reference_sizes(storage, job_id, 2) == [(16, 16), (24, 16)]
+
+    with running(tmp_path) as client:
+        body = wait_for(client, job_id)
+        assert (body["status"], body["params"]["reference_count"]) == ("succeeded", 2)
+        control = wait_for(client, submit_multipart(client, data=form, files=files)["id"])
+        assert download_pixels(client, body) == download_pixels(client, control)
+
+
+def test_failed_commit_call_keeps_references_even_when_nothing_was_committed(tmp_path, monkeypatch):
+    storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
+    backend = CountingBackend()
+    app = create_app(Settings.from_env(base_env(tmp_path)), backend=backend)
+    with (
+        _fault_in_create(monkeypatch, "before_commit") as fired,
+        TestClient(app, raise_server_exceptions=False) as client,
+    ):
+        response = post_multipart(
+            client, data=FORM_16, files=[_reference_file("a.png", (200, 0, 0))]
+        )
+        assert fired == ["before_commit"]
+        assert response.status_code == 500
+        # Unknown outcome: no job row, but the upload stays as an orphan rather than risk
+        # deleting the files of a job the database might have committed.
+        assert stored_owners(tmp_path) == []
+        (job_dir,) = storage.iterdir()
+        assert _reference_sizes(storage, job_dir.name, 1) == [(16, 16)]
+        assert backend.renders == 0
+
+
+def test_filename_less_reference_parts_upload_like_named_ones(tmp_path):
+    storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
+    red = make_image_bytes((220, 20, 20), (16, 16))
+    blue = make_image_bytes((20, 40, 220), (24, 16))
+    form = FORM_16 | {"seed": "7"}
+    with running(tmp_path) as client:
+        named, unnamed = (
+            wait_for(
+                client,
+                submit_multipart(
+                    client, data=form, files=[("references", (name, red, "image/png"))]
+                )["id"],
+            )
+            for name in ("red.png", None)
+        )
+        for body in (named, unnamed):
+            assert (body["status"], body["params"]["reference_count"]) == ("succeeded", 1)
+        assert download_pixels(client, named) == download_pixels(client, unnamed)
+
+        mixed = submit_multipart(
+            client,
+            data=form,
+            files=[
+                ("references", (None, red, "image/png")),
+                ("references", ("blue.png", blue, "image/png")),
+                ("references", (None, blue, "application/octet-stream")),
+                ("references", ("red.png", red, "image/png")),
+            ],
+        )
+        body = wait_for(client, mixed["id"])
+        assert (body["status"], body["params"]["reference_count"]) == ("succeeded", 4)
+        assert _reference_sizes(storage, mixed["id"], 4) == [(16, 16), (24, 16), (24, 16), (16, 16)]
+
+
+def test_invalid_filename_less_references_reject_the_whole_request(tmp_path):
+    backend = CountingBackend()
+    first = ("references", ("first.png", make_image_bytes(), "image/png"))
+    with running(tmp_path, backend=backend) as client:
+        too_many = post_multipart(
+            client,
+            data=FORM_16,
+            files=[
+                ("references", (None if i % 2 else f"{i}.png", make_image_bytes(), "image/png"))
+                for i in range(5)
+            ],
+        )
+        assert too_many.status_code == 422, too_many.text
+        assert too_many.json()["detail"][0]["msg"] == "at most 4 reference images are allowed"
+
+        for second in (b"https://example.invalid/ref.png", b"not-an-image", b""):
+            response = post_multipart(
+                client, data=FORM_16, files=[first, ("references", (None, second, "image/png"))]
+            )
+            assert response.status_code == 422, response.text
+            assert [err["loc"] for err in response.json()["detail"]] == [["body", "references", 1]]
+        _assert_nothing_persisted(tmp_path, backend)

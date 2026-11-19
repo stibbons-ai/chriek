@@ -36,7 +36,14 @@ from chriek.backend import ImageBackend, create_backend
 from chriek.config import AuthMode, Limits, Settings
 from chriek.signing import UrlSigner
 from chriek.storage import check_database, private_image_root
-from chriek.store import MEMORY_DATABASE, RUNNING, SUCCEEDED, Job, JobStore
+from chriek.store import (
+    MEMORY_DATABASE,
+    RUNNING,
+    SUCCEEDED,
+    CommitOutcomeUnknown,
+    Job,
+    JobStore,
+)
 from chriek.worker import Worker, image_path, write_references
 
 log = logging.getLogger(__name__)
@@ -317,6 +324,9 @@ def create_app(
                         f"queue full: at most {settings.limits.max_queued_jobs} queued jobs "
                         "per owner; new jobs are accepted only while fewer are queued",
                     )
+            except CommitOutcomeUnknown:
+                # The job may be committed: keep its references, at worst as an orphan.
+                raise
             except BaseException:
                 shutil.rmtree(storage_dir / job_id, onexc=_log_cleanup_error)
                 raise
@@ -370,7 +380,8 @@ def create_app(
 
 
 def _authenticated_route(authenticate: Authenticate) -> type[APIRoute]:
-    """Route class that authenticates, then caps non-multipart bodies, before the handler runs.
+    """Route class that authenticates, then caps bodies other than multipart `POST /jobs`
+    uploads, before the handler runs.
 
     `/jobs` streams and parses its body itself, so authenticating first means an
     unauthenticated client gets 401 without chriek reading, parsing or storing any upload.
@@ -383,7 +394,7 @@ def _authenticated_route(authenticate: Authenticate) -> type[APIRoute]:
             async def authenticated(request: Request) -> Response:
                 request.state.owner = authenticate(request)
                 content_type, _ = parse_options_header(request.headers.get("content-type", ""))
-                if content_type == b"multipart/form-data":
+                if request.method == "POST" and content_type == b"multipart/form-data":
                     # Reference uploads: the multipart parser enforces `max_upload_bytes` (422).
                     return await handler(request)
                 try:
@@ -552,27 +563,23 @@ class _MultipartAccumulator:
             self._part_name = raw_name.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise _validation_error(("body",), "multipart field name must be valid UTF-8") from exc
-        self._is_file = b"filename" in options
+        # A `references` part is an upload whether or not it carries the optional filename
+        # (RFC 7578); image decoding, not the part's headers, decides whether it is valid.
+        self._is_file = self._part_name == "references"
         if self._is_file:
-            if self._part_name != "references":
-                raise _validation_error(
-                    ("body", self._part_name),
-                    f"unexpected file field {self._part_name!r}; reference files must use "
-                    "field 'references'",
-                )
             if len(self.files) + 1 > self.limits.max_references:
                 raise _validation_error(
                     ("body", "references"),
                     f"at most {self.limits.max_references} reference images are allowed",
                 )
-        else:
-            if self._part_name == "references":
-                raise _validation_error(
-                    ("body", "references"),
-                    "references must be uploaded as image files, not text or URLs",
-                )
-            if len(self.fields) + 1 > MAX_FORM_FIELDS:
-                raise _validation_error(("body",), "too many form fields")
+        elif b"filename" in options:
+            raise _validation_error(
+                ("body", self._part_name),
+                f"unexpected file field {self._part_name!r}; reference files must use "
+                "field 'references'",
+            )
+        elif len(self.fields) + 1 > MAX_FORM_FIELDS:
+            raise _validation_error(("body",), "too many form fields")
 
     def on_part_data(self, data: bytes, start: int, end: int) -> None:
         if not self._is_file and len(self._part_data) + (end - start) > MAX_SCALAR_FIELD_BYTES:
