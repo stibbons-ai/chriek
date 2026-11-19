@@ -1,6 +1,7 @@
 """Exercise the MLX backend and its consumers without the optional inference packages."""
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -93,6 +94,11 @@ def inference(monkeypatch, tmp_path):
         SimpleNamespace(Flux3Klein=SimpleNamespace(from_pretrained=fake.load)),
     )
     monkeypatch.setitem(
+        sys.modules,
+        "flux3_mlx.pipeline",
+        SimpleNamespace(DOWNSAMPLING_RATIO=16, MULTI_REFERENCE_MAX_PIXELS=1024**2),
+    )
+    monkeypatch.setitem(
         sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=fake.download)
     )
     monkeypatch.setitem(
@@ -148,6 +154,20 @@ def test_edit_pads_small_multi_reference_images(inference, tmp_path):
         assert padded.getpixel((8, 16)) == (255, 0, 0)
         assert small.size == (12, 32)
         assert unchanged is regular
+
+
+def test_edit_keeps_tall_multi_reference_nonempty_after_runtime_crop(inference):
+    backend = mlx_backend.MlxBackend()
+    with Image.new("RGB", (12, 131072), "red") as tall, Image.new("RGB", (64, 64)) as regular:
+        assert backend.render("edit", 32, 16, 7, (tall, regular)).size == (32, 16)
+        [(_, references, _)] = inference.renders
+        for reference in references:
+            width, height = reference.size
+            # flux3-mlx 0.1.0 scales to the area cap, then crops to its grid.
+            scale = min(1.0, math.sqrt(1024**2 / (width * height)))
+            size = tuple(int(side * scale) // 16 * 16 for side in reference.size)
+            assert min(size) >= 16, size
+        assert references[1] is regular
 
 
 @pytest.mark.parametrize("load_error", [RuntimeError, SystemExit])

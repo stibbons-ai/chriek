@@ -2,6 +2,7 @@
 
 import json
 import logging
+import math
 import platform
 import subprocess
 from collections.abc import Sequence
@@ -77,12 +78,21 @@ def _hardware() -> dict[str, object]:
     }
 
 
-def _pad_multi_reference(image: Image.Image) -> Image.Image:
-    # flux3-mlx crops each side down to a multiple of 16.
-    if min(image.size) >= 16:
+def _fit_multi_reference(image: Image.Image) -> Image.Image:
+    from flux3_mlx.pipeline import DOWNSAMPLING_RATIO, MULTI_REFERENCE_MAX_PIXELS
+
+    grid, budget = DOWNSAMPLING_RATIO, MULTI_REFERENCE_MAX_PIXELS
+    short, long = sorted(image.size)
+    area = short * long
+    # Leave references alone if the runtime's area scaling still leaves a full grid cell.
+    if short >= grid and (area <= budget or short * math.sqrt(budget / area) >= grid):
         return image
     image = ImageOps.exif_transpose(image).convert("RGB")
-    dx, dy = max(16 - image.width, 0), max(16 - image.height, 0)
+    max_side = budget // grid
+    if long > max_side:
+        size = tuple(max(1, side * max_side // long) for side in image.size)
+        image = image.resize(size, Image.Resampling.LANCZOS)
+    dx, dy = max(grid - image.width, 0), max(grid - image.height, 0)
     return ImageOps.expand(image, (dx // 2, dy // 2, dx - dx // 2, dy - dy // 2))
 
 
@@ -179,7 +189,7 @@ class MlxBackend:
                 self._load_seconds = round(perf_counter() - started, 3)
         image, _ = self._pipeline(
             prompt,
-            [_pad_multi_reference(ref) for ref in references]
+            [_fit_multi_reference(ref) for ref in references]
             if len(references) > 1
             else list(references),
             width=width,
