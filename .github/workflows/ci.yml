@@ -49,3 +49,30 @@ jobs:
           enable-cache: true
       - run: uv sync --locked
       - run: uv run pytest
+
+  # The same test suite with images in a real S3-compatible service (RustFS: MinIO no longer
+  # publishes container images); tests marked `local_storage` keep local images.
+  s3:
+    runs-on: ubuntu-latest
+    services:
+      s3:
+        image: rustfs/rustfs:1.0.6
+        env:
+          RUSTFS_ACCESS_KEY: chriek-ci
+          RUSTFS_SECRET_KEY: chriek-ci-secret-0123456789
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fsS http://127.0.0.1:9000/health"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      CHRIEK_TEST_S3_URL: http://chriek-ci:chriek-ci-secret-0123456789@127.0.0.1:9000/chriek-test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run pytest

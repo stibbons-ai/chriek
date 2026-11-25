@@ -23,6 +23,8 @@ from sqlalchemy import text
 
 TRAINED_ALGORITHMIC_MEDIA = "http://cv.iptc.org/newscodes/digitalsourcetype/trainedAlgorithmicMedia"
 IPTC_EXT = "{http://iptc.org/std/Iptc4xmpExt/2008-02-29/}"
+# chriek's own signed download route serves local images only; test_s3.py covers S3 links.
+pytestmark = pytest.mark.local_storage
 
 
 def finished_job(client, **fields):

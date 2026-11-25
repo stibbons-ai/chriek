@@ -33,9 +33,10 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from chriek.api import WORKER_STOPPED
+from chriek.images import reference_path
 from chriek.signing import UrlSigner
 from chriek.store import JobStore
-from chriek.worker import Worker, reference_path
+from chriek.worker import Worker
 
 
 def status(client, job_id, headers=ALICE):
@@ -68,6 +69,7 @@ def test_jobs_run_one_at_a_time_in_submission_order(tmp_path):
         assert earlier["finished_at"] <= later["started_at"]
 
 
+@pytest.mark.local_storage
 def test_restart_fails_running_job_and_runs_queued_job(tmp_path):
     crashed_backend = GatedBackend()
     stale_clock = FakeClock()
@@ -110,6 +112,7 @@ def test_restart_fails_running_job_and_runs_queued_job(tmp_path):
     assert not (tmp_path / "images" / running_job["id"]).exists()
 
 
+@pytest.mark.local_storage
 def test_jobs_and_downloads_survive_a_clean_restart(tmp_path):
     with running(tmp_path) as before:
         body = wait_for(before, submit(before, width=16, height=16)["id"])
@@ -186,6 +189,7 @@ CREATE TABLE images (
 
 
 @pytest.mark.sqlite
+@pytest.mark.local_storage
 def test_existing_sqlite_database_keeps_working(tmp_path):
     db_path = tmp_path / "db" / "chriek.db"
     db_path.parent.mkdir(mode=0o700)
@@ -229,6 +233,7 @@ def test_database_path_is_used_literally_across_restart(tmp_path, filename):
 
 @pytest.mark.sqlite
 @pytest.mark.parametrize("sentinel", [":memory:", "./:memory:"])
+@pytest.mark.local_storage
 def test_memory_database_serves_one_lifetime_and_resets_on_restart(tmp_path, monkeypatch, sentinel):
     # A shared (0755) working directory: the database checks must skip it, not refuse it.
     cwd = tmp_path / "cwd"
@@ -405,6 +410,7 @@ class StepBackend(GatedBackend):
 TIMED_OUT = "timed out: the job ran longer than CHRIEK_JOB_TIMEOUT_SECONDS"
 
 
+@pytest.mark.local_storage
 def test_stuck_job_times_out_and_its_late_result_is_discarded(tmp_path):
     clock = FakeClock()
     backend = StepBackend()
@@ -535,6 +541,7 @@ def test_result_finished_after_the_deadline_without_a_poll_fails_the_job(tmp_pat
     [(False, ("succeeded", None)), (True, ("failed", "image 1 of 1 failed"))],
     ids=["success", "failure"],
 )
+@pytest.mark.local_storage
 def test_result_finished_exactly_at_the_deadline_keeps_its_outcome(tmp_path, fails, outcome):
     # Every clock read after the render advances 1 s, so the worker must decide and persist
     # with one completion time: within the limit, never a later one past it.
@@ -563,6 +570,7 @@ def test_result_finished_exactly_at_the_deadline_keeps_its_outcome(tmp_path, fai
     [(True, False), (False, False), (False, True)],
     ids=["poll-then-late-success", "worker-late-success", "worker-late-failure"],
 )
+@pytest.mark.local_storage
 def test_timed_out_edit_job_keeps_its_references_and_never_publishes_outputs(
     tmp_path, polled, fails
 ):
@@ -605,6 +613,7 @@ def test_timed_out_edit_job_keeps_its_references_and_never_publishes_outputs(
     ],
     ids=["past-deadline", "exact-deadline"],
 )
+@pytest.mark.local_storage
 def test_reference_load_failure_decides_and_persists_one_completion_time(tmp_path, tick, outcome):
     clock = TickingClock()
     backend = GatedBackend()

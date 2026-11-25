@@ -34,10 +34,13 @@ from conftest import (
     base_env,
     connect_db,
     db_dump,
+    download,
     make_image_bytes,
     post_job,
     proxy_env,
+    read_stored,
     running,
+    stored_images,
     stored_owners,
     submit,
     wait_for,
@@ -49,14 +52,15 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 import chriek.api
+import chriek.images
 from chriek.api import create_app
 from chriek.auth import PROXY_OWNER
 from chriek.backend import FakeBackend
 from chriek.config import Settings
+from chriek.images import LocalImages, reference_path
 from chriek.signing import UrlSigner
 from chriek.storage import StorageError
 from chriek.store import JobStore
-from chriek.worker import reference_path, write_references
 
 MAX_SEED = 2**32 - 1
 SMALL_FORM = {"width": "16", "height": "16"}
@@ -98,9 +102,9 @@ def submit_multipart(client, headers=ALICE, data=None, files=None):
 
 
 def download_pixels(client, job_body: dict, index: int = 0) -> bytes:
-    response = client.get(job_body["images"][index]["url"])
-    assert response.status_code == 200
-    return Image.open(io.BytesIO(response.content)).tobytes()
+    status, body = download(client, job_body["images"][index]["url"])
+    assert status == 200
+    return Image.open(io.BytesIO(body)).tobytes()
 
 
 def asgi_post_jobs(
@@ -474,7 +478,7 @@ def _draft_db_with_queued_edit_job(tmp_path: Path, refs: list[bytes]) -> str:
     store = JobStore(Path(base_env(tmp_path)["CHRIEK_DB_PATH"]))
     (tmp_path / "images").mkdir(mode=0o700)
     job_id = str(uuid.uuid7())
-    write_references(tmp_path / "images", job_id, refs)
+    LocalImages(tmp_path / "images").put_references(job_id, refs)
     store.create(
         job_id=job_id,
         owner="alice",
@@ -494,6 +498,7 @@ def _draft_db_with_queued_edit_job(tmp_path: Path, refs: list[bytes]) -> str:
 
 
 @pytest.mark.sqlite  # only SQLite drafts had the old table name
+@pytest.mark.local_storage
 def test_draft_database_reference_table_is_renamed_keeping_associations_and_order(tmp_path):
     ref_a = make_image_bytes((111, 22, 33))
     ref_b = make_image_bytes((44, 155, 66))
@@ -565,6 +570,7 @@ def test_postgres_never_renames_an_unrelated_references_table(tmp_path):
         assert db.scalar(text("SELECT count(*) FROM job_references")) == 1
 
 
+@pytest.mark.local_storage
 def test_references_stored_with_safe_names_and_persist_across_restart_for_queued_job(tmp_path):
     crashed = GatedBackend()
     ref_a = make_image_bytes((111, 22, 33))
@@ -623,6 +629,7 @@ def test_references_stored_with_safe_names_and_persist_across_restart_for_queued
     assert sorted(p.name for p in (first_dir / "references").iterdir()) == ["0.png"]
 
 
+@pytest.mark.local_storage
 def test_reference_bytes_cannot_be_downloaded_and_failed_edit_job_publishes_no_outputs(tmp_path):
     ref_bytes = make_image_bytes((200, 100, 50))
     # Fail on the second image (index 1) after image 0 has already been rendered.
@@ -695,6 +702,7 @@ def network_attempts(monkeypatch) -> list:
     return attempts
 
 
+@pytest.mark.local_storage  # blocks all sockets, which S3 needs
 def test_url_and_text_reference_fields_are_rejected_without_network_fetch(
     tmp_path, network_attempts
 ):
@@ -739,6 +747,7 @@ def test_url_and_text_reference_fields_are_rejected_without_network_fetch(
     assert network_attempts == ["urlopen", "create_connection", "socket.connect"]
 
 
+@pytest.mark.local_storage
 def test_reference_count_and_upload_byte_limits_are_configurable_and_enforced(tmp_path):
     small_png = make_image_bytes((10, 20, 30), (16, 16))
     boundary = "chriek-test-boundary"
@@ -1101,6 +1110,7 @@ def test_invalid_multipart_requests_return_422_and_leave_no_files(
         "invalid-utf8-field-name",
     ],
 )
+@pytest.mark.local_storage
 def test_malformed_raw_multipart_returns_422(tmp_path, content_type, body):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
@@ -1135,6 +1145,7 @@ def test_multipart_part_header_names_are_case_insensitive(client):
     assert download_pixels(client, done) != download_pixels(client, text_only)
 
 
+@pytest.mark.local_storage
 def test_form_field_count_and_scalar_size_are_rejected_during_receipt(tmp_path):
     headers = ALICE | {"Content-Type": "multipart/form-data; boundary=bound"}
     # One empty field per chunk; the 33rd part's headers exceed the 32-field bound.
@@ -1169,6 +1180,7 @@ TRUNCATION_REFS = [
 @pytest.mark.parametrize(
     "cut", ["after-boundary-with-crlf", "after-boundary-without-crlf", "mid-second-reference"]
 )
+@pytest.mark.local_storage
 def test_multipart_truncated_after_complete_parts_returns_422(tmp_path, cut):
     ct_header, body = encode_multipart(
         {"prompt": "truncated", "width": "16", "height": "16"},
@@ -1255,6 +1267,7 @@ def _bomb_header_png(width: int = 20000, height: int = 20000) -> bytes:
     return raw[:16] + ihdr_data + ihdr_crc + raw[33:]
 
 
+@pytest.mark.local_storage
 def test_reference_format_allowlist_corrupt_metadata_and_bomb_headers(tmp_path, monkeypatch):
     gs_marker = tmp_path / "gs_invoked"
     fake_bin = tmp_path / "bin"
@@ -1357,6 +1370,7 @@ def _oriented_jpeg() -> bytes:
     return buf.getvalue()
 
 
+@pytest.mark.local_storage
 def test_non_rgb_and_transparent_references_are_stored_as_plain_rgb(tmp_path):
     backend = CountingBackend()
     form = {"prompt": "normalize", "width": "16", "height": "16"}
@@ -1423,6 +1437,7 @@ def test_reference_pixel_limit_includes_exact_boundary(tmp_path, monkeypatch):
         assert wait_for(client, exact["id"])["status"] == "succeeded"
 
 
+@pytest.mark.local_storage
 def test_16_bit_greyscale_references_are_scaled_not_clipped(client, tmp_path):
     form = {"prompt": "deep grey", "seed": "5", "width": "16", "height": "16"}
 
@@ -1456,6 +1471,7 @@ def test_16_bit_greyscale_references_are_scaled_not_clipped(client, tmp_path):
 
 
 @pytest.mark.parametrize("fmt", ["JPEG", "WEBP"])
+@pytest.mark.local_storage
 def test_reference_icc_profile_is_dropped_so_large_profiles_stay_loadable(client, tmp_path, fmt):
     # 1,048,832 bytes: above Pillow's 1 MiB limit on a decompressed PNG iCCP profile.
     icc = bytes(range(256)) * 4097
@@ -1500,6 +1516,7 @@ with TestClient(create_app(Settings.from_env(env)), raise_server_exceptions=Fals
     ],
     ids=["bomb-warning-as-error", "palette-without-plte-optimized"],
 )
+@pytest.mark.local_storage
 def test_invalid_reference_returns_422_in_non_default_interpreter_modes(
     tmp_path, reference, python_args, env
 ):
@@ -1527,6 +1544,7 @@ def test_invalid_reference_returns_422_in_non_default_interpreter_modes(
     assert stored_owners(tmp_path) == []
 
 
+@pytest.mark.local_storage
 def test_mid_publish_failure_cleans_already_moved_outputs_and_keeps_references(
     tmp_path, monkeypatch
 ):
@@ -1562,6 +1580,7 @@ def test_mid_publish_failure_cleans_already_moved_outputs_and_keeps_references(
         )
 
 
+@pytest.mark.local_storage
 def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_up(
     tmp_path, monkeypatch, caplog
 ):
@@ -1624,7 +1643,7 @@ def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_u
         assert claimed_at_first_commit == [(submitted["id"], [(0, (16, 16)), (1, (24, 16))])]
         assert wait_for(client, blocker["id"])["status"] == "succeeded"
 
-    # A failure inside the admitting transaction, after `write_references` has written the
+    # A failure inside the admitting transaction, after `put_references` has written the
     # files but before COMMIT, rolls everything back: the references are removed too.
     fail_dir = tmp_path / "fail_case"
     app = create_app(Settings.from_env(base_env(fail_dir)))
@@ -1656,7 +1675,7 @@ def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_u
     try:
         with (
             TestClient(app) as stuck_client,
-            caplog.at_level(logging.ERROR, "chriek.api"),
+            caplog.at_level(logging.ERROR, "chriek.images"),
             pytest.raises(OperationalError, match="database is full"),
         ):
             post_multipart(
@@ -1667,7 +1686,7 @@ def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_u
         (job_dir,) = (stuck_dir / "images").iterdir()
         assert (job_dir / "references" / "0.png").is_file()
         assert any(
-            "could not remove" in record.getMessage() and record.name == "chriek.api"
+            "could not remove" in record.getMessage() and record.name == "chriek.images"
             for record in caplog.records
         )
     finally:
@@ -1675,8 +1694,9 @@ def test_references_exist_when_job_becomes_claimable_and_create_failure_cleans_u
             path.chmod(0o700)
 
 
+@pytest.mark.local_storage
 def test_second_reference_write_failure_removes_the_first_and_stores_no_job(tmp_path, monkeypatch):
-    original_write = chriek.worker.write_private
+    original_write = chriek.images.write_private
     failed_at: list[Path] = []
 
     def fail_second_reference(path: Path, data: bytes) -> None:
@@ -1687,7 +1707,7 @@ def test_second_reference_write_failure_removes_the_first_and_stores_no_job(tmp_
             raise OSError(28, "No space left on device")
         original_write(path, data)
 
-    monkeypatch.setattr(chriek.worker, "write_private", fail_second_reference)
+    monkeypatch.setattr(chriek.images, "write_private", fail_second_reference)
     backend = CountingBackend()
     app = create_app(Settings.from_env(base_env(tmp_path)), backend=backend)
     with TestClient(app, raise_server_exceptions=False) as client:
@@ -1704,10 +1724,11 @@ def test_second_reference_write_failure_removes_the_first_and_stores_no_job(tmp_
     _assert_nothing_persisted(tmp_path, backend)
 
 
+@pytest.mark.local_storage
 def test_submit_decodes_and_persists_off_the_event_loop(tmp_path, monkeypatch):
     threads: dict[str, int] = {}
     original_decode = chriek.api._decode_reference_png
-    original_write = chriek.api.write_references
+    original_write = LocalImages.put_references
     original_create = JobStore.create
 
     def recording_decode(*args):
@@ -1723,7 +1744,7 @@ def test_submit_decodes_and_persists_off_the_event_loop(tmp_path, monkeypatch):
         return original_create(self, *args, **kwargs)
 
     monkeypatch.setattr(chriek.api, "_decode_reference_png", recording_decode)
-    monkeypatch.setattr(chriek.api, "write_references", recording_write)
+    monkeypatch.setattr(LocalImages, "put_references", recording_write)
     monkeypatch.setattr(JobStore, "create", recording_create)
 
     with running(tmp_path) as client:
@@ -1739,6 +1760,7 @@ def test_submit_decodes_and_persists_off_the_event_loop(tmp_path, monkeypatch):
     assert loop_thread not in threads.values()
 
 
+@pytest.mark.local_storage
 def test_cleanup_fault_and_missing_reference_fail_job_cleanly_without_stopping_worker(
     tmp_path, monkeypatch, caplog
 ):
@@ -1887,13 +1909,13 @@ def _with_fill(data: bytes, fill: int) -> bytes:
 
 
 def _assert_nothing_persisted(tmp_path: Path, backend: CountingBackend) -> None:
-    assert not any((tmp_path / "images").iterdir())
+    assert stored_images(tmp_path) == []
     assert stored_owners(tmp_path) == []
     assert backend.renders == 0
 
 
 def _stored_reference(tmp_path: Path, job_id: str) -> Image.Image:
-    with Image.open(reference_path(tmp_path / "images", job_id, 0)) as stored:
+    with Image.open(io.BytesIO(read_stored(tmp_path, f"{job_id}/references/0.png"))) as stored:
         stored.load()
         return stored
 
@@ -1944,6 +1966,7 @@ def test_jpeg_references_keep_their_decoded_pixels(client, tmp_path, upload):
     assert _stored_reference(tmp_path, job["id"]).tobytes() == expected
 
 
+@pytest.mark.local_storage
 def test_jpeg_structure_bounds_hold_at_their_limits(tmp_path):
     baseline = _jpeg(_noise_image((16, 16)))
     progressive = _jpeg(_noise_image((16, 16)), progressive=True)
@@ -2199,6 +2222,7 @@ def _with_exif(fmt: str, exif: bytes) -> bytes:
 
 
 @pytest.mark.parametrize("fmt", ["PNG", "JPEG", "WEBP"])
+@pytest.mark.local_storage
 def test_exif_cap_holds_at_its_limit(tmp_path, fmt):
     backend = CountingBackend()
     with running(tmp_path, backend=backend) as client:
@@ -2736,6 +2760,7 @@ def _reference_file(name: str, color: tuple[int, int, int]):
     return ("references", (name, make_image_bytes(color), "image/png"))
 
 
+@pytest.mark.local_storage
 def test_edit_jobs_report_backend_metrics_only_when_the_backend_ran(tmp_path):
     class MeasuredBackend(RecordingStepBackend):
         """Counts `start_job` calls; reports them and the renders seen so far as run details."""
@@ -2800,6 +2825,7 @@ def _admission_state(tmp_path: Path) -> tuple[str, list[Path]]:
     return db_dump(tmp_path), sorted(p.relative_to(storage) for p in storage.rglob("*"))
 
 
+@pytest.mark.local_storage
 def test_full_queue_rejects_every_transport_and_leaves_no_reference_artifacts(tmp_path):
     red, blue, green = (200, 0, 0), (0, 0, 200), (0, 200, 0)
     backend = RecordingStepBackend()
@@ -2851,6 +2877,7 @@ def test_full_queue_rejects_every_transport_and_leaves_no_reference_artifacts(tm
     }
 
 
+@pytest.mark.local_storage
 def test_admission_lost_after_the_early_count_saw_room_is_429_without_artifacts(
     tmp_path, monkeypatch
 ):
@@ -2895,6 +2922,7 @@ def test_admission_lost_after_the_early_count_saw_room_is_429_without_artifacts(
     assert backend.prompts == ["running", "queued"]
 
 
+@pytest.mark.local_storage
 def test_proxy_mode_edit_jobs_use_the_shared_owner_and_the_host_check(tmp_path):
     storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
     files = [_reference_file("a.png", (200, 0, 0))]
@@ -2966,6 +2994,7 @@ def _reference_sizes(storage: Path, job_id: str, count: int) -> list[tuple[int, 
 
 
 @pytest.mark.parametrize("error", [None, _Interrupted()], ids=["lost-connection", "non-exception"])
+@pytest.mark.local_storage
 def test_lost_commit_acknowledgement_keeps_the_committed_job_and_its_references(
     tmp_path, monkeypatch, error
 ):
@@ -3006,6 +3035,7 @@ def test_lost_commit_acknowledgement_keeps_the_committed_job_and_its_references(
         assert download_pixels(client, body) == download_pixels(client, control)
 
 
+@pytest.mark.local_storage
 def test_failed_commit_call_keeps_references_even_when_nothing_was_committed(tmp_path, monkeypatch):
     storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
     backend = CountingBackend()
@@ -3027,6 +3057,7 @@ def test_failed_commit_call_keeps_references_even_when_nothing_was_committed(tmp
         assert backend.renders == 0
 
 
+@pytest.mark.local_storage
 def test_failure_building_the_returned_job_rolls_back_rows_and_files(tmp_path, monkeypatch):
     storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
     built: list[str] = []
@@ -3059,6 +3090,7 @@ def test_failure_building_the_returned_job_rolls_back_rows_and_files(tmp_path, m
     assert not any(storage.iterdir())
 
 
+@pytest.mark.local_storage
 def test_filename_less_reference_parts_upload_like_named_ones(tmp_path):
     storage = Path(base_env(tmp_path)["CHRIEK_STORAGE_DIR"])
     red = make_image_bytes((220, 20, 20), (16, 16))

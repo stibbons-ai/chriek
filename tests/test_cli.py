@@ -465,6 +465,7 @@ def served(env: dict[str, str], **kwargs) -> Iterator[httpx2.Client]:
 
 # A non-ASCII signing secret stays valid: only API keys travel in headers.
 @pytest.mark.parametrize("signing_secret", [SIGNING_SECRET, EMOJI_KEY])
+@pytest.mark.local_storage
 def test_chriek_serve_walkthrough_across_restart(tmp_path, signing_secret):
     """Operator starts, stops and restarts `chriek serve`; alice submits, polls and downloads;
     bob can't see her job. Runs on SQLite, or on Postgres with CHRIEK_TEST_POSTGRES_URL."""
@@ -510,6 +511,7 @@ def test_chriek_serve_walkthrough_across_restart(tmp_path, signing_secret):
         assert client.get(f"/jobs/{body['id']}", headers=BOB).status_code == 404
 
 
+@pytest.mark.local_storage
 def test_chriek_serve_shipped_defaults_keep_jobs_private_across_restart(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
@@ -550,6 +552,7 @@ def test_chriek_serve_shipped_defaults_keep_jobs_private_across_restart(tmp_path
 
 
 @pytest.mark.sqlite
+@pytest.mark.local_storage
 def test_chriek_serve_memory_database_runs_jobs_and_resets_on_restart(tmp_path):
     env = base_env(tmp_path) | {"CHRIEK_DB_PATH": ":memory:"}
     with served(env, cwd=tmp_path) as client:
@@ -571,6 +574,7 @@ def test_chriek_serve_memory_database_runs_jobs_and_resets_on_restart(tmp_path):
     assert sorted(path.name for path in tmp_path.iterdir()) == ["images"]
 
 
+@pytest.mark.local_storage
 def test_chriek_serve_output_never_contains_download_signatures(tmp_path):
     with served_process(base_env(tmp_path)) as (process, client):
         url = wait_for(client, submit(client, width=16, height=16)["id"])["images"][0]["url"]
@@ -583,6 +587,7 @@ def test_chriek_serve_output_never_contains_download_signatures(tmp_path):
     assert f"expires={query['expires'][0]}" not in output
 
 
+@pytest.mark.local_storage
 def test_chriek_serve_links_ignore_host_and_forwarded_headers(tmp_path):
     # Host reaches the request scope directly; uvicorn applies X-Forwarded-Proto from 127.0.0.1
     # by default, turning this http request into https. Forwarded is not interpreted.
@@ -655,6 +660,7 @@ def read_only_directory(tmp_path: Path) -> Path:
         ),
     ],
 )
+@pytest.mark.local_storage
 def test_chriek_serve_reports_an_unusable_storage_path_without_a_traceback(
     tmp_path, variable, below
 ):
@@ -823,6 +829,7 @@ FORWARDED_HTTPS = {"Host": "img.example.com", "X-Forwarded-Proto": "https"}
 
 
 @pytest.mark.parametrize("allowed", ["127.0.0.1", "192.0.2.1"], ids=["trusted", "untrusted"])
+@pytest.mark.local_storage
 def test_walkthrough_proxy_operator_without_api_keys_shares_one_owner(tmp_path, allowed):
     env = proxy_env(tmp_path) | {
         "CHRIEK_ALLOWED_HOSTS": "127.0.0.1,img.example.com",
@@ -891,6 +898,7 @@ def test_proxy_server_checks_the_raw_host_header(tmp_path):
 
 
 @pytest.mark.parametrize("env_base", [base_env, loopback_proxy_env], ids=["api-key", "proxy"])
+@pytest.mark.local_storage
 def test_walkthrough_native_tls_operator_downloads_over_https_only(tmp_path, env_base):
     cert, key = make_tls_files(tmp_path / "tls")
     # uvicorn ignores SSLKEYLOGFILE, so a key log path in a missing directory must not stop TLS.

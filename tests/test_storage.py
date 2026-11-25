@@ -15,14 +15,13 @@ import pytest
 from conftest import PausingBackend, modes, running, submit, tree_state, wait_for
 from PIL import Image
 
-from chriek.backend import FakeBackend
+from chriek.images import LocalImages
 from chriek.storage import StorageError, private_image_root
 from chriek.store import JobStore
-from chriek.worker import Worker
 
 # These checks cover the SQLite database file next to the images. On Postgres, image privacy is
 # covered by the `chriek serve` walkthroughs in test_cli.py, which run on both databases.
-pytestmark = pytest.mark.sqlite
+pytestmark = [pytest.mark.sqlite, pytest.mark.local_storage]
 
 # Runs in a child process so its umask never leaks into other tests.
 DIRECT_ENTRY_POINTS = """
@@ -30,6 +29,7 @@ import json, sys, time
 from pathlib import Path
 
 from conftest import PausingBackend, modes
+from chriek.images import LocalImages
 from chriek.store import SUCCEEDED, JobStore
 from chriek.worker import Worker
 
@@ -58,7 +58,7 @@ job = store.create(
     owner="alice", prompt="p", image_count=2, width=16, height=16, seed=0, now=0.0, max_queued=9
 )
 backend = PausingBackend()
-worker = Worker(store, backend, root / "data" / "images", time.time, 3600)
+worker = Worker(store, backend, LocalImages(root / "data" / "images"), time.time, 3600)
 worker.start()
 assert backend.paused.wait(10)
 seen = {"job": job.id, "paused": modes(root)}
@@ -242,7 +242,7 @@ def test_a_store_used_directly_refuses_unsafe_storage_before_touching_it(tmp_pat
     assert tree_state(tmp_path) == before, "the database, its sidecars and link target unchanged"
 
 
-DIRECT_WORKER_UNSAFE = {
+DIRECT_IMAGES_UNSAFE = {
     "image root readable": (lambda t: (t / "images").chmod(0o755), "images"),
     "image root missing below a shared ancestor": (
         lambda t: make(t / "shared", 0o777, directory=True),
@@ -252,21 +252,17 @@ DIRECT_WORKER_UNSAFE = {
 
 
 @pytest.mark.parametrize(
-    ("make_unsafe", "images"), DIRECT_WORKER_UNSAFE.values(), ids=DIRECT_WORKER_UNSAFE.keys()
+    ("make_unsafe", "images"), DIRECT_IMAGES_UNSAFE.values(), ids=DIRECT_IMAGES_UNSAFE.keys()
 )
-def test_a_worker_used_directly_refuses_unsafe_storage_before_touching_it(
+def test_local_images_used_directly_refuse_unsafe_storage_before_touching_it(
     tmp_path, make_unsafe, images
 ):
     installed(tmp_path)
     make_unsafe(tmp_path)
-    store = JobStore(tmp_path / "db/chriek.db")
-    try:
-        before = tree_state(tmp_path)
-        with pytest.raises(StorageError, match="never changes existing permissions"):
-            Worker(store, FakeBackend(), tmp_path / images, lambda: 0.0, 3600)
-        assert tree_state(tmp_path) == before, "nothing created or changed"
-    finally:
-        store.close()
+    before = tree_state(tmp_path)
+    with pytest.raises(StorageError, match="never changes existing permissions"):
+        LocalImages(tmp_path / images)
+    assert tree_state(tmp_path) == before, "nothing created or changed"
 
 
 def report_owned_by_another_user(monkeypatch, target: Path, uid: int = os.geteuid() + 1) -> int:
@@ -529,6 +525,7 @@ import sys, time
 from pathlib import Path
 
 from chriek.backend import FakeBackend
+from chriek.images import LocalImages
 from chriek.store import SUCCEEDED, JobStore
 from chriek.worker import Worker
 
@@ -537,7 +534,8 @@ store = JobStore(root / "alias" / ".." / "db" / "chriek.db")
 job = store.create(
     owner="alice", prompt="p", image_count=1, width=16, height=16, seed=0, now=0.0, max_queued=9
 )
-worker = Worker(store, FakeBackend(), root / "alias" / ".." / "images", time.time, 3600)
+images = LocalImages(root / "alias" / ".." / "images")
+worker = Worker(store, FakeBackend(), images, time.time, 3600)
 worker.start()
 deadline = time.monotonic() + 10
 try:

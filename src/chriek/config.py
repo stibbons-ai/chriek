@@ -5,7 +5,7 @@ import os
 import re
 import ssl
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -24,10 +24,13 @@ AUTHORITY_PATTERN = re.compile(
 )
 # WHATWG clients parse a host whose last label is numeric as IPv4 (017.0.0.1 -> 15.0.0.1).
 NUMERIC_LABEL = re.compile(r"[0-9]+|0[xX][0-9A-Fa-f]*")
-PUBLIC_URL_FORM = (
-    "CHRIEK_PUBLIC_URL must be an absolute http or https URL with a host, an optional port "
+URL_FORM = (
+    "{} must be an absolute http or https URL with a host, an optional port "
     "1-65535 and an optional path prefix"
 )
+S3_BUCKET_PATTERN = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
+S3_REGION_PATTERN = re.compile(r"[a-z0-9-]{1,32}")
+S3_PREFIX_PATTERN = re.compile(r"(?=.{1,256}$)[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*")
 
 # Every supported CHRIEK_* name; any other name with that prefix stops startup.
 SETTING_NAMES = frozenset(
@@ -50,7 +53,14 @@ SETTING_NAMES = frozenset(
         "CHRIEK_OFFLOAD",
         "CHRIEK_PORT",
         "CHRIEK_PUBLIC_URL",
+        "CHRIEK_S3_ACCESS_KEY_ID",
+        "CHRIEK_S3_BUCKET",
+        "CHRIEK_S3_ENDPOINT_URL",
+        "CHRIEK_S3_PREFIX",
+        "CHRIEK_S3_REGION",
+        "CHRIEK_S3_SECRET_ACCESS_KEY",
         "CHRIEK_SIGNING_SECRET",
+        "CHRIEK_STORAGE",
         "CHRIEK_STORAGE_DIR",
         "CHRIEK_TLS_CERTFILE",
         "CHRIEK_TLS_KEYFILE",
@@ -109,10 +119,20 @@ class BackendSettings:
 
 
 @dataclass(frozen=True)
+class S3Settings:
+    bucket: str
+    endpoint_url: str | None  # None: the AWS endpoint for `region`
+    region: str
+    prefix: str  # key prefix without slashes at either end; "" stores at the bucket root
+    access_key_id: str
+    secret_access_key: str = field(repr=False)
+
+
+@dataclass(frozen=True)
 class Settings:
     database: Path | URL  # SQLite file (or ":memory:") or a Postgres URL
     public_url: str  # scheme://authority[/prefix], no trailing slash
-    storage_dir: Path
+    storage: Path | S3Settings  # local image directory or S3-compatible bucket
     auth_mode: AuthMode
     api_keys: Mapping[str, str]  # owner name -> key; empty in proxy mode
     signing_secret: str
@@ -158,7 +178,7 @@ class Settings:
         return cls(
             public_url=_public_url(env.get("CHRIEK_PUBLIC_URL", "")),
             database=_database(env),
-            storage_dir=Path(env.get("CHRIEK_STORAGE_DIR", "chriek-data/images")),
+            storage=_storage(env),
             auth_mode=auth_mode,
             api_keys=api_keys,
             signing_secret=signing_secret,
@@ -175,6 +195,56 @@ class Settings:
             ),
             backend=backend,
         )
+
+
+def _storage(env: Mapping[str, str]) -> Path | S3Settings:
+    kind = env.get("CHRIEK_STORAGE", "local")
+    s3_names = sorted(name for name in env if name.startswith("CHRIEK_S3_"))
+    if kind == "local":
+        if s3_names:
+            # Refused, not ignored: a bucket setting must never look active while images stay local.
+            raise ConfigError(f"{', '.join(s3_names)} applies only when CHRIEK_STORAGE is 's3'")
+        return Path(env.get("CHRIEK_STORAGE_DIR", "chriek-data/images"))
+    if kind != "s3":
+        raise ConfigError("CHRIEK_STORAGE must be 'local' or 's3'")
+    if "CHRIEK_STORAGE_DIR" in env:
+        raise ConfigError("CHRIEK_STORAGE_DIR applies only when CHRIEK_STORAGE is 'local'")
+    for name in ("CHRIEK_S3_BUCKET", "CHRIEK_S3_ACCESS_KEY_ID", "CHRIEK_S3_SECRET_ACCESS_KEY"):
+        if not env.get(name):
+            raise ConfigError(f"{name} is required when CHRIEK_STORAGE is 's3'")
+    bucket = env["CHRIEK_S3_BUCKET"]
+    if not S3_BUCKET_PATTERN.fullmatch(bucket) or ".." in bucket:
+        raise ConfigError(
+            "CHRIEK_S3_BUCKET must be an existing bucket name of 3-63 characters from a-z 0-9 . -"
+        )
+    endpoint_url = env.get("CHRIEK_S3_ENDPOINT_URL")
+    if endpoint_url is not None:
+        if not endpoint_url:
+            raise ConfigError("CHRIEK_S3_ENDPOINT_URL must not be empty; unset it for AWS")
+        endpoint_url = _http_url(endpoint_url, "CHRIEK_S3_ENDPOINT_URL")
+        if urlsplit(endpoint_url).path:
+            raise ConfigError("CHRIEK_S3_ENDPOINT_URL must not contain a path")
+    region = env.get("CHRIEK_S3_REGION", "us-east-1")
+    if not S3_REGION_PATTERN.fullmatch(region):
+        raise ConfigError("CHRIEK_S3_REGION must be 1-32 characters from a-z 0-9 -")
+    prefix = env.get("CHRIEK_S3_PREFIX", "")
+    if prefix and (not S3_PREFIX_PATTERN.fullmatch(prefix) or {".", ".."} & set(prefix.split("/"))):
+        raise ConfigError(
+            "CHRIEK_S3_PREFIX must be at most 256 characters of /-separated segments from "
+            "A-Z a-z 0-9 _ . -, without empty, . or .. segments"
+        )
+    # Credentials are checked for shape only; errors name the variable, never the value.
+    for name in ("CHRIEK_S3_ACCESS_KEY_ID", "CHRIEK_S3_SECRET_ACCESS_KEY"):
+        if not all("!" <= c <= "~" for c in env[name]):
+            raise ConfigError(f"{name} must be printable ASCII characters without whitespace")
+    return S3Settings(
+        bucket=bucket,
+        endpoint_url=endpoint_url,
+        region=region,
+        prefix=prefix,
+        access_key_id=env["CHRIEK_S3_ACCESS_KEY_ID"],
+        secret_access_key=env["CHRIEK_S3_SECRET_ACCESS_KEY"],
+    )
 
 
 def _database(env: Mapping[str, str]) -> Path | URL:
@@ -289,38 +359,41 @@ def _signing_secret(raw: str) -> str:
 
 
 def _public_url(raw: str) -> str:
-    """Validate the operator-chosen download origin. Errors never echo the value: it may hold
-    credentials or tokens pasted by mistake."""
     if not raw:
         raise ConfigError("CHRIEK_PUBLIC_URL is required: the public base URL of download links")
+    return _http_url(raw, "CHRIEK_PUBLIC_URL")
+
+
+def _http_url(raw: str, name: str) -> str:
+    """Validate a non-empty, operator-chosen http(s) origin with optional path prefix. Errors
+    never echo the value: it may hold credentials or tokens pasted by mistake."""
+    url_form = URL_FORM.format(name)
     # urlsplit silently strips some whitespace and control characters; reject them first.
     if not all("!" <= c <= "~" for c in raw):
-        raise ConfigError(
-            "CHRIEK_PUBLIC_URL must contain only printable ASCII characters without whitespace"
-        )
+        raise ConfigError(f"{name} must contain only printable ASCII characters without whitespace")
     if "?" in raw or "#" in raw:
-        raise ConfigError("CHRIEK_PUBLIC_URL must not contain a query or fragment")
+        raise ConfigError(f"{name} must not contain a query or fragment")
     try:
         parts = urlsplit(raw)
     except ValueError:
-        raise ConfigError(PUBLIC_URL_FORM) from None
+        raise ConfigError(url_form) from None
     if parts.scheme not in ("http", "https"):
-        raise ConfigError(PUBLIC_URL_FORM)
+        raise ConfigError(url_form)
     if "@" in parts.netloc:
-        raise ConfigError("CHRIEK_PUBLIC_URL must not contain credentials")
+        raise ConfigError(f"{name} must not contain credentials")
     authority = AUTHORITY_PATTERN.fullmatch(parts.netloc)
     if authority is None or (authority["port"] and not 1 <= int(authority["port"]) <= 65535):
-        raise ConfigError(PUBLIC_URL_FORM)
-    name = authority["name"]
-    if name and NUMERIC_LABEL.fullmatch(name.rpartition(".")[2]):
+        raise ConfigError(url_form)
+    host = authority["name"]
+    if host and NUMERIC_LABEL.fullmatch(host.rpartition(".")[2]):
         try:
-            ipaddress.IPv4Address(name)  # rejects leading zeros, short and hex forms
+            ipaddress.IPv4Address(host)  # rejects leading zeros, short and hex forms
         except ValueError:
-            raise ConfigError(PUBLIC_URL_FORM) from None
+            raise ConfigError(url_form) from None
     # Clients normalize backslashes and dot segments, which would change the prefix.
     segments = parts.path.lower().replace("%2e", ".").split("/")
     if "\\" in parts.path or "." in segments or ".." in segments:
-        raise ConfigError(PUBLIC_URL_FORM)
+        raise ConfigError(url_form)
     return raw.rstrip("/")
 
 
