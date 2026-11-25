@@ -96,6 +96,10 @@ class S3Images:
         self._bucket = settings.bucket
         self._prefix = settings.prefix
         self._ttl = url_ttl_seconds
+        compatible = settings.endpoint_url is not None
+        # Many S3-compatible services reject the aws-chunked checksum trailers botocore sends
+        # over https by default; AWS (None: botocore's defaults) supports them.
+        checksums = "when_required" if compatible else None
         try:
             self._client = boto3.client(
                 "s3",
@@ -106,17 +110,30 @@ class S3Images:
                 config=Config(
                     signature_version="s3v4",
                     # S3-compatible services rarely route bucket subdomains; AWS prefers them.
-                    s3={"addressing_style": "path" if settings.endpoint_url else "auto"},
+                    s3={"addressing_style": "path" if compatible else "auto"},
                     connect_timeout=10,
                     retries={"mode": "standard"},
+                    # Only CHRIEK_S3_ENDPOINT_URL picks the host, never AWS_ENDPOINT_URL* or
+                    # a profile's endpoint_url.
+                    ignore_configured_endpoint_urls=True,
+                    request_checksum_calculation=checksums,
+                    response_checksum_validation=checksums,
                 ),
             )
-            self._client.head_bucket(Bucket=self._bucket)
+            response = self._client.head_bucket(Bucket=self._bucket)
         except (BotoCoreError, ClientError) as error:
             raise StorageError(
                 f"CHRIEK_S3_BUCKET {self._bucket} cannot be used ({_describe(error)}); it must "
                 "already exist and be reachable with the configured endpoint and credentials"
             ) from None
+        # botocore follows AWS's region redirect for requests but presigns with the configured
+        # region, so every link of a bucket in another region would be rejected.
+        bucket_region = response.get("BucketRegion")
+        if not compatible and bucket_region and bucket_region != settings.region:
+            raise StorageError(
+                f"CHRIEK_S3_BUCKET {self._bucket} is in region {bucket_region}; "
+                f"set CHRIEK_S3_REGION={bucket_region}"
+            )
 
     def put_references(self, job_id: str, references: Sequence[bytes]) -> None:
         for index, png_bytes in enumerate(references):

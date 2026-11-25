@@ -4,14 +4,18 @@ direct presigned download walkthrough, link tampering and expiry, and object cle
 The rest of the API suite also runs on S3 when CHRIEK_TEST_S3_URL is set (see conftest.py).
 """
 
+import hashlib
 import io
+import os
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
+import boto3
 import pytest
+from botocore.awsrequest import AWSResponse
 from botocore.exceptions import ClientError
 from conftest import (
     ALICE,
@@ -166,6 +170,90 @@ def test_unreachable_storage_stops_startup_without_leaking_credentials(tmp_path)
         create_app(settings)
     assert SECRET not in str(e.value)
     assert not (tmp_path / "images").exists()
+
+
+# The S3 client against a stubbed wire (no service, no developer AWS configuration)
+
+
+class _Raw:
+    def stream(self, **_kwargs):
+        yield b""
+
+
+@pytest.fixture
+def wire(monkeypatch, tmp_path):
+    """Every request the S3 client sends, answered by `responses` (status, headers) in order,
+    then 200. Instead of the developer's AWS files, the client gets a profile whose ambient
+    endpoint_url chriek must ignore."""
+    for name in [name for name in os.environ if name.startswith("AWS_")]:
+        monkeypatch.delenv(name)
+    (tmp_path / "aws-config").write_text("[default]\nendpoint_url = https://evil.example\n")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "aws-config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "aws-credentials"))
+    sent, responses = [], []
+
+    def answer(request, **_kwargs):
+        sent.append(request)
+        status, headers = responses.pop(0) if responses else (200, {})
+        return AWSResponse(request.url, status, headers, _Raw())
+
+    session = boto3.Session()
+    session.events.register("before-send.s3", answer)
+    monkeypatch.setattr(boto3, "DEFAULT_SESSION", session)
+    return sent, responses
+
+
+def _settings(endpoint_url: str | None = None, region: str = "us-east-1") -> S3Settings:
+    return S3Settings("chriek-images", endpoint_url, region, "", "AKIDSENTINEL", SECRET)
+
+
+@pytest.mark.parametrize("variable", ["AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL", None])
+def test_ambient_aws_endpoints_never_redirect_s3_traffic(wire, monkeypatch, variable):
+    sent, _ = wire
+    if variable:
+        monkeypatch.setenv(variable, "https://evil.example")
+    images = S3Images(_settings(), 60)
+    assert urlsplit(sent[0].url).hostname == "chriek-images.s3.amazonaws.com"
+    assert urlsplit(images.presigned_url("job", 0)[0]).hostname == "chriek-images.s3.amazonaws.com"
+
+    sent.clear()
+    images = S3Images(_settings("https://s3.example.test:9000"), 60)
+    assert sent[0].url == "https://s3.example.test:9000/chriek-images"
+    assert images.presigned_url("job", 0)[0].startswith(
+        "https://s3.example.test:9000/chriek-images/job/0.png?"
+    )
+
+
+def test_aws_bucket_in_another_region_stops_startup(wire):
+    _, responses = wire
+    # AWS answers the wrong region with a redirect, which botocore follows.
+    redirect = {"x-amz-bucket-region": "eu-central-1"}
+    responses.extend([(301, redirect), (200, redirect)])
+    with pytest.raises(StorageError, match="set CHRIEK_S3_REGION=eu-central-1") as error:
+        S3Images(_settings(), 60)
+    assert SECRET not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("endpoint_url", "bucket_region"),
+    [(None, "eu-central-1"), (None, None), ("https://s3.example.test", "us-west-2")],
+)
+def test_bucket_region_is_checked_only_when_aws_reports_it(wire, endpoint_url, bucket_region):
+    _, responses = wire
+    responses.append((200, {"x-amz-bucket-region": bucket_region} if bucket_region else {}))
+    url, _ = S3Images(_settings(endpoint_url, "eu-central-1"), 60).presigned_url("job", 0)
+    assert _query(url)["X-Amz-Credential"].endswith("/eu-central-1/s3/aws4_request")
+
+
+def test_compatible_endpoint_uploads_over_https_without_checksum_trailers(wire):
+    sent, _ = wire
+    png = make_image_bytes()
+    S3Images(_settings("https://s3.example.test"), 60).stage_output("job", 0, png)
+    put = sent[-1]
+    assert (put.method, put.url) == ("PUT", "https://s3.example.test/chriek-images/job/0.png")
+    assert "Content-Encoding" not in put.headers
+    assert "X-Amz-Trailer" not in put.headers
+    assert put.headers["X-Amz-Content-SHA256"] == hashlib.sha256(png).hexdigest().encode()
 
 
 # Against the real service
