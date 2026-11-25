@@ -108,11 +108,18 @@ def _s3():
         aws_secret_access_key=env["CHRIEK_S3_SECRET_ACCESS_KEY"],
         config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
-    try:
-        client.head_bucket(Bucket=S3_BUCKET)
-    except ClientError:
-        client.create_bucket(Bucket=S3_BUCKET)
+    ensure_bucket(client, S3_BUCKET)
     return client
+
+
+def ensure_bucket(client, bucket: str) -> None:
+    """Create `bucket` only when it is missing; any other error (403, outage) propagates."""
+    try:
+        client.head_bucket(Bucket=bucket)
+    except ClientError as error:
+        if error.response["Error"]["Code"] not in ("404", "NoSuchBucket"):
+            raise
+        client.create_bucket(Bucket=bucket)
 
 
 @pytest.fixture

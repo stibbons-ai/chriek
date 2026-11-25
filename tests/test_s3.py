@@ -18,6 +18,7 @@ import boto3
 import pytest
 from botocore.awsrequest import AWSResponse
 from botocore.exceptions import ClientError
+from botocore.stub import Stubber
 from conftest import (
     ALICE,
     BOB,
@@ -162,6 +163,45 @@ def test_s3_settings_are_refused_with_local_storage(tmp_path):
     with pytest.raises(ConfigError, match="CHRIEK_S3_SECRET_ACCESS_KEY applies only when") as error:
         Settings.from_env(env)
     assert SECRET not in str(error.value)
+
+def test_s3_endpoint_errors_describe_an_origin_and_public_url_errors_a_prefix(tmp_path):
+    for raw in ("ftp://h", "https://h:0"):
+        with pytest.raises(ConfigError, match="CHRIEK_S3_ENDPOINT_URL .*port") as error:
+            Settings.from_env(s3_settings_env(tmp_path, CHRIEK_S3_ENDPOINT_URL=raw))
+        assert "prefix" not in str(error.value)
+    with pytest.raises(ConfigError, match="CHRIEK_PUBLIC_URL .*path prefix"):
+        Settings.from_env(local_env(tmp_path) | {"CHRIEK_PUBLIC_URL": "ftp://h"})
+
+
+def _stubbed_s3() -> tuple[object, Stubber]:
+    client = boto3.client(
+        "s3", region_name="us-east-1", aws_access_key_id="k", aws_secret_access_key="s"
+    )
+    return client, Stubber(client)
+
+
+@pytest.mark.parametrize(("head_code", "created"), [(None, False), ("404", True)])
+def test_test_bucket_is_created_only_when_missing(head_code, created):
+    client, stubber = _stubbed_s3()
+    params = {"Bucket": "chriek-test"}
+    if head_code is None:
+        stubber.add_response("head_bucket", {}, params)
+    else:
+        stubber.add_client_error("head_bucket", head_code, http_status_code=404)
+    if created:
+        stubber.add_response("create_bucket", {}, params)
+    with stubber:
+        ensure_bucket(client, "chriek-test")
+    stubber.assert_no_pending_responses()
+
+
+def test_test_bucket_access_errors_propagate_without_creating_it():
+    client, stubber = _stubbed_s3()
+    stubber.add_client_error("head_bucket", "403", http_status_code=403)
+    # An unexpected create_bucket call would raise the stubber's own error instead.
+    with stubber, pytest.raises(ClientError) as error:
+        ensure_bucket(client, "chriek-test")
+    assert error.value.response["Error"]["Code"] == "403"
 
 
 def test_unreachable_storage_stops_startup_without_leaking_credentials(tmp_path):
@@ -336,12 +376,19 @@ def test_s3_links_reject_tampering_unsigned_access_and_references(tmp_path, stor
 
 
 @needs_s3
-def test_s3_links_expire_after_the_configured_ttl(tmp_path):
-    with running(tmp_path, CHRIEK_URL_TTL_SECONDS="1") as client:
+def test_s3_links_work_until_the_configured_ttl_then_expire(tmp_path):
+    ttl = 3  # the signature date is truncated to whole seconds: at least 2 s to fetch in time
+    with running(tmp_path, CHRIEK_URL_TTL_SECONDS=str(ttl)) as client:
         job = wait_for(client, submit(client, **SMALL)["id"])
-    url = job["images"][0]["url"]
-    assert _query(url)["X-Amz-Expires"] == "1"
-    time.sleep(2.5)
+    (image,) = job["images"]
+    url = image["url"]
+    assert _query(url)["X-Amz-Expires"] == str(ttl)
+    expires = datetime.fromisoformat(image["expires_at"]).timestamp()
+    status, _ = fetch(url)
+    assert time.time() < expires, "fetch finished after expiry; rerun on a less loaded host"
+    assert status == 200
+    # The same link, once its expiry has passed (1 s slack for the service's second rounding).
+    time.sleep(expires - time.time() + 1)
     assert fetch(url)[0] == 403
 
 

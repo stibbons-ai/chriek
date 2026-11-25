@@ -33,7 +33,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
 from chriek.api import WORKER_STOPPED
-from chriek.images import reference_path
+from chriek.images import LocalImages, S3Images, reference_path
 from chriek.signing import UrlSigner
 from chriek.store import JobStore
 from chriek.worker import Worker
@@ -563,6 +563,32 @@ def test_result_finished_exactly_at_the_deadline_keeps_its_outcome(tmp_path, fai
         assert len(body["images"]) == (0 if fails else 1)
         if not fails:
             assert client.get(body["images"][0]["url"]).status_code == 200
+
+@pytest.mark.parametrize(
+    ("elapsed", "error"),
+    [(59, "image 1 of 1 failed"), (61, TIMED_OUT)],
+    ids=["failure-in-time", "late-failure"],
+)
+def test_slow_output_cleanup_never_decides_whether_a_render_failure_timed_out(
+    tmp_path, monkeypatch, elapsed, error
+):
+    clock = TickingClock()
+    backend = LateBackend(clock, fails=True)
+    for images in (LocalImages, S3Images):
+
+        def slow_remove(self, job_id, count, remove=images.remove_outputs):
+            clock.advance(30)  # the cleanup alone outlasts the deadline
+            remove(self, job_id, count)
+
+        monkeypatch.setattr(images, "remove_outputs", slow_remove)
+    with running(tmp_path, backend=backend, clock=clock, CHRIEK_JOB_TIMEOUT_SECONDS="60") as client:
+        job = submit(client, width=16, height=16)
+        assert backend.rendering.wait(5)
+        clock.advance(elapsed)
+        backend.release()  # nobody polls before the worker finishes
+        wait_for_worker(tmp_path, job["id"])
+        body = client.get(f"/jobs/{job['id']}", headers=ALICE).json()
+    assert (body["status"], body["error"], body["images"]) == ("failed", error, [])
 
 
 @pytest.mark.parametrize(

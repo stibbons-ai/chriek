@@ -75,4 +75,7 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run pytest
+      # Fails instead of silently testing local storage when the service URL is missing.
+      - run: |
+          : "${CHRIEK_TEST_S3_URL:?must name the S3 test service}"
+          uv run pytest

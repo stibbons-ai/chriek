@@ -112,9 +112,10 @@ class Worker:
             # Any image failure fails the whole job; already rendered images are discarded.
             # The traceback stays in the server log; the public error never carries exception text.
             log.exception("job %s failed at image %d", job.id, index)
-            self._images.remove_outputs(job.id, job.image_count)
-            # One completion time decides the timeout and is the one persisted.
+            # One completion time decides the timeout and is the one persisted; taken before the
+            # cleanup so a slow delete cannot turn this failure into a timeout.
             finished = self._clock()
+            self._images.remove_outputs(job.id, job.image_count)
             error = f"image {index + 1} of {job.image_count} failed"
             if not self._fail_if_timed_out(job, finished):
                 self._store.fail(

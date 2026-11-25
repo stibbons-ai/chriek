@@ -28,6 +28,10 @@ URL_FORM = (
     "{} must be an absolute http or https URL with a host, an optional port "
     "1-65535 and an optional path prefix"
 )
+ORIGIN_FORM = (
+    "{} must be an absolute http or https URL with a host and an optional port 1-65535, "
+    "without a path"
+)
 S3_BUCKET_PATTERN = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
 S3_REGION_PATTERN = re.compile(r"[a-z0-9-]{1,32}")
 S3_PREFIX_PATTERN = re.compile(r"(?=.{1,256}$)[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*")
@@ -221,7 +225,7 @@ def _storage(env: Mapping[str, str]) -> Path | S3Settings:
     if endpoint_url is not None:
         if not endpoint_url:
             raise ConfigError("CHRIEK_S3_ENDPOINT_URL must not be empty; unset it for AWS")
-        endpoint_url = _http_url(endpoint_url, "CHRIEK_S3_ENDPOINT_URL")
+        endpoint_url = _http_url(endpoint_url, "CHRIEK_S3_ENDPOINT_URL", ORIGIN_FORM)
         if urlsplit(endpoint_url).path:
             raise ConfigError("CHRIEK_S3_ENDPOINT_URL must not contain a path")
     region = env.get("CHRIEK_S3_REGION", "us-east-1")
@@ -364,10 +368,11 @@ def _public_url(raw: str) -> str:
     return _http_url(raw, "CHRIEK_PUBLIC_URL")
 
 
-def _http_url(raw: str, name: str) -> str:
-    """Validate a non-empty, operator-chosen http(s) origin with optional path prefix. Errors
-    never echo the value: it may hold credentials or tokens pasted by mistake."""
-    url_form = URL_FORM.format(name)
+def _http_url(raw: str, name: str, form: str = URL_FORM) -> str:
+    """Validate a non-empty, operator-chosen http(s) origin with optional path prefix; `form`
+    describes the accepted shape. Errors never echo the value: it may hold credentials or
+    tokens pasted by mistake."""
+    url_form = form.format(name)
     # urlsplit silently strips some whitespace and control characters; reject them first.
     if not all("!" <= c <= "~" for c in raw):
         raise ConfigError(f"{name} must contain only printable ASCII characters without whitespace")
