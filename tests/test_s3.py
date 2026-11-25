@@ -30,6 +30,7 @@ from conftest import (
     FakeClock,
     GatedBackend,
     base_env,
+    ensure_bucket,
     fetch,
     make_image_bytes,
     running,
@@ -163,6 +164,7 @@ def test_s3_settings_are_refused_with_local_storage(tmp_path):
     with pytest.raises(ConfigError, match="CHRIEK_S3_SECRET_ACCESS_KEY applies only when") as error:
         Settings.from_env(env)
     assert SECRET not in str(error.value)
+
 
 def test_s3_endpoint_errors_describe_an_origin_and_public_url_errors_a_prefix(tmp_path):
     for raw in ("ftp://h", "https://h:0"):

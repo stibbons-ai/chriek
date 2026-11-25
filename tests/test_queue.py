@@ -564,6 +564,7 @@ def test_result_finished_exactly_at_the_deadline_keeps_its_outcome(tmp_path, fai
         if not fails:
             assert client.get(body["images"][0]["url"]).status_code == 200
 
+
 @pytest.mark.parametrize(
     ("elapsed", "error"),
     [(59, "image 1 of 1 failed"), (61, TIMED_OUT)],
