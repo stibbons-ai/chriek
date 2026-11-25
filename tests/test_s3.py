@@ -6,6 +6,7 @@ The rest of the API suite also runs on S3 when CHRIEK_TEST_S3_URL is set (see co
 
 import hashlib
 import io
+import logging
 import os
 import time
 import uuid
@@ -417,6 +418,74 @@ def test_s3_rejected_submissions_leave_no_objects_or_jobs(
         )
         assert response.status_code == status, response.text
         assert s3_keys(s3_client, storage) == []
+        gated.release()
+        for job in (running_job, queued):
+            assert wait_for(client, job["id"])["status"] == "succeeded"
+    assert len(stored_owners(tmp_path)) == 2
+
+
+@pytest.fixture
+def failing_deletes(monkeypatch, caplog):
+    """Every DeleteObject of an app's S3 client fails; returns the keys it tried. The test
+    fixtures' own client still deletes."""
+    tried: list[str] = []
+    original_init = S3Images.__init__
+
+    def refuse(params, **_kwargs):
+        tried.append(params["Key"])
+        raise ClientError({"Error": {"Code": "AccessDenied", "Message": SECRET}}, "DeleteObject")
+
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._client.meta.events.register("before-parameter-build.s3.DeleteObject", refuse)
+
+    monkeypatch.setattr(S3Images, "__init__", init)
+    caplog.set_level(logging.ERROR, "chriek.images")
+    return tried
+
+
+def _cleanup_failures_logged(caplog) -> bool:
+    messages = [r.getMessage() for r in caplog.records if r.name == "chriek.images"]
+    return any("could not remove" in m for m in messages) and not any(SECRET in m for m in messages)
+
+
+@needs_s3
+def test_s3_output_delete_failure_still_fails_the_job_and_keeps_the_worker(
+    tmp_path, storage, s3_client, failing_deletes, caplog
+):
+    with running(tmp_path, backend=FailingBackend(fail_index=1)) as client:
+        failed = wait_for(client, submit(client, image_count=3, **SMALL)["id"])
+        assert (failed["status"], failed["error"], failed["images"]) == (
+            ("failed", "image 2 of 3 failed", [])
+        )
+        assert failing_deletes == [f"{storage}/{failed['id']}/{i}.png" for i in range(3)]
+        assert _cleanup_failures_logged(caplog)
+        later = wait_for(client, submit(client, **SMALL)["id"])
+        assert (later["status"], len(later["images"])) == ("succeeded", 1)
+        assert client.get("/health").status_code == 200
+    # The undeleted output stays as an unlinked orphan.
+    assert f"{failed['id']}/0.png" in s3_keys(s3_client, storage)
+
+
+@needs_s3
+def test_s3_reference_delete_failure_keeps_the_queue_full_rejection(
+    tmp_path, storage, s3_client, failing_deletes, caplog
+):
+    gated = GatedBackend()
+    with running(tmp_path, backend=gated, CHRIEK_MAX_QUEUED_JOBS="1") as client:
+        running_job = submit(client, prompt="running", **SMALL)
+        assert gated.rendering.wait(5)
+        queued = submit(client, prompt="queued", **SMALL)
+        response = client.post(
+            "/jobs",
+            headers=ALICE,
+            data={"prompt": "rejected", "width": "16", "height": "16"},
+            files=[("references", ("r.png", make_image_bytes(), "image/png"))],
+        )
+        assert response.status_code == 429, response.text
+        (key,) = failing_deletes
+        assert key.startswith(f"{storage}/") and key.endswith("/references/0.png")
+        assert _cleanup_failures_logged(caplog)
         gated.release()
         for job in (running_job, queued):
             assert wait_for(client, job["id"])["status"] == "succeeded"

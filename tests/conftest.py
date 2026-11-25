@@ -168,6 +168,7 @@ def storage(request: pytest.FixtureRequest) -> Iterator[str | None]:
         yield None
         return
     prefix = f"chriek-test/{uuid.uuid4().hex}"  # only this prefix's objects get deleted
+    _s3()  # creates the test bucket before the first app checks it
     _s3_prefix = prefix
     yield prefix
     _s3_prefix = None
