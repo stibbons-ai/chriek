@@ -2,6 +2,7 @@
 
 from collections.abc import Sequence
 from importlib.metadata import version
+from pathlib import Path
 from time import perf_counter
 
 from PIL import Image
@@ -12,6 +13,16 @@ from chriek.config import ConfigError
 # The components the pipeline needs once the prompt upsampler step is removed; load_components
 # only logs a warning for a component it cannot load.
 _COMPONENTS = ("text_encoder", "tokenizer", "transformer", "vae")
+# The diffusers layout the README tells operators to download; the cache lookup checks only these,
+# not the repo's other files (original-format weights, variants, assets).
+_ALLOW_PATTERNS = (
+    "modular_model_index.json",
+    "transformer/*",
+    "vae/*",
+    "text_encoder/*",
+    "LICENSE.md",
+    "NOTICE.md",
+)
 # diffusers' Flux3ImageProcessor fits each of several references under 1 MP, then crops to 16 px.
 _GRID, _BUDGET = 16, 1024 * 1024
 
@@ -20,6 +31,15 @@ def _offload_all_resident(hooks, **_):
     """Offload strategy for `sequential`: before a component runs, every other one leaves the GPU,
     so the text encoder is on the CPU before the transformer is moved in."""
     return hooks
+
+
+def _in_snapshot(spec, root: str) -> bool:
+    """Whether diffusers resolved the component to a folder inside the pinned snapshot (the
+    tokenizer lives in `text_encoder/` there)."""
+    folder = Path(root, spec.subfolder or "").resolve()
+    return spec.pretrained_model_name_or_path == root and folder.is_relative_to(
+        Path(root).resolve()
+    )
 
 
 class CudaBackend:
@@ -40,7 +60,10 @@ class CudaBackend:
                 "uv sync --locked --extra cuda"
             ) from error
         if not torch.cuda.is_available():
-            raise ConfigError("CHRIEK_BACKEND=cuda requires an NVIDIA GPU visible to PyTorch")
+            raise ConfigError(
+                "CHRIEK_BACKEND=cuda requires an NVIDIA GPU visible to PyTorch: NVIDIA driver 580 "
+                "or newer (CUDA 13) and, in Docker, the NVIDIA Container Toolkit with --gpus"
+            )
 
         self._torch = torch
         self._blocks = Flux3DistilledAutoBlocks
@@ -62,17 +85,31 @@ class CudaBackend:
     def _load(self):
         try:
             # Cache only: the operator downloads the gated weights with their own token beforehand.
-            root = self._download(self.model, revision=self.revision, local_files_only=True)
+            root = self._download(
+                self.model,
+                revision=self.revision,
+                allow_patterns=_ALLOW_PATTERNS,
+                local_files_only=True,
+            )
         except self._cache_miss as error:
             raise RuntimeError(
-                f"{self.model} at revision {self.revision} is not in the Hugging Face cache; "
-                "download it first (see README.md)"
+                f"{self.model} at revision {self.revision} is not in the Hugging Face cache "
+                f"or not readable by this user; download it first (see README.md): {error}"
             ) from error
         blocks = self._blocks()
         # chriek sends the prompt as given, as the MLX backend does; no second model is loaded.
         blocks.sub_blocks.pop("prompt_upsampler")
         manager = self._manager() if self._offload == "sequential" else None
         pipeline = blocks.init_pipeline(root, components_manager=manager)
+        # init_pipeline points a component at the snapshot only if its files are there; otherwise
+        # it would load whatever revision of the index's repo the cache holds.
+        foreign = [
+            name
+            for name in _COMPONENTS
+            if not _in_snapshot(pipeline.get_component_spec(name), root)
+        ]
+        if foreign:
+            raise RuntimeError(f"{', '.join(foreign)} not found in the pinned snapshot {root}")
         pipeline.load_components(dtype=self._torch.bfloat16, local_files_only=True)
         missing = [name for name in _COMPONENTS if getattr(pipeline, name, None) is None]
         if missing:

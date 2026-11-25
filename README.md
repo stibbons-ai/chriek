@@ -94,31 +94,37 @@ Presets:
 - **24 GB card (RTX 3090 class):** `CHRIEK_OFFLOAD=sequential`. Components wait in host RAM (about 20 GB of BF16 weights) and only the running one is on the GPU: the text encoder encodes, leaves the GPU, then the transformer runs. Moving components adds transfer time to every job.
 - **Hosted GPU with at least 48 GB:** `CHRIEK_OFFLOAD=none`. Text encoder, transformer and VAE all stay on the GPU.
 
-Download the weights once on the host, with your own Hugging Face account after accepting the [model license](https://huggingface.co/black-forest-labs/flux-3-image-klein); export your `HF_TOKEN` from your secret store or run `hf auth login` first. About 20 GB, diffusers layout only:
+Host prerequisites: Linux with an NVIDIA driver 580 or newer (the locked PyTorch wheels use CUDA 13), Docker and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) for `--gpus all`. With an older driver or without the toolkit, PyTorch sees no GPU and the CUDA backend stops with `requires an NVIDIA GPU visible to PyTorch`.
+
+Download the weights once on the host, with your own Hugging Face account after accepting the [model license](https://huggingface.co/black-forest-labs/flux-3-image-klein); export your `HF_TOKEN` from your secret store or run `hf auth login` first. About 20 GB, diffusers layout only; the backend checks exactly these files, so download them all (`--include` takes one pattern each):
 
 ```sh
 export HF_HOME="$HOME/.cache/huggingface"
 uvx --from 'huggingface-hub==2.4.0' hf download black-forest-labs/flux-3-image-klein \
   --revision 09561231f44e41381c461caf53d5452005a60ac9 \
-  --include modular_model_index.json 'transformer/*' 'vae/*' 'text_encoder/*' LICENSE.md NOTICE.md
+  --include modular_model_index.json --include 'transformer/*' --include 'vae/*' \
+  --include 'text_encoder/*' --include LICENSE.md --include NOTICE.md
 ```
 
-Build the image from a checkout; the build installs the `cuda` extra from `uv.lock` and the runtime image contains only the Python environment, no source checkout, `uv`, weights or tokens. The image runs offline (`HF_HUB_OFFLINE=1`) and reads the cache from a read-only `/hf` mount:
+Build the image from a checkout; the build installs the `cuda` extra from `uv.lock` and the runtime image contains only the Python environment, no source checkout, `uv`, weights or tokens. The image runs offline (`HF_HUB_OFFLINE=1`) and reads the model cache from a read-only `/hf/hub` mount. Mount only `$HF_HOME/hub`, never all of `$HF_HOME`: that also holds your Hugging Face token (`hf auth login` writes `$HF_HOME/token`). The commands run as your own user (`--user`), which can read the cache and write the mounted output directory:
 
 ```sh
 sudo docker build -t chriek:cuda .
 mkdir -p out
 sudo docker run --rm --gpus all --user "$(id -u):$(id -g)" \
-  -v "$HF_HOME:/hf:ro" -v "$PWD/out:/out" -e CHRIEK_OFFLOAD=sequential \
+  -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/out:/out" -e CHRIEK_OFFLOAD=sequential \
   chriek:cuda smoke --prompt "A red bicycle in the rain" --out /out/bicycle.png
 ```
 
 Use `-e CHRIEK_OFFLOAD=none` on a ≥48 GB GPU. Without Docker, `uv sync --locked --extra cuda`, then `CHRIEK_BACKEND=cuda CHRIEK_OFFLOAD=sequential HF_HUB_OFFLINE=1 uv run --locked --extra cuda chriek smoke …`.
 
-To serve, pass the server settings from [Install and run](#install-and-run-uv) (the image sets `CHRIEK_BACKEND=cuda` and listens on `0.0.0.0` inside the container). The job database and PNGs stay in the container's filesystem and are lost with it:
+To serve, pass the server settings from [Install and run](#install-and-run-uv) (the image sets `CHRIEK_BACKEND=cuda` and listens on `0.0.0.0` inside the container). The job database and PNGs go to a private host directory owned by the user the container runs as (see [Storage permissions](#storage-permissions)):
 
 ```sh
-sudo docker run -d --gpus all -p 127.0.0.1:8000:8000 -v "$HF_HOME:/hf:ro" \
+mkdir -m 700 chriek-data
+sudo docker run -d --gpus all --user "$(id -u):$(id -g)" -p 127.0.0.1:8000:8000 \
+  -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/chriek-data:/data" \
+  -e CHRIEK_DB_PATH=/data/chriek.db -e CHRIEK_STORAGE_DIR=/data/images \
   -e CHRIEK_OFFLOAD=sequential -e CHRIEK_API_KEYS -e CHRIEK_SIGNING_SECRET \
   -e CHRIEK_PUBLIC_URL=http://127.0.0.1:8000 chriek:cuda
 ```
@@ -137,7 +143,7 @@ An edit with three references in the CUDA image, after three text-to-image rende
 
 ```sh
 sudo docker run --rm --gpus all --user "$(id -u):$(id -g)" \
-  -v "$HF_HOME:/hf:ro" -v "$PWD/out:/out" -e CHRIEK_OFFLOAD=sequential \
+  -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/out:/out" -e CHRIEK_OFFLOAD=sequential \
   chriek:cuda smoke --prompt "The bicycle from the first image, painted in the colors of the second image, parked on the path from the third image" \
   --reference /out/bicycle.png --reference /out/palette.png --reference /out/garden.png --out /out/edit.png
 ```
@@ -466,4 +472,4 @@ Recorded run, 2026-11-12, Python 3.14.6 on macOS 27.2.1 arm64, pip-audit 2.10.1,
 
 The MLX lock was audited on 2026-11-18 on macOS 27.2.1 arm64 with Python 3.14.6: 73 locked third-party packages, no known vulnerabilities (exit 0).
 
-With the `cuda` extra, the lock was audited on 2026-11-25 on macOS 27.2.1 arm64 with Python 3.14.6: 110 locked third-party packages, no known vulnerabilities (exit 0).
+With the `cuda` extra (including `torchvision`), the lock was audited on 2026-11-25 on macOS 27.2.1 arm64 with Python 3.14.6: 111 locked third-party packages, no known vulnerabilities (exit 0).

@@ -1,7 +1,9 @@
 """Exercise the CUDA backend and its consumers without torch, diffusers or a GPU."""
 
 import json
+import math
 import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +17,7 @@ from chriek.config import BackendSettings, ConfigError
 
 REVISION = "09561231f44e41381c461caf53d5452005a60ac9"
 BF16 = object()
+COMPONENTS = ("text_encoder", "tokenizer", "transformer", "vae")
 
 
 class Inference:
@@ -27,10 +30,13 @@ class Inference:
         self.snapshot = snapshot
         self.cache_miss = False
         self.unloadable = set()
+        # Component name -> (pretrained_model_name_or_path, subfolder) diffusers resolved.
+        self.sources = {}
         self.lookups = []
         self.popped = []
         self.pipelines = []
         self.offloads = []
+        self.events = []
         self.calls = []
         self.reference_pixels = []
         self.peak = 0
@@ -38,7 +44,7 @@ class Inference:
     def download(self, model, **options):
         self.lookups.append((model, options))
         if self.cache_miss:
-            raise self.CacheMiss
+            raise self.CacheMiss("IncompleteSnapshotError: 3 file(s) are missing")
         return str(self.snapshot)
 
     def blocks(self):
@@ -60,6 +66,7 @@ class Inference:
 
         class Manager:
             def enable_auto_cpu_offload(self, **options):
+                inference.events.append("offload")
                 inference.offloads.append(options)
 
         return Manager()
@@ -71,16 +78,22 @@ class Pipeline:
         self.root = root
         self.manager = manager
         self.loads = []
-        self.devices = []
+
+    def get_component_spec(self, name):
+        # The real snapshot keeps the tokenizer's files in text_encoder/.
+        default = (self.root, "text_encoder" if name == "tokenizer" else name)
+        path, subfolder = self.inference.sources.get(name, default)
+        return SimpleNamespace(pretrained_model_name_or_path=path, subfolder=subfolder)
 
     def load_components(self, **options):
+        self.inference.events.append("load")
         self.loads.append(options)
-        for name in ("text_encoder", "tokenizer", "transformer", "vae"):
+        for name in COMPONENTS:
             if name not in self.inference.unloadable:
                 setattr(self, name, name)
 
     def to(self, device):
-        self.devices.append(device)
+        self.inference.events.append(f"to:{device}")
 
     def __call__(self, **options):
         self.inference.calls.append(options)
@@ -88,7 +101,8 @@ class Pipeline:
         self.inference.reference_pixels.append(
             [image.getpixel((0, 0)) for image in options.get("image", ())]
         )
-        self.inference.peak = 100 + len(options.get("image", ()))
+        # Like torch's allocator peak: only reset_peak_memory_stats lowers it.
+        self.inference.peak = max(self.inference.peak, 100 + len(options.get("image", ())))
         return [Image.new("RGBA", (options["width"], options["height"]))]
 
 
@@ -155,16 +169,30 @@ def test_text_and_ordered_edit_share_one_cached_bf16_pipeline(inference, offload
     [(model, options)] = inference.lookups
     assert (model, options) == (
         "black-forest-labs/flux-3-image-klein",
-        {"revision": REVISION, "local_files_only": True},
+        {
+            "revision": REVISION,
+            # The README's download: the diffusers layout only, not the whole repo.
+            "allow_patterns": (
+                "modular_model_index.json",
+                "transformer/*",
+                "vae/*",
+                "text_encoder/*",
+                "LICENSE.md",
+                "NOTICE.md",
+            ),
+            "local_files_only": True,
+        },
     )
     assert inference.popped == ["prompt_upsampler"]
     [pipeline] = inference.pipelines
     assert pipeline.root == str(inference.snapshot)
     assert pipeline.loads == [{"dtype": BF16, "local_files_only": True}]
+    # Offload hooks only components registered when it is enabled, so loading comes first.
     if offload == "none":
-        assert (pipeline.manager, pipeline.devices, inference.offloads) == (None, ["cuda"], [])
+        assert pipeline.manager is None
+        assert inference.events == ["load", "to:cuda"]
     else:
-        assert pipeline.devices == []
+        assert inference.events == ["load", "offload"]
         [options] = inference.offloads
         strategy = options.pop("offload_strategy")
         assert options == {"device": "cuda"}
@@ -177,7 +205,7 @@ def test_text_and_ordered_edit_share_one_cached_bf16_pipeline(inference, offload
 def test_missing_or_incomplete_weights_fail_without_downloading(inference):
     backend = create_backend(BackendSettings("cuda", "sequential"))
     inference.cache_miss = True
-    with pytest.raises(RuntimeError, match="not in the Hugging Face cache"):
+    with pytest.raises(RuntimeError, match="not in the Hugging Face cache.*3 file.s. are missing"):
         backend.render("a cat", 32, 16, 7)
     assert inference.pipelines == []
 
@@ -185,12 +213,89 @@ def test_missing_or_incomplete_weights_fail_without_downloading(inference):
     inference.unloadable = {"transformer"}
     with pytest.raises(RuntimeError, match="could not load transformer"):
         backend.render("a cat", 32, 16, 7)
-    assert inference.calls == [] and inference.offloads == []
+    assert inference.calls == [] and inference.events == ["load"]
 
     inference.unloadable = set()
     backend.render("a cat", 32, 16, 7)
     assert len(inference.pipelines) == 2
     assert all(options["local_files_only"] for _, options in inference.lookups)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        ("black-forest-labs/flux-3-image-klein", "text_encoder"),
+        (None, "text_encoder"),
+        ("SNAPSHOT", "../other-snapshot/text_encoder"),
+    ],
+    ids=["hub-repo", "no-source", "outside-snapshot"],
+)
+def test_component_resolved_outside_the_pinned_snapshot_is_never_loaded(inference, source):
+    path, subfolder = source
+    path = str(inference.snapshot) if path == "SNAPSHOT" else path
+    inference.sources = {"tokenizer": (path, subfolder)}
+    backend = create_backend(BackendSettings("cuda", "none"))
+    with pytest.raises(RuntimeError, match="^tokenizer not found in the pinned snapshot"):
+        backend.render("a cat", 32, 16, 7)
+    assert inference.events == [] and inference.calls == []
+
+
+def test_edit_fits_tiny_and_tall_references_without_touching_them(inference):
+    backend = create_backend(BackendSettings("cuda", "none"))
+    with (
+        Image.new("RGB", (4, 4), "red") as tiny,
+        Image.new("RGB", (12, 131072), "red") as tall,
+        Image.new("RGB", (64, 48), "blue") as regular,
+    ):
+        backend.render("edit", 32, 16, 7, (tiny, tall, regular))
+        [fitted] = [call["image"] for call in inference.calls]
+        for image in fitted:
+            # diffusers scales several references under 1 MP, then crops them to its 16 px grid.
+            scale = min(1.0, math.sqrt(1024**2 / (image.width * image.height)))
+            assert min(int(side * scale) // 16 * 16 for side in image.size) >= 16, image.size
+        assert fitted[0] is not tiny and fitted[1] is not tall and fitted[2] is regular
+        assert fitted[0].getpixel((8, 8)) == (255, 0, 0)
+        assert (tiny.size, tall.size) == ((4, 4), (12, 131072))
+
+
+def test_measurements_are_per_job_not_per_image_or_process(inference, monkeypatch):
+    monkeypatch.setattr(cuda_backend, "perf_counter", iter([2.0, 3.25]).__next__)
+    backend = create_backend(BackendSettings("cuda", "none"))
+    backend.start_job()
+    references = [Image.new("RGB", (64, 48)) for _ in range(3)]
+    backend.render("a hat", 32, 16, 7, references)
+    backend.render("a cat", 32, 16, 8)
+    details = backend.run_details()
+    assert (details["load_seconds"], details["peak_memory_bytes"]) == (1.25, 103)
+
+    backend.start_job()
+    backend.render("a cat", 32, 16, 7)
+    details = backend.run_details()
+    assert (details["load_seconds"], details["peak_memory_bytes"]) == (0.0, 100)
+
+
+def test_fake_and_mlx_never_import_cuda_libraries():
+    # Records import attempts, so it holds whether or not the cuda extra is installed.
+    code = """
+import sys
+attempted = []
+CUDA = {"torch", "torchvision", "diffusers", "transformers", "accelerate"}
+class Spy:
+    def find_spec(self, name, path=None, target=None):
+        if name.partition(".")[0] in CUDA:
+            attempted.append(name)
+sys.meta_path.insert(0, Spy())
+from chriek import cli
+from chriek.backend import create_backend
+from chriek.config import BackendSettings, ConfigError
+for name in ("fake", "mlx"):
+    try:
+        create_backend(BackendSettings(name))
+    except ConfigError:
+        pass
+assert not attempted, attempted
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 @pytest.fixture
@@ -248,7 +353,7 @@ def test_smoke_three_reference_edit_prints_cuda_run_record(
 
 @pytest.mark.parametrize(
     ("module", "message"),
-    [("torch", "uv sync --locked --extra cuda"), ("gpu", "NVIDIA GPU visible to PyTorch")],
+    [("torch", "uv sync --locked --extra cuda"), ("gpu", "driver 580 or newer")],
 )
 def test_smoke_without_cuda_runtime_is_a_configuration_error(
     inference, smoke_env, tmp_path, monkeypatch, capsys, module, message
