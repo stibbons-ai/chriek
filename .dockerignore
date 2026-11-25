@@ -1,0 +1,7 @@
+# Allowlist: the build sees only what the image installs; never .git, .venv, weights or .env files.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+**/__pycache__

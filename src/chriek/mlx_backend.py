@@ -2,7 +2,6 @@
 
 import json
 import logging
-import math
 import platform
 import subprocess
 from collections.abc import Sequence
@@ -10,8 +9,9 @@ from importlib.metadata import version
 from pathlib import Path
 from time import perf_counter
 
-from PIL import Image, ImageOps
+from PIL import Image
 
+from chriek.backend import FLUX_MODEL, FLUX_REVISION, FLUX_STEPS, fit_references
 from chriek.config import ConfigError
 
 log = logging.getLogger(__name__)
@@ -78,29 +78,11 @@ def _hardware() -> dict[str, object]:
     }
 
 
-def _fit_multi_reference(image: Image.Image) -> Image.Image:
-    from flux3_mlx.pipeline import DOWNSAMPLING_RATIO, MULTI_REFERENCE_MAX_PIXELS
-
-    grid, budget = DOWNSAMPLING_RATIO, MULTI_REFERENCE_MAX_PIXELS
-    short, long = sorted(image.size)
-    area = short * long
-    # Leave references alone if the runtime's area scaling still leaves a full grid cell.
-    if short >= grid and (area <= budget or short * math.sqrt(budget / area) >= grid):
-        return image
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    max_side = budget // grid
-    if long > max_side:
-        size = tuple(max(1, side * max_side // long) for side in image.size)
-        image = image.resize(size, Image.Resampling.LANCZOS)
-    dx, dy = max(grid - image.width, 0), max(grid - image.height, 0)
-    return ImageOps.expand(image, (dx // 2, dy // 2, dx - dx // 2, dy - dy // 2))
-
-
 class MlxBackend:
     name = "mlx"
-    model = "black-forest-labs/flux-3-image-klein"
-    revision = "09561231f44e41381c461caf53d5452005a60ac9"
-    steps = 16
+    model = FLUX_MODEL
+    revision = FLUX_REVISION
+    steps = FLUX_STEPS
 
     def __init__(self):
         try:
@@ -187,11 +169,11 @@ class MlxBackend:
                 raise RuntimeError("flux3-mlx could not load the model") from error
             finally:
                 self._load_seconds = round(perf_counter() - started, 3)
+        from flux3_mlx.pipeline import DOWNSAMPLING_RATIO, MULTI_REFERENCE_MAX_PIXELS
+
         image, _ = self._pipeline(
             prompt,
-            [_fit_multi_reference(ref) for ref in references]
-            if len(references) > 1
-            else list(references),
+            fit_references(references, DOWNSAMPLING_RATIO, MULTI_REFERENCE_MAX_PIXELS),
             width=width,
             height=height,
             steps=self.steps,

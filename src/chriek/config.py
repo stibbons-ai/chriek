@@ -92,6 +92,7 @@ class Tls:
 @dataclass(frozen=True)
 class BackendSettings:
     name: str = "fake"
+    offload: str = "none"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> BackendSettings:
@@ -101,11 +102,14 @@ class BackendSettings:
         if unknown:
             raise ConfigError(f"unknown setting {', '.join(unknown)}; see README.md for names")
         name = env.get("CHRIEK_BACKEND", "fake")
-        if name not in ("fake", "mlx"):
-            raise ConfigError("CHRIEK_BACKEND must be 'fake' or 'mlx'")
-        if env.get("CHRIEK_OFFLOAD", "none") != "none":
-            raise ConfigError("CHRIEK_OFFLOAD must be 'none'")
-        return cls(name)
+        if name not in ("fake", "mlx", "cuda"):
+            raise ConfigError("CHRIEK_BACKEND must be 'fake', 'mlx' or 'cuda'")
+        offload = env.get("CHRIEK_OFFLOAD", "none")
+        if offload != "none" and (name, offload) != ("cuda", "sequential"):
+            raise ConfigError(
+                "CHRIEK_OFFLOAD must be 'none', or 'sequential' with CHRIEK_BACKEND=cuda"
+            )
+        return cls(name, offload)
 
 
 @dataclass(frozen=True)
