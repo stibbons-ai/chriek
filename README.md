@@ -106,22 +106,32 @@ uvx --from 'huggingface-hub==2.4.0' hf download black-forest-labs/flux-3-image-k
   --include 'text_encoder/*' --include LICENSE.md --include NOTICE.md
 ```
 
-Build the image from a checkout; the build installs the `cuda` extra from `uv.lock` and the runtime image contains only the Python environment, no source checkout, `uv`, weights or tokens. The image runs offline (`HF_HUB_OFFLINE=1`) and reads the model cache from a read-only `/hf/hub` mount. Mount only `$HF_HOME/hub`, never all of `$HF_HOME`: that also holds your Hugging Face token (`hf auth login` writes `$HF_HOME/token`). The commands run as your own user (`--user`), which can read the cache and write the mounted output directory:
+Build the image from a checkout; the build installs the `cuda` extra from `uv.lock` and the runtime image contains only the Python environment, no source checkout, `uv`, weights or tokens. The image runs offline (`HF_HUB_OFFLINE=1`) and reads the model cache from a read-only `/hf/hub` mount. Mount only `$HF_HOME/hub`, never all of `$HF_HOME`: that also holds your Hugging Face token (`hf auth login` writes `$HF_HOME/token`). The commands run as your own user (`--user`), which can read the cache and write the mounted output directory. They assume your user can reach the Docker socket; membership in the `docker` group is root-equivalent on that host, so grant it only to users you would give root:
 
 ```sh
-sudo docker build -t chriek:cuda .
+docker build -t chriek:cuda .
 mkdir -p out
-sudo docker run --rm --gpus all --user "$(id -u):$(id -g)" \
+docker run --rm --gpus all --user "$(id -u):$(id -g)" \
   -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/out:/out" -e CHRIEK_OFFLOAD=sequential \
   chriek:cuda smoke --prompt "A red bicycle in the rain" --out /out/bicycle.png
 ```
 
 Use `-e CHRIEK_OFFLOAD=none` on a ≥48 GB GPU. Without Docker, `uv sync --locked --extra cuda`, then `CHRIEK_BACKEND=cuda CHRIEK_OFFLOAD=sequential HF_HUB_OFFLINE=1 uv run --locked --extra cuda chriek smoke …`.
 
-To serve, pass the server settings from [Install and run](#install-and-run-uv) (the image sets `CHRIEK_BACKEND=cuda` and listens on `0.0.0.0` inside the container). Export `CHRIEK_API_KEYS` and `CHRIEK_SIGNING_SECRET` in your shell: `sudo` drops exported variables by default, so `--preserve-env` keeps those two for Docker, which copies them by name and keeps their values off the command line. The job database and PNGs go to a private host directory owned by the user the container runs as (see [Storage permissions](#storage-permissions)):
+To serve, pass the server settings from [Install and run](#install-and-run-uv) (the image sets `CHRIEK_BACKEND=cuda` and listens on `0.0.0.0` inside the container). Export `CHRIEK_API_KEYS` and `CHRIEK_SIGNING_SECRET` in your shell; the name-only `-e CHRIEK_API_KEYS -e CHRIEK_SIGNING_SECRET` makes Docker copy them from that environment and keeps their values off the command line. The job database and PNGs go to a private host directory owned by the user the container runs as (see [Storage permissions](#storage-permissions)):
 
 ```sh
 mkdir -m 700 chriek-data
+docker run -d --gpus all --user "$(id -u):$(id -g)" -p 127.0.0.1:8000:8000 \
+  -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/chriek-data:/data" \
+  -e CHRIEK_DB_PATH=/data/chriek.db -e CHRIEK_STORAGE_DIR=/data/images \
+  -e CHRIEK_OFFLOAD=sequential -e CHRIEK_API_KEYS -e CHRIEK_SIGNING_SECRET \
+  -e CHRIEK_PUBLIC_URL=http://127.0.0.1:8000 chriek:cuda
+```
+
+Without socket access, prefix the other commands with `sudo`. For serving, `sudo` drops exported variables by default, so the container would get neither secret and `chriek serve` would stop at startup; keep exactly those two:
+
+```sh
 sudo --preserve-env=CHRIEK_API_KEYS,CHRIEK_SIGNING_SECRET docker run -d --gpus all \
   --user "$(id -u):$(id -g)" -p 127.0.0.1:8000:8000 \
   -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/chriek-data:/data" \
@@ -143,7 +153,7 @@ uv run --locked --extra mlx chriek smoke --prompt "Move the bicycle into a sunny
 An edit with three references in the CUDA image, after three text-to-image renders as above (`bicycle.png`, then `palette.png` with `--prompt "A flat palette of teal, orange and cream paint swatches"`, `garden.png` with `--prompt "A sunny cottage garden path"`):
 
 ```sh
-sudo docker run --rm --gpus all --user "$(id -u):$(id -g)" \
+docker run --rm --gpus all --user "$(id -u):$(id -g)" \
   -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/out:/out" -e CHRIEK_OFFLOAD=sequential \
   chriek:cuda smoke --prompt "The bicycle from the first image, painted in the colors of the second image, parked on the path from the third image" \
   --reference /out/bicycle.png --reference /out/palette.png --reference /out/garden.png --out /out/edit.png
