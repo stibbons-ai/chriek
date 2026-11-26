@@ -118,11 +118,12 @@ sudo docker run --rm --gpus all --user "$(id -u):$(id -g)" \
 
 Use `-e CHRIEK_OFFLOAD=none` on a ≥48 GB GPU. Without Docker, `uv sync --locked --extra cuda`, then `CHRIEK_BACKEND=cuda CHRIEK_OFFLOAD=sequential HF_HUB_OFFLINE=1 uv run --locked --extra cuda chriek smoke …`.
 
-To serve, pass the server settings from [Install and run](#install-and-run-uv) (the image sets `CHRIEK_BACKEND=cuda` and listens on `0.0.0.0` inside the container). The job database and PNGs go to a private host directory owned by the user the container runs as (see [Storage permissions](#storage-permissions)):
+To serve, pass the server settings from [Install and run](#install-and-run-uv) (the image sets `CHRIEK_BACKEND=cuda` and listens on `0.0.0.0` inside the container). Export `CHRIEK_API_KEYS` and `CHRIEK_SIGNING_SECRET` in your shell: `sudo` drops exported variables by default, so `--preserve-env` keeps those two for Docker, which copies them by name and keeps their values off the command line. The job database and PNGs go to a private host directory owned by the user the container runs as (see [Storage permissions](#storage-permissions)):
 
 ```sh
 mkdir -m 700 chriek-data
-sudo docker run -d --gpus all --user "$(id -u):$(id -g)" -p 127.0.0.1:8000:8000 \
+sudo --preserve-env=CHRIEK_API_KEYS,CHRIEK_SIGNING_SECRET docker run -d --gpus all \
+  --user "$(id -u):$(id -g)" -p 127.0.0.1:8000:8000 \
   -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/chriek-data:/data" \
   -e CHRIEK_DB_PATH=/data/chriek.db -e CHRIEK_STORAGE_DIR=/data/images \
   -e CHRIEK_OFFLOAD=sequential -e CHRIEK_API_KEYS -e CHRIEK_SIGNING_SECRET \

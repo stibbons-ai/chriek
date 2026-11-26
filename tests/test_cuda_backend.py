@@ -65,9 +65,15 @@ class Inference:
         inference = self
 
         class Manager:
+            def __init__(self):
+                self.components = {}
+
+            def add(self, name, component):
+                self.components[name] = component
+
             def enable_auto_cpu_offload(self, **options):
                 inference.events.append("offload")
-                inference.offloads.append(options)
+                inference.offloads.append((self, options))
 
         return Manager()
 
@@ -91,6 +97,9 @@ class Pipeline:
         for name in COMPONENTS:
             if name not in self.inference.unloadable:
                 setattr(self, name, name)
+                # Like diffusers: only a manager given to init_pipeline receives the components.
+                if self.manager is not None:
+                    self.manager.add(name, name)
 
     def to(self, device):
         self.inference.events.append(f"to:{device}")
@@ -193,7 +202,10 @@ def test_text_and_ordered_edit_share_one_cached_bf16_pipeline(inference, offload
         assert inference.events == ["load", "to:cuda"]
     else:
         assert inference.events == ["load", "offload"]
-        [options] = inference.offloads
+        [(manager, options)] = inference.offloads
+        # Offload hooks only the components of the manager the pipeline registered them with.
+        assert manager is pipeline.manager
+        assert sorted(manager.components) == sorted(COMPONENTS)
         strategy = options.pop("offload_strategy")
         assert options == {"device": "cuda"}
         encoder, vae = object(), object()
@@ -202,23 +214,26 @@ def test_text_and_ordered_edit_share_one_cached_bf16_pipeline(inference, offload
         assert hooks == [encoder, vae]
 
 
-def test_missing_or_incomplete_weights_fail_without_downloading(inference):
+def test_missing_weights_fail_without_downloading(inference):
     backend = create_backend(BackendSettings("cuda", "sequential"))
     inference.cache_miss = True
     with pytest.raises(RuntimeError, match="not in the Hugging Face cache.*3 file.s. are missing"):
         backend.render("a cat", 32, 16, 7)
     assert inference.pipelines == []
+    assert all(options["local_files_only"] for _, options in inference.lookups)
 
-    inference.cache_miss = False
-    inference.unloadable = {"transformer"}
-    with pytest.raises(RuntimeError, match="could not load transformer"):
+
+@pytest.mark.parametrize("name", COMPONENTS)
+def test_unloadable_component_fails_before_rendering(inference, name):
+    backend = create_backend(BackendSettings("cuda", "sequential"))
+    inference.unloadable = {name}
+    with pytest.raises(RuntimeError, match=f"could not load {name}"):
         backend.render("a cat", 32, 16, 7)
     assert inference.calls == [] and inference.events == ["load"]
 
     inference.unloadable = set()
     backend.render("a cat", 32, 16, 7)
     assert len(inference.pipelines) == 2
-    assert all(options["local_files_only"] for _, options in inference.lookups)
 
 
 @pytest.mark.parametrize(
@@ -230,12 +245,15 @@ def test_missing_or_incomplete_weights_fail_without_downloading(inference):
     ],
     ids=["hub-repo", "no-source", "outside-snapshot"],
 )
-def test_component_resolved_outside_the_pinned_snapshot_is_never_loaded(inference, source):
+@pytest.mark.parametrize("name", COMPONENTS)
+def test_component_resolved_outside_the_pinned_snapshot_is_never_loaded(inference, source, name):
     path, subfolder = source
     path = str(inference.snapshot) if path == "SNAPSHOT" else path
-    inference.sources = {"tokenizer": (path, subfolder)}
+    # The real snapshot keeps the tokenizer's files in text_encoder/.
+    folder = "text_encoder" if name == "tokenizer" else name
+    inference.sources = {name: (path, subfolder.replace("text_encoder", folder))}
     backend = create_backend(BackendSettings("cuda", "none"))
-    with pytest.raises(RuntimeError, match="^tokenizer not found in the pinned snapshot"):
+    with pytest.raises(RuntimeError, match=f"^{name} not found in the pinned snapshot"):
         backend.render("a cat", 32, 16, 7)
     assert inference.events == [] and inference.calls == []
 
