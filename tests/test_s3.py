@@ -294,6 +294,7 @@ def test_compatible_endpoint_uploads_over_https_without_checksum_trailers(wire):
     S3Images(_settings("https://s3.example.test"), 60).stage_output("job", 0, png)
     put = sent[-1]
     assert (put.method, put.url) == ("PUT", "https://s3.example.test/chriek-images/job/0.png")
+    assert put.headers["Content-Type"] == b"image/png"
     assert "Content-Encoding" not in put.headers
     assert "X-Amz-Trailer" not in put.headers
     assert put.headers["X-Amz-Content-SHA256"] == hashlib.sha256(png).hexdigest().encode()
