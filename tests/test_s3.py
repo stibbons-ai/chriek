@@ -415,6 +415,34 @@ def test_s3_failed_and_partial_outputs_are_removed_and_never_linked(tmp_path, st
 
 
 @needs_s3
+def test_s3_output_write_failure_fails_the_job_and_keeps_no_outputs(
+    tmp_path, storage, s3_client, monkeypatch
+):
+    puts: list[str] = []
+    persisted: list[int] = []
+    original_init = S3Images.__init__
+
+    def refuse_second(params, **_kwargs):
+        puts.append(params["Key"])
+        if len(puts) == 2:
+            # The first output really reached the bucket before the write failure.
+            persisted.append(s3_client.head_object(Bucket=S3_BUCKET, Key=puts[0])["ContentLength"])
+            raise ClientError({"Error": {"Code": "SlowDown", "Message": SECRET}}, "PutObject")
+
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._client.meta.events.register("before-parameter-build.s3.PutObject", refuse_second)
+
+    monkeypatch.setattr(S3Images, "__init__", init)
+    with running(tmp_path) as client:
+        job = wait_for(client, submit(client, image_count=3, **SMALL)["id"])
+    assert (job["status"], job["error"], job["images"]) == ("failed", "image 2 of 3 failed", [])
+    assert puts == [f"{storage}/{job['id']}/{i}.png" for i in range(2)]
+    assert len(persisted) == 1 and persisted[0] > 0
+    assert s3_keys(s3_client, storage) == []
+
+
+@needs_s3
 def test_s3_missing_reference_fails_job_and_keeps_no_outputs(tmp_path, storage, s3_client):
     gated = GatedBackend()
     with running(tmp_path, backend=gated) as client:
