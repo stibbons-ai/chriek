@@ -129,7 +129,7 @@ docker run -d --gpus all --user "$(id -u):$(id -g)" -p 127.0.0.1:8000:8000 \
   -e CHRIEK_PUBLIC_URL=http://127.0.0.1:8000 chriek:cuda
 ```
 
-Without socket access, prefix the other commands with `sudo`. For serving, `sudo` drops exported variables by default, so the container would get neither secret and `chriek serve` would stop at startup; keep exactly those two:
+Without socket access, prefix only the `docker` commands with `sudo`. Run `mkdir` as yourself, without `sudo`: the container runs as your user and can't write to directories owned by root. Your shell expands `$(id -u)`, `$HF_HOME` and `$PWD` before `sudo` runs, so they still name your user and paths. For serving, `sudo` drops exported variables by default, so the container would get neither secret and `chriek serve` would stop at startup; keep exactly those two:
 
 ```sh
 sudo --preserve-env=CHRIEK_API_KEYS,CHRIEK_SIGNING_SECRET docker run -d --gpus all \
