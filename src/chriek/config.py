@@ -198,10 +198,12 @@ class S3Settings:
 class Dispatch:
     """Where `chriek api` sends each job ID, and with which headers."""
 
-    url: str
+    url: str = field(repr=False)  # a provider may put a token in the path
     worker_token: str = field(repr=False)
     headers: Mapping[str, str] = field(repr=False)  # extra headers, incl. a provider credential
-    timeout_seconds: float  # connect plus answer; a synchronous endpoint answers after rendering
+    # Per connect and per read, not a total deadline; a synchronous endpoint answers after
+    # rendering.
+    timeout_seconds: float
 
 
 @dataclass(frozen=True)

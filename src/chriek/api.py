@@ -42,13 +42,14 @@ from starlette.types import Message
 
 from chriek.auth import Authenticate, authenticator, worker_authenticator
 from chriek.backend import ImageBackend, create_backend
-from chriek.config import AuthMode, Limits, Settings, WorkerSettings
+from chriek.config import AuthMode, Dispatch, Limits, Settings, WorkerSettings
 from chriek.dispatch import dispatch
 from chriek.images import LocalImages, S3Images, image_path, open_images
 from chriek.signing import UrlSigner
 from chriek.storage import check_database
 from chriek.store import (
     MEMORY_DATABASE,
+    QUEUED,
     RUNNING,
     SUCCEEDED,
     CommitOutcomeUnknown,
@@ -355,6 +356,9 @@ def create_app(
                     )
             except CommitOutcomeUnknown:
                 # The job may be committed: keep its references, at worst as an orphan.
+                if settings.dispatch is not None:
+                    # No later step would deliver a committed job; the error still stands.
+                    _dispatch_if_queued(settings.dispatch, store, job_id, clock)
                 raise
             except BaseException:
                 images.remove_submission(job_id, len(references))
@@ -418,6 +422,18 @@ def create_app(
 
     app.include_router(jobs)
     return app
+
+
+def _dispatch_if_queued(
+    settings: Dispatch, store: JobStore, job_id: str, clock: Callable[[], float]
+) -> None:
+    """Deliver a job whose COMMIT outcome is unknown, if a fresh read finds it queued.
+    Best effort: the caller re-raises the original submission error whatever happens here."""
+    try:
+        if store.status(job_id) == QUEUED:
+            dispatch(settings, store, job_id, clock)
+    except Exception:
+        log.exception("could not verify or dispatch job %s after an unknown commit", job_id)
 
 
 class Invocation(BaseModel):

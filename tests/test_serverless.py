@@ -17,6 +17,7 @@ import urllib.request
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import uvicorn
@@ -40,9 +41,11 @@ from fastapi import FastAPI, Request, Response
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import make_url
-from test_references import submit_multipart
+from sqlalchemy.exc import OperationalError
+from test_references import _fault_in_create, post_multipart, submit_multipart
 
 from chriek import api as api_module
+from chriek import cli as cli_module
 from chriek import dispatch as dispatch_module
 from chriek.api import create_app, create_worker_app
 from chriek.cli import main
@@ -119,6 +122,7 @@ def config_api_env(tmp_path: Path, **changes: str) -> dict[str, str]:
         ({"CHRIEK_WORKER_TOKEN": ALICE_KEY}, None, "CHRIEK_WORKER_TOKEN must differ"),
         ({"CHRIEK_WORKER_TOKEN": SIGNING_SECRET}, None, "CHRIEK_WORKER_TOKEN must differ"),
         ({"CHRIEK_BACKEND": "fake"}, None, "CHRIEK_BACKEND does not apply to chriek api"),
+        ({"CHRIEK_OFFLOAD": "none"}, None, "CHRIEK_OFFLOAD does not apply to chriek api"),
         ({"CHRIEK_DISPATCH_URL": "ftp://worker.example"}, None, "CHRIEK_DISPATCH_URL must be"),
         ({"CHRIEK_DISPATCH_HEADERS": "Prefer: respond-async"}, None, "must be a JSON object"),
         ({"CHRIEK_DISPATCH_HEADERS": '{"Prefer": 1}'}, None, "must be a JSON object"),
@@ -164,6 +168,7 @@ def test_api_role_settings_carry_dispatch_headers(tmp_path):
     settings = Settings.from_env(
         config_api_env(
             tmp_path,
+            CHRIEK_DISPATCH_URL="https://worker.example/hooks/path-token-SENTINEL/invoke",
             CHRIEK_DISPATCH_TOKEN=PROVIDER_TOKEN,
             CHRIEK_DISPATCH_HEADERS=json.dumps({"Prefer": "respond-async"}),
             CHRIEK_DISPATCH_TIMEOUT_SECONDS="2.5",
@@ -175,7 +180,8 @@ def test_api_role_settings_carry_dispatch_headers(tmp_path):
         "Authorization": f"Bearer {PROVIDER_TOKEN}",
     }
     assert settings.dispatch.timeout_seconds == 2.5
-    assert PROVIDER_TOKEN not in repr(settings) and WORKER_TOKEN not in repr(settings)
+    for secret in ("path-token-SENTINEL", PROVIDER_TOKEN, WORKER_TOKEN):
+        assert secret not in repr(settings)
     assert Settings.from_env(config_api_env(tmp_path), Role.API).dispatch.timeout_seconds == 30
     maximum = config_api_env(tmp_path, CHRIEK_DISPATCH_TIMEOUT_SECONDS="604800")
     assert Settings.from_env(maximum, Role.API).dispatch.timeout_seconds == 604800
@@ -228,6 +234,7 @@ def test_dispatch_logs_an_error_only_for_a_recorded_failure(monkeypatch, caplog,
     [
         "CHRIEK_DISPATCH_URL",
         "CHRIEK_DISPATCH_TOKEN",
+        "CHRIEK_DISPATCH_HEADERS",
         "CHRIEK_DISPATCH_TIMEOUT_SECONDS",
         "CHRIEK_WORKER_TOKEN",
     ],
@@ -273,6 +280,8 @@ def test_role_commands_stop_on_sqlite_before_opening_anything(
     for name, value in env.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(uvicorn, "run", lambda *a, **kw: pytest.fail("server must not start"))
+    for name in ("create_app", "create_worker_app"):  # each opens the database and the bucket
+        monkeypatch.setattr(cli_module, name, lambda *a, **kw: pytest.fail("storage opened"))
 
     assert main([command]) == 2
     error = capsys.readouterr().err
@@ -280,7 +289,7 @@ def test_role_commands_stop_on_sqlite_before_opening_anything(
         f"chriek: configuration error: chriek {command} requires CHRIEK_DATABASE_URL"
     )
     assert WORKER_TOKEN not in error
-    assert not (tmp_path / "db").exists()
+    assert not (tmp_path / "db").exists()  # the SQLite file `chriek api` was given, unopened
 
 
 # --- walkthroughs over HTTP ----------------------------------------------------------------
@@ -308,12 +317,19 @@ def serving(app) -> Iterator[str]:
 
 class Provider:
     """A stand-in provider gateway: records each delivery, then optionally forwards it to the
-    worker (recording its answer), and answers with `status`."""
+    worker (recording its answer), and answers with `status` and, if given, `location`. With
+    a `gate`, each delivery waits for the gate to open first."""
 
     def __init__(
-        self, status: int = 202, forward_to: str | None = None, delay: float = 0.0
+        self,
+        status: int = 202,
+        forward_to: str | None = None,
+        delay: float = 0.0,
+        location: str | None = None,
+        gate: threading.Event | None = None,
     ) -> None:
         self.deliveries: list[tuple[dict[str, str], dict]] = []
+        self.answered = threading.Event()  # set once a delivery got its answer
         self.worker_answers: list[tuple[int, dict]] = []
         self.app = FastAPI()
 
@@ -321,10 +337,15 @@ class Provider:
         def deliver(request_headers: Request, body: dict) -> Response:
             headers = dict(request_headers.headers)
             self.deliveries.append((headers, body))
+            if gate is not None:
+                assert gate.wait(10), "gated delivery never released"
             time.sleep(delay)  # a cold start before the worker sees the job
             if forward_to:
                 self.worker_answers.append(invoke(forward_to, body["job_id"]))
-            return Response(status_code=status)
+            self.answered.set()
+            return Response(
+                status_code=status, headers={"Location": location} if location else None
+            )
 
 
 def invoke(base: str, job_id: str, token: str = WORKER_TOKEN) -> tuple[int, dict]:
@@ -463,7 +484,7 @@ def test_render_failure_is_recorded_and_returned(tmp_path):
 
 
 @needs_services
-@pytest.mark.parametrize("answer", [503, 307, None])
+@pytest.mark.parametrize("answer", [503, None])
 def test_delivery_failure_fails_the_queued_job_without_secrets(tmp_path, answer):
     secret_path = "/hooks/path-token-SENTINEL/invoke"
     if answer is None:  # nothing listens on a port just released
@@ -484,6 +505,178 @@ def test_delivery_failure_fails_the_queued_job_without_secrets(tmp_path, answer)
     assert job["error"] == expected
     for secret in ("SENTINEL", PROVIDER_TOKEN, WORKER_TOKEN):
         assert secret not in json.dumps(job)
+
+
+@needs_services
+@pytest.mark.parametrize("answer", [302, 303])
+def test_dispatch_never_follows_a_redirect(tmp_path, answer):
+    """Following it would resend the worker token and provider credential to the target."""
+    hits: list[str] = []  # only methods: nothing credential-bearing is recorded
+    destination = FastAPI()
+
+    @destination.api_route("/{path:path}", methods=["GET", "HEAD", "POST", "PUT"])
+    def count(request: Request) -> Response:
+        hits.append(request.method)
+        return Response(status_code=200)
+
+    with serving(destination) as destination_url:
+        provider = Provider(status=answer, location=f"{destination_url}/elsewhere")
+        with serving(provider.app) as provider_url:
+            job = run_job(tmp_path, provider_url)
+
+    assert len(provider.deliveries) == 1
+    assert hits == []
+    assert (job["status"], job["error"]) == (
+        "failed",
+        f"dispatch failed: the worker endpoint answered HTTP {answer}",
+    )
+
+
+@needs_services
+def test_submission_answers_202_while_the_provider_still_holds_the_delivery(tmp_path):
+    gate = threading.Event()
+    provider = Provider(status=202, gate=gate)
+    try:
+        with serving(provider.app) as provider_url:
+            app = create_app(Settings.from_env(api_env(tmp_path, provider_url), Role.API))
+            with serving(app) as base:
+                request = urllib.request.Request(  # noqa: S310 - loopback test server
+                    f"{base}/jobs",
+                    data=json.dumps({"prompt": "x"} | SMALL).encode(),
+                    headers={"Content-Type": "application/json"} | ALICE,
+                    method="POST",
+                )
+                # A dispatch before the response would hold this request until the gate opens.
+                with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310
+                    status, job = response.status, json.loads(response.read())
+                assert (status, job["status"]) == (202, "queued")
+                assert not gate.is_set()
+
+                gate.set()
+                assert provider.answered.wait(10)
+        assert [body for _headers, body in provider.deliveries] == [{"job_id": job["id"]}]
+    finally:
+        gate.set()
+
+
+class RecordingLock:
+    """Stands in for the worker's render lock and counts attempts to take it."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._changed = threading.Condition()
+        self.attempts = 0
+
+    def __enter__(self) -> None:
+        with self._changed:
+            self.attempts += 1
+            self._changed.notify_all()
+        self._lock.acquire()
+
+    def __exit__(self, *_exc) -> None:
+        self._lock.release()
+
+    def wait_for_attempts(self, count: int) -> bool:
+        with self._changed:
+            return self._changed.wait_for(lambda: self.attempts >= count, 10)
+
+
+@needs_services
+def test_one_worker_process_renders_one_job_at_a_time(tmp_path, monkeypatch):
+    lock = RecordingLock()
+    monkeypatch.setattr(api_module, "threading", SimpleNamespace(Lock=lambda: lock))
+    backend = GatedBackend()
+    results: dict[str, tuple[int, dict]] = {}
+    with (
+        serving(Provider(status=202).app) as provider_url,
+        api(tmp_path, provider_url) as client,
+        worker(tmp_path, backend) as base,
+    ):
+        a = submit(client, prompt="job a", **SMALL)["id"]
+        b = submit(client, prompt="job b", **SMALL)["id"]
+        calls = [("a", a), ("duplicate of a", a), ("b", b)]
+        threads = [
+            threading.Thread(target=lambda n=name, j=job_id: results.update({n: invoke(base, j)}))
+            for name, job_id in calls
+        ]
+        threads[0].start()
+        assert backend.rendering.wait(10)
+        for thread in threads[1:]:
+            thread.start()
+        assert lock.wait_for_attempts(3)  # both later invocations reached the lock
+        backend.release()
+        for thread in threads:
+            thread.join(20)
+
+    assert results == {
+        "a": (200, {"id": a, "status": "succeeded"}),
+        "duplicate of a": (200, {"id": a, "status": "succeeded"}),
+        "b": (200, {"id": b, "status": "succeeded"}),
+    }
+    assert backend.max_active == 1
+    assert backend.prompts == ["job a", "job b"]
+
+
+def _connection_lost(*_args) -> None:
+    raise OperationalError("SELECT", {}, ConnectionError("connection lost"))
+
+
+@needs_services
+def test_worker_answers_500_when_the_result_cannot_be_saved(tmp_path, monkeypatch):
+    backend = CountingBackend()
+    with (
+        serving(Provider(status=202).app) as provider_url,
+        api(tmp_path, provider_url) as client,
+        worker(tmp_path, backend) as base,
+    ):
+        job_id = submit(client, **SMALL)["id"]
+        monkeypatch.setattr(JobStore, "succeed", _connection_lost)
+        assert invoke(base, job_id) == (500, {"detail": "job result could not be saved"})
+        assert client.get(f"/jobs/{job_id}", headers=ALICE).json()["status"] == "running"
+    assert backend.renders == 1
+
+
+@needs_services
+@pytest.mark.parametrize(
+    ("event_name", "verify_fails", "delivered"),
+    [("after_commit", False, True), ("before_commit", False, False), ("after_commit", True, False)],
+    ids=["committed", "never-committed", "committed-but-unverifiable"],
+)
+def test_unknown_commit_outcome_delivers_only_a_job_found_committed(
+    tmp_path, monkeypatch, event_name, verify_fails, delivered
+):
+    backend = ReferenceBackend()
+    if verify_fails:  # the fresh read after the failed COMMIT fails too
+        monkeypatch.setattr(JobStore, "status", _connection_lost)
+    with worker(tmp_path, backend) as base:
+        provider = Provider(status=200, forward_to=base)
+        with serving(provider.app) as provider_url:
+            app = create_app(Settings.from_env(api_env(tmp_path, provider_url), Role.API))
+            with (
+                _fault_in_create(monkeypatch, event_name) as fired,
+                TestClient(app, raise_server_exceptions=False) as client,
+            ):
+                response = post_multipart(
+                    client,
+                    data={"prompt": "lost ack", "width": "16", "height": "16"},
+                    files=[("references", ("r.png", make_image_bytes((9, 9, 9)), "image/png"))],
+                )
+
+    # The submission's own error stands, whatever the fresh read found.
+    assert fired == [event_name]
+    assert response.status_code == 500
+    assert "location" not in response.headers
+    if not delivered:
+        assert provider.deliveries == []
+        assert backend.renders == 0
+        return
+    ((_headers, body),) = provider.deliveries
+    job_id = body["job_id"]
+    assert provider.worker_answers == [(200, {"id": job_id, "status": "succeeded"})]
+    assert backend.references == [(16 * 16 * 3,)]  # the kept reference, read by the worker
+    with api(tmp_path, provider_url) as client:
+        job = wait_for(client, job_id)
+    assert (job["status"], job["params"]["reference_count"]) == ("succeeded", 1)
 
 
 @needs_services
