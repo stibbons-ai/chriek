@@ -47,7 +47,7 @@ Spec: #1. Decisions: ADR-0001.
 
 - Python, FastAPI, SQLAlchemy (SQLite + Postgres), boto3 for S3.
 - uv for dependency management; `uv.lock` committed.
-- Mac: runs natively via `uv run`. NVIDIA: Docker image (CUDA); uv used in the build stage (`uv sync --frozen`), runtime image ships only the venv.
+- Mac: runs natively via `uv run`. NVIDIA: Docker image (CUDA); uv used in the build stage (`uv sync --locked`), runtime image ships only the venv.
 - One codebase, two roles, two deployment modes (see Deployment modes).
 
 ### Deployment modes
@@ -61,7 +61,8 @@ Spec: #1. Decisions: ADR-0001.
   - Deploying to a specific provider is the consuming project's job, not chriek's. Worker exposes `GET /health`; weights cached on a persistent volume via `HF_HOME`.
   - A job killed mid-run (e.g. scale-down SIGTERM) ends up `failed` via the running-timeout.
   - Reference consumer setup (guidance only): Verda Serverless Containers, continuous deployment, min replicas 0, async requests (`Prefer: respond-async`), not Batch jobs (a fresh replica per job = cold load + 10-minute billing chunk per panel). Docs checked 2026-11-11. Open with Verda: max request TTL, result retention, FIN-only pinning, cold-start time.
-  - Cold start (loading ~20 GB weights) adds latency to the first job after idle; accepted. Weights come from the image or a provider volume, never downloaded from HF per start.
+
+Cold start (loading ~20 GB weights) adds latency to the first job after idle in either mode; accepted. The CUDA image does not contain weights; mount an operator-populated cache. The CUDA backend does not download weights at startup or on a cache miss.
 
 ### API
 
@@ -84,7 +85,7 @@ Spec: #1. Decisions: ADR-0001.
 - PoC parameters as baseline: 16 steps fixed, no guidance/CFG, no prompt upsampling, width/height multiples of 16, ~1 MP. References → edit mode; none → text-to-image.
 - Same request contract on both backends.
 - Mac backend: flux3-mlx on MLX (as in PoC).
-- NVIDIA backend: PyTorch/CUDA, BF16.
+- NVIDIA backend ([issue #3](https://github.com/stibbons-ai/chriek/issues/3)): PyTorch/CUDA, BF16, with diffusers 0.43.0's modular `Flux3DistilledAutoBlocks` pipeline and diffusers-format weights.
 - Config `offload`: `none` (hosted ≥48 GB, Mac) or `sequential` (24 GB cards: text encoder encodes, is unloaded, then transformer runs).
 - Minimum hardware (README): NVIDIA 24 GB VRAM; Apple Silicon ≥32 GB unified memory (guess, from 22.6 GB PoC peak).
 - Every PNG carries metadata: "AI generated", model, revision, seed. Always on, not configurable.
@@ -103,7 +104,8 @@ Spec: #1. Decisions: ADR-0001.
 - Abuse limit: per-key cap on queued jobs (configurable); no rate limiter beyond that.
 - N images per job: seeds `seed + i`; any image failure fails the whole job (generation errors are systemic, not per-image). Images already produced are discarded.
 - AI disclosure: PNG text chunk plus XMP with IPTC `DigitalSourceType = trainedAlgorithmicMedia`, written via Pillow (no extra dependency). No C2PA in MVP.
-- Test hardware: RTX 3090 (24 GB, `offload=sequential`) and M4 Max 128 GB. 24 GB fit of multi-reference BF16 edits is unproven; the plan builds and checks the NVIDIA backend on the 3090 early, before the rest depends on it.
+- Test hardware: RTX 3090 (24 GB) and M4 Max 128 GB. [Issue #3](https://github.com/stibbons-ai/chriek/issues/3) required proving multi-reference BF16 fit on the 3090 with sequential offload.
+  - Acceptance update: [Daniel confirmed](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7217734284) that separate offline BF16 Docker smokes for text-to-image and a three-reference edit passed on the RTX 3090 with `sequential`. A [warm-server follow-up](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7218700646) ran serial jobs with one to four 1024×1024 references in one `chriek serve` process per offload mode, one worker; both `sequential` and `none` passed. Concurrent jobs, soak runs and hosted ≥48 GB GPUs remain unmeasured.
 
 ### Docs
 
@@ -116,7 +118,6 @@ Spec: #1. Decisions: ADR-0001.
 ## Left to the builder
 
 - Python version (3.14 if MLX/torch/flux3-mlx support it, for stdlib `uuid.uuid7`; otherwise a small UUIDv7 library).
-- Exact NVIDIA inference library (BFL reference code, diffusers, …): verify against current docs; the HF repo ships diffusers-format copies.
 - Upload format for reference images (multipart proposed; no server-side fetching of URLs, to avoid SSRF).
 - Config mechanism and names (env vars recommended), signed-URL TTL, request limits (max images per job, max references, max upload size).
 - Migrations approach, health endpoint, logging, per-job run record (PoC fields: timings, peak memory, hardware) in the job response.

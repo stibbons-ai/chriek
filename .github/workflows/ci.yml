@@ -25,6 +25,16 @@ jobs:
       - name: Dependency audit
         run: uv run --locked python scripts/audit_dependencies.py
 
+  # Builds the real CUDA runtime image (no GPU needed) and checks it ships only the venv.
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # PyTorch's CUDA wheels need more disk than the runner leaves free.
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+      - run: scripts/check_cuda_image.sh
+
   # The same test suite against a real Postgres server; tests marked `sqlite` stay on SQLite.
   postgres:
     runs-on: ubuntu-latest

@@ -1,12 +1,18 @@
 """Image backend seam and configured backend selection."""
 
 import hashlib
+import math
 from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 from chriek.config import BackendSettings
+
+# Model identity shared by the real backends: the same pinned BF16 revision on every platform.
+FLUX_MODEL = "black-forest-labs/flux-3-image-klein"
+FLUX_REVISION = "09561231f44e41381c461caf53d5452005a60ac9"
+FLUX_STEPS = 16
 
 
 class ImageBackend(Protocol):
@@ -77,9 +83,37 @@ class FakeBackend:
         return image
 
 
+def fit_references(references: Sequence[Image.Image], grid: int, budget: int) -> list[Image.Image]:
+    """A new list of the borrowed references, in order. One reference is passed as is; each of
+    several is padded or shrunk so the runtime's area scaling and grid crop (to `budget` pixels,
+    then down to multiples of `grid`) leave it at least one grid cell."""
+    if len(references) < 2:
+        return list(references)
+    return [_fit_multi_reference(image, grid, budget) for image in references]
+
+
+def _fit_multi_reference(image: Image.Image, grid: int, budget: int) -> Image.Image:
+    short, long = sorted(image.size)
+    area = short * long
+    # Leave references alone if the runtime's area scaling still leaves a full grid cell.
+    if short >= grid and (area <= budget or short * math.sqrt(budget / area) >= grid):
+        return image
+    image = ImageOps.exif_transpose(image).convert("RGB")
+    max_side = budget // grid
+    if long > max_side:
+        size = tuple(max(1, side * max_side // long) for side in image.size)
+        image = image.resize(size, Image.Resampling.LANCZOS)
+    dx, dy = max(grid - image.width, 0), max(grid - image.height, 0)
+    return ImageOps.expand(image, (dx // 2, dy // 2, dx - dx // 2, dy - dy // 2))
+
+
 def create_backend(settings: BackendSettings) -> ImageBackend:
     if settings.name == "mlx":
         from chriek.mlx_backend import MlxBackend
 
         return MlxBackend()
+    if settings.name == "cuda":
+        from chriek.cuda_backend import CudaBackend
+
+        return CudaBackend(settings.offload)
     return FakeBackend()

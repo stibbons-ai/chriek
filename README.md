@@ -2,7 +2,7 @@
 
 Self-hostable image generation server for FLUX 3 Image Klein, with an asynchronous job API: submit a job, poll it, download the PNGs through signed, expiring URLs. Architecture: [ADR-0001](docs/adr/0001-mvp-architecture.md).
 
-> **Status: home mode.** The default fake backend draws deterministic placeholder PNGs (two coloured rectangles derived from prompt, size, seed and uploaded reference images) without a GPU or model weights; it does not run FLUX or any other model. On Apple Silicon, the optional MLX backend runs FLUX 3 Image Klein in BF16, including edits with reference images uploaded through the API or the local smoke command. CUDA is not available yet.
+> **Status: home mode.** The default fake backend draws deterministic placeholder PNGs (two coloured rectangles derived from prompt, size, seed and uploaded reference images) without a GPU or model weights; it does not run FLUX or any other model. On Apple Silicon, the optional MLX backend runs FLUX 3 Image Klein in BF16; on NVIDIA GPUs, the CUDA backend runs it in BF16 through diffusers, packaged as a Docker image. Both take reference images uploaded through the API or the local smoke command.
 
 ## Install and run (uv)
 
@@ -67,7 +67,7 @@ uv run chriek serve
 
 ### Backend dependencies
 
-`uv sync --locked` installs the default fake backend, with no GPU runtime or model weights. `uv sync --locked --extra mlx` adds `flux3-mlx` and its inference dependencies on Apple Silicon. Installing the extra does not select the backend. There is no `cuda` extra yet.
+`uv sync --locked` installs the default fake backend, with no GPU runtime or model weights. `uv sync --locked --extra mlx` adds `flux3-mlx` and its inference dependencies on Apple Silicon. `uv sync --locked --extra cuda` adds PyTorch (CUDA 13 wheels), diffusers, transformers and accelerate on Linux. Installing an extra does not select the backend.
 
 Keep the committed `uv.lock` as the single lockfile; do not introduce hand-maintained `requirements_mlx.txt` or `requirements_cuda.txt` copies.
 
@@ -85,6 +85,65 @@ Before the first render, accept the [model license](https://huggingface.co/black
 
 To serve MLX jobs, also set the server settings from [Install and run](#install-and-run-uv), then run `uv run --locked --extra mlx chriek serve`.
 
+### NVIDIA GPUs (CUDA, Docker)
+
+CUDA and MLX use the same pinned model revision, with different weight layouts. CUDA loads the diffusers-format BF16 weights through the FLUX 3 Image Klein modular pipeline (`Flux3DistilledAutoBlocks`, 16 steps, no guidance), without its prompt-upsampler step. It loads only from the Hugging Face cache and never downloads. If the snapshot or a required component is missing, the render fails. The pipeline stays loaded between jobs.
+
+Presets:
+
+- **24 GB card (RTX 3090 class):** `CHRIEK_OFFLOAD=sequential`. Components wait in host RAM (about 20 GB of BF16 weights) and only the running one is on the GPU: the text encoder encodes, leaves the GPU, then the transformer runs. Moving components adds transfer time to every job. This is the preset with VRAM headroom; see the [RTX 3090 results](#rtx-3090-results).
+- **Hosted GPU with at least 48 GB:** `CHRIEK_OFFLOAD=none`. Text encoder, transformer and VAE all stay on the GPU.
+
+The [owner's dedicated RTX 3090 setup](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7218700646) is an exception, not a 24 GB preset. It uses `none` with one worker running serial jobs, one 1024×1024 output and up to four 1024×1024 references, with little VRAM headroom (see the [warm-server results](#rtx-3090-results)). To cap requests for this setup, set `CHRIEK_MAX_IMAGES=1`, `CHRIEK_MAX_DIMENSION=1024`, `CHRIEK_MAX_PIXELS=1048576` and `CHRIEK_MAX_REFERENCES=4`. These are upper bounds, not validation of the tested 1024×1024 shape.
+
+Host prerequisites: Linux with an NVIDIA driver 580 or newer (the locked PyTorch wheels use CUDA 13), Docker and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) for `--gpus all`. With an older driver or without the toolkit, PyTorch sees no GPU and the CUDA backend stops with `requires an NVIDIA GPU visible to PyTorch`.
+
+Download the weights once on the host, with your own Hugging Face account after accepting the [model license](https://huggingface.co/black-forest-labs/flux-3-image-klein); export your `HF_TOKEN` from your secret store or run `hf auth login` first. This downloads the diffusers layout (about 20 GB) and the license files, not the entire repository. `--include` takes one pattern each:
+
+```sh
+export HF_HOME="$HOME/.cache/huggingface"
+uvx --from 'huggingface-hub==2.4.0' hf download black-forest-labs/flux-3-image-klein \
+  --revision 09561231f44e41381c461caf53d5452005a60ac9 \
+  --include modular_model_index.json --include 'transformer/*' --include 'vae/*' \
+  --include 'text_encoder/*' --include LICENSE.md --include NOTICE.md
+```
+
+Build the image from a clean checkout. Untracked Python files under `src/` are build inputs. The build installs the `cuda` extra from `uv.lock` and the runtime image contains only the Python environment, no source checkout, `uv`, weights or tokens. The image runs offline (`HF_HUB_OFFLINE=1`) and reads the model cache from a read-only `/hf/hub` mount. Mount only `$HF_HOME/hub`, never all of `$HF_HOME`: that also holds your Hugging Face token (`hf auth login` writes `$HF_HOME/token`). The commands run as your own user (`--user`), which can read the cache and write the mounted output directory. They assume your user can reach the Docker socket; membership in the `docker` group is root-equivalent on that host, so grant it only to users you would give root:
+
+```sh
+docker build -t chriek:cuda .
+mkdir -p out
+docker run --rm --gpus all --user "$(id -u):$(id -g)" \
+  -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/out:/out" -e CHRIEK_OFFLOAD=sequential \
+  chriek:cuda smoke --prompt "A red bicycle in the rain" --out /out/bicycle.png
+```
+
+Use `-e CHRIEK_OFFLOAD=none` on a ≥48 GB GPU. Without Docker, `uv sync --locked --extra cuda`, then `CHRIEK_BACKEND=cuda CHRIEK_OFFLOAD=sequential HF_HUB_OFFLINE=1 uv run --locked --extra cuda chriek smoke …`.
+
+To serve, pass the server settings from [Install and run](#install-and-run-uv) (the image sets `CHRIEK_BACKEND=cuda` and listens on `0.0.0.0` inside the container). Export `CHRIEK_API_KEYS` and `CHRIEK_SIGNING_SECRET` in your shell; the name-only `-e CHRIEK_API_KEYS -e CHRIEK_SIGNING_SECRET` makes Docker copy them from that environment and keeps their values off the command line. The job database and PNGs go to a private host directory owned by the user the container runs as (see [Storage permissions](#storage-permissions)):
+
+```sh
+mkdir -m 700 chriek-data
+docker run -d --gpus all --user "$(id -u):$(id -g)" -p 127.0.0.1:8000:8000 \
+  -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/chriek-data:/data" \
+  -e CHRIEK_DB_PATH=/data/chriek.db -e CHRIEK_STORAGE_DIR=/data/images \
+  -e CHRIEK_OFFLOAD=sequential -e CHRIEK_API_KEYS -e CHRIEK_SIGNING_SECRET \
+  -e CHRIEK_PUBLIC_URL=http://127.0.0.1:8000 chriek:cuda
+```
+
+Without socket access, prefix only the `docker` commands with `sudo`. Run `mkdir` as yourself, without `sudo`: the container runs as your user and can't write to directories owned by root. Your shell expands `$(id -u)`, `$HF_HOME` and `$PWD` before `sudo` runs, so they still name your user and paths. For serving, `sudo` drops exported variables by default, so the container would get neither secret and `chriek serve` would stop at startup; preserve them by name:
+
+```sh
+sudo --preserve-env=CHRIEK_API_KEYS,CHRIEK_SIGNING_SECRET docker run -d --gpus all \
+  --user "$(id -u):$(id -g)" -p 127.0.0.1:8000:8000 \
+  -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/chriek-data:/data" \
+  -e CHRIEK_DB_PATH=/data/chriek.db -e CHRIEK_STORAGE_DIR=/data/images \
+  -e CHRIEK_OFFLOAD=sequential -e CHRIEK_API_KEYS -e CHRIEK_SIGNING_SECRET \
+  -e CHRIEK_PUBLIC_URL=http://127.0.0.1:8000 chriek:cuda
+```
+
+For [S3 storage](#s3-storage) with either Docker command, replace `-e CHRIEK_STORAGE_DIR=/data/images` with `-e CHRIEK_STORAGE=s3` and pass `CHRIEK_S3_BUCKET` and any other non-secret S3 settings as `-e` options. Export the S3 credentials and forward them by name with `-e CHRIEK_S3_ACCESS_KEY_ID -e CHRIEK_S3_SECRET_ACCESS_KEY`. With `sudo`, also add both names to `--preserve-env`.
+
 ### Smoke test
 
 Generate a labeled PNG and print a JSON run record to stdout. The command uses the configured backend, defaults to 1024×1024 and seed 7, and needs no server settings. Dimensions must be positive multiples of 16 and obey the default server limits for each side and for total pixels. `--reference` is repeatable. An existing output is replaced only after the new PNG is fully written. Server jobs take references as multipart uploads; see [`POST /jobs`](#post-jobs).
@@ -95,7 +154,20 @@ uv run --locked --extra mlx chriek smoke --prompt "Move the bicycle into a sunny
   --reference bicycle.png --out garden.png
 ```
 
-MLX uses 16 steps, without guidance or prompt upsampling. The smoke record adds `prompt`, `seed`, `width`, `height`, `references` (count), `output` and `steps` (`null` for fake) to the normal run record. If MLX cannot read the GPU core count, `hardware.gpu_cores` is `null` and rendering continues.
+An edit with three references in the CUDA image, after three text-to-image renders as above (`bicycle.png`, then `palette.png` with `--prompt "A flat palette of teal, orange and cream paint swatches"`, `garden.png` with `--prompt "A sunny cottage garden path"`). This is the composition prompt tested on the RTX 3090; the shorter prompt "The bicycle from the first image, painted in the colors of the second image, parked on the path from the third image" dropped the bicycle there:
+
+```sh
+docker run --rm --gpus all --user "$(id -u):$(id -g)" \
+  -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/out:/out" -e CHRIEK_OFFLOAD=sequential \
+  chriek:cuda smoke --prompt "Create a new photograph using all three reference images. Take the bicycle from the first image,
+keeping its black wheels and saddle. Repaint its frame and fork using the teal swatch on the left of the
+second image. Place the entire bicycle side-on across the foreground stone path from the third image, with
+both wheels visible and a short shadow on the dry stones. Keep the third image's cottage and flower beds
+behind the bicycle. Use bright sunlight, with no rain or wet pavement." \
+  --reference /out/bicycle.png --reference /out/palette.png --reference /out/garden.png --out /out/edit.png
+```
+
+MLX and CUDA use 16 steps, without guidance or prompt upsampling. References are passed in command-line order. The smoke record adds `prompt`, `seed`, `width`, `height`, `references` (count), `output` and `steps` (`null` for fake) to the normal run record. If MLX cannot read the GPU core count, `hardware.gpu_cores` is `null` and rendering continues.
 
 Measured offline on an Apple M4 Max (40 GPU cores, 128 GB, macOS 27.2.1), with `CHRIEK_OFFLOAD=none`, MLX 0.32.4, `flux3-mlx` 0.1.0, 1024×1024, seed 7:
 
@@ -107,6 +179,30 @@ Measured offline on an Apple M4 Max (40 GPU cores, 128 GB, macOS 27.2.1), with `
 
 Two offline 512×512 jobs in one server process recorded 3.662 s and 0.0 s of load time, respectively.
 
+#### RTX 3090 results
+
+[Owner acceptance](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7217734284): offline Docker smoke runs on one 24,576 MiB RTX 3090, PyTorch CUDA 13.2 (the CUDA version the wheel was built with), torch 2.15.0, diffusers 0.43.0, 1024×1024, seed 7, 16 steps, BF16. Each row is a separate smoke process. Peak allocation is the run record's `peak_memory_bytes` (PyTorch's allocation peak), not the device memory usage observed separately:
+
+| `CHRIEK_OFFLOAD` | Workload | Load (s) | Wall (s) | Peak PyTorch allocation (bytes) |
+|---|---|---:|---:|---:|
+| `sequential` | Text-to-image | 1.495 | 33.768 | 11,728,788,480 |
+| `sequential` | Three-reference composition (prompt above) | 0.883 | 77.731 | 13,815,259,136 |
+| `none` | Text-to-image | 3.425 | 15.367 | 22,767,763,456 |
+| `none` | Three-reference edit (`none-edit.json` in owner comment; neither prompt above) | 3.087 | 64.660 | 22,914,622,464 |
+
+Observed device usage peaked at about 16 GB with `sequential` and at 23,122 MiB with `none`, 1,454 MiB below the card's capacity. Both three-reference outputs show a teal bicycle in the garden, with visible compositing or occlusion artifacts. The two edit prompts differ, so their wall times are not a speed comparison.
+
+[Warm-server follow-up](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7218700646): one `chriek serve` process per offload mode on the same RTX 3090, one worker, jobs submitted one at a time. After a one-reference warm-up, one job each with 1, 2, 3 and 4 references of 1024×1024; output 1024×1024, BF16, seed 7, same prompt throughout. All eight measured jobs succeeded with `load_seconds` 0.0. Peaks are the run records' PyTorch allocation peaks, not device usage:
+
+| References | `sequential` peak allocation (MiB) | `none` peak allocation (MiB) | `sequential` render (s) | `none` render (s) |
+|---:|---:|---:|---:|---:|
+| 1 | 11,905.4 | 21,717.3 | 39.785 | 25.730 |
+| 2 | 12,541.2 | 21,719.4 | 54.252 | 42.767 |
+| 3 | 13,175.3 | 21,863.4 | 73.779 | 63.289 |
+| 4 | 13,810.6 | 22,498.4 | 96.041 | 86.252 |
+
+A separate three-reference cold/warm pair also passed in both modes (first load 0.891 s `sequential`, 4.651 s `none`; warm load 0.0 s). Right after those warm jobs, `nvidia-smi` showed 4,802 MiB (`sequential`) and 23,256 MiB (`none`): device readings after the job, not in-render peaks. The owner chose `none` for a dedicated 3090 with one worker within this envelope (one 1024×1024 output, up to four 1024×1024 references); `sequential` stays the 24 GB preset for VRAM headroom. Production use remains subject to the model license. Not measured: concurrent load, soak runs and hosted ≥48 GB GPUs.
+
 ## Configuration
 
 All configuration comes from environment variables.
@@ -115,8 +211,8 @@ All configuration comes from environment variables.
 |---|---|---|
 | `CHRIEK_AUTH_MODE` | `api-key` | `api-key`: every `/jobs` request needs a key from `CHRIEK_API_KEYS`, and each key owns its jobs. `proxy`: no key check; a trusted reverse proxy authenticates, and all clients are one shared owner; see [Behind a reverse proxy](#behind-a-reverse-proxy-chriek_auth_modeproxy). Empty, differently cased or other values stop startup. |
 | `CHRIEK_API_KEYS` | required in `api-key` mode | Named static API keys, `name:key,name:key`. The name is the owner of the jobs created with that key. Names: 1–64 characters from `A-Z a-z 0-9 _ . -`, unique. Names are not secret: each job stores its owner's name in plain text, so never use a key or the signing secret as a name. Keys: at least 32 printable ASCII characters (`!` to `~`; no spaces, control or non-ASCII characters, no commas), unique. Keys travel in an HTTP header, so other characters are rejected at startup. Startup errors identify an invalid entry by its position, never by its name or key. Must be unset, empty or whitespace only in `proxy` mode. |
-| `CHRIEK_BACKEND` | `fake` | `fake`: deterministic placeholders. `mlx`: BF16 FLUX 3 Image Klein on Apple Silicon; requires the `mlx` extra. Exact lowercase values only. |
-| `CHRIEK_OFFLOAD` | `none` | Only exact lowercase `none` is supported today. MLX keeps the text encoder, DiT and VAE loaded. |
+| `CHRIEK_BACKEND` | `fake` | `fake`: deterministic placeholders. `mlx`: BF16 FLUX 3 Image Klein on Apple Silicon; requires the `mlx` extra. `cuda`: BF16 FLUX 3 Image Klein on an NVIDIA GPU; requires the `cuda` extra (or the Docker image). Exact lowercase values only. |
+| `CHRIEK_OFFLOAD` | `none` | `none`: every model component stays on the GPU (MLX: the text encoder, DiT and VAE stay loaded). `sequential`: CUDA only; one component on the GPU at a time, for 24 GB cards; see [NVIDIA GPUs](#nvidia-gpus-cuda-docker). Exact lowercase values only. |
 | `CHRIEK_SIGNING_SECRET` | required | HMAC secret for local download URLs, at least 32 characters. Changing it invalidates previously issued local links (poll the job again for new ones), not S3 links. Anyone who knows it can sign local download URLs; startup rejects a signing secret equal to any key or name in `CHRIEK_API_KEYS`. |
 | `CHRIEK_PUBLIC_URL` | required | Public base URL for local download links, `http(s)://host[:port][/prefix]`, for example `https://images.example/chriek`. Final `/` characters are optional and ignored. The host is a DNS name, a dotted-decimal IPv4 address such as `192.0.2.10` or a bracketed IPv6 address; a port must be 1–65535. Hosts that browsers would read as a different IPv4 address (`017.0.0.1`, `2130706433`, `0x7f.1`) or as an invalid one (`1.2.3.4.5`) are rejected. The prefix must not contain `\`, `.` or `..` segments (also percent-encoded as `%2e`), which clients rewrite. Only printable ASCII is accepted (no whitespace or control characters; write internationalized host names in punycode), with no user name or password, query (`?`) or fragment (`#`). See [Public URL and reverse proxies](#public-url-and-reverse-proxies). |
 | `CHRIEK_URL_TTL_SECONDS` | `900` | Lifetime of a download URL, 1–604800 seconds. |
@@ -330,7 +426,7 @@ curl -s http://127.0.0.1:8000/jobs/$JOB_ID -H "Authorization: Bearer $KEY"
 
 - `status` is `queued`, `running`, `succeeded` or `failed`.
 - `params.reference_count` is present in submit and poll responses at every status. It is response-only and is `0` for text-to-image jobs, including jobs created before reference uploads were supported.
-- `run` records `backend`, `model`, `revision` and `render_seconds` (wall time including model load and PNG writes) when the worker finishes the job, whether it succeeded, an image failed or a stored reference could not be loaded. MLX also reports `load_seconds` (the initial pipeline load paid by this job; `0.0` after loading), `peak_memory_bytes` (MLX allocation peak for this job, not system RAM use; `null` if the counter could not be reset or read), `hardware` (`chip`, `gpu_cores`, `memory_gb`, `macos_version`), `runtime` (`flux3_mlx`, `mlx` versions), `precision` (`BF16`) and `steps` (`16`), except after a reference load failure, when the backend never ran. A job failed by restart recovery or by the running-time limit has `run: null`; see [Job behaviour](#job-behaviour).
+- `run` records `backend`, `model`, `revision` and `render_seconds` (wall time including model load and PNG writes) when the worker finishes the job, whether it succeeded, an image failed or a stored reference could not be loaded. MLX also reports `load_seconds` (the initial pipeline load paid by this job; `0.0` after loading), `peak_memory_bytes` (MLX allocation peak for this job, not system RAM use; `null` if the counter could not be reset or read), `hardware` (`chip`, `gpu_cores`, `memory_gb`, `macos_version`), `runtime` (`flux3_mlx`, `mlx` versions), `precision` (`BF16`) and `steps` (`16`). CUDA reports the same `load_seconds`, `precision` and `steps`, plus `peak_memory_bytes` (PyTorch's peak GPU allocation for this job), `hardware` (`gpu`, `memory_gb`, and `cuda`: the CUDA version PyTorch was built with, not the host driver's), `runtime` (`torch`, `diffusers`, `transformers`, `accelerate` versions) and `offload`. Neither reports these backend details after a reference load failure, when the backend never ran. A job failed by restart recovery or by the running-time limit has `run: null`; see [Job behaviour](#job-behaviour).
 - `images` is filled only when `succeeded`. Every poll mints fresh URLs that expire `CHRIEK_URL_TTL_SECONDS` later: chriek's signed `/images/…` URLs with local storage, presigned bucket URLs with [S3 storage](#s3-storage).
 - `error` is `null` unless the job `failed`. A failed image is reported as exactly `image N of M failed` (N is the one-based image that failed, M the requested `image_count`); a stored reference image the worker can't load (for example one deleted from `CHRIEK_STORAGE_DIR`) as exactly `reference N of M could not be loaded`; a job failed by restart recovery or by the running-time limit carries the interrupted or timed-out message below. The public error never includes exception text, classes or other backend details. The server logs the job ID, the zero-based image or reference index, and the traceback. For handled S3 SDK exceptions, the traceback shows the sanitized storage error described under [S3 storage](#s3-storage).
 
@@ -446,7 +542,7 @@ It audits every third-party package locked in `uv.lock` against PyPI's vulnerabi
 
 Only exit 0 passes. There is no ignore list, severity threshold or fallback; a vulnerability without a compatible fix blocks the build until a person decides. `pip-audit` exits 1 both for findings and for its own errors, so the gate never reads its exit code alone.
 
-Coverage limits: the gate covers the application dependencies, the `dev` group (including `pip-audit`'s own dependencies) and any future optional extras or groups, on all platforms in the universal lock. It does not cover the Python interpreter, `uv`, system libraries, anything a locked package downloads or bundles itself, packages outside `uv.lock` (such as GPU backends installed separately), or vulnerabilities with no published PyPI advisory. A pass means no known advisory on PyPI at that moment, not that the dependencies are secure.
+Coverage limits: the gate covers the application dependencies, the optional `mlx` and `cuda` extras (including the locked CUDA stack: `torch`, `torchvision`, `diffusers`, `accelerate` and their dependencies), the `dev` group (including `pip-audit`'s own dependencies) and any future optional extras or groups, on all platforms in the universal lock. It does not cover the Python interpreter, `uv`, system libraries, the Docker base images, anything a locked package downloads or bundles itself, packages outside `uv.lock`, or vulnerabilities with no published PyPI advisory. A pass means no known advisory on PyPI at that moment, not that the dependencies are secure.
 
 Fixture projects in `tests/fixtures/dependency_audit/` demonstrate both outcomes against the real service without touching this project's lock (`--project` points the gate at another uv project):
 
@@ -455,6 +551,6 @@ uv run --locked python scripts/audit_dependencies.py --project tests/fixtures/de
 uv run --locked python scripts/audit_dependencies.py --project tests/fixtures/dependency_audit/vulnerable  # exit 1, urllib3 1.26.4
 ```
 
-Recorded run, 2026-11-12, Python 3.14.6 on macOS 27.2.1 arm64, pip-audit 2.10.1, PyPI service, with PyPI response validation: this lock, 61 third-party packages, no known vulnerabilities (exit 0). Same day: clean fixture exit 0; vulnerable fixture exit 1 with 11 advisories for `urllib3==1.26.4` (PYSEC-2021-108, PYSEC-2023-192, PYSEC-2023-212, PYSEC-2026-141, PYSEC-2026-1994, PYSEC-2026-1995, PYSEC-2026-1996, PYSEC-2026-1998, PYSEC-2026-1999, PYSEC-2026-4175, PYSEC-2026-4177); unreachable service (`HTTPS_PROXY=http://127.0.0.1:9`) exit 2; stale lock exit 2. Malformed PyPI responses are demonstrated offline only (`tests/test_dependency_audit.py`); real PyPI was not observed serving one.
+Historical recorded run, 2026-11-12, Python 3.14.6 on macOS 27.2.1 arm64, pip-audit 2.10.1, PyPI service, with PyPI response validation: the lock as it stood then, before the `mlx` and `cuda` extras, 61 third-party packages, no known vulnerabilities (exit 0). It is not a result for the current lock. Same day: clean fixture exit 0; vulnerable fixture exit 1 with 11 advisories for `urllib3==1.26.4` (PYSEC-2021-108, PYSEC-2023-192, PYSEC-2023-212, PYSEC-2026-141, PYSEC-2026-1994, PYSEC-2026-1995, PYSEC-2026-1996, PYSEC-2026-1998, PYSEC-2026-1999, PYSEC-2026-4175, PYSEC-2026-4177); unreachable service (`HTTPS_PROXY=http://127.0.0.1:9`) exit 2; stale lock exit 2. Malformed PyPI responses are demonstrated offline only (`tests/test_dependency_audit.py`); real PyPI was not observed serving one.
 
 The MLX lock was audited on 2026-11-18 on macOS 27.2.1 arm64 with Python 3.14.6: 73 locked third-party packages, no known vulnerabilities (exit 0).
