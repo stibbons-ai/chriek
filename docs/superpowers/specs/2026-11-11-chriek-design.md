@@ -104,6 +104,7 @@ Spec: #1. Decisions: ADR-0001.
 - N images per job: seeds `seed + i`; any image failure fails the whole job (generation errors are systemic, not per-image). Images already produced are discarded.
 - AI disclosure: PNG text chunk plus XMP with IPTC `DigitalSourceType = trainedAlgorithmicMedia`, written via Pillow (no extra dependency). No C2PA in MVP.
 - Test hardware: RTX 3090 (24 GB, `offload=sequential`) and M4 Max 128 GB. 24 GB fit of multi-reference BF16 edits is unproven; the plan builds and checks the NVIDIA backend on the 3090 early, before the rest depends on it.
+  - Acceptance update: [Daniel confirmed](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7217734284) that separate offline BF16 Docker smokes for text-to-image and a three-reference edit passed on the RTX 3090 with `sequential`. This does not establish fit for four references, a warm server, or concurrent jobs.
 
 ### Docs
 

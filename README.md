@@ -177,14 +177,14 @@ Two offline 512×512 jobs in one server process recorded 3.662 s and 0.0 s of lo
 
 #### RTX 3090 results
 
-[Owner acceptance](https://github.com/stibbons-ai/chriek/pull/41#issuecomment-7217734284): offline Docker smoke runs on one 24,576 MiB RTX 3090, CUDA 13.2, torch 2.15.0, diffusers 0.43.0, 1024×1024, seed 7, 16 steps, BF16. Each row is a separate smoke process. Peak allocation is the run record's `peak_memory_bytes` (PyTorch's allocation peak), not the device memory usage observed separately:
+[Owner acceptance](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7217734284): offline Docker smoke runs on one 24,576 MiB RTX 3090, CUDA 13.2, torch 2.15.0, diffusers 0.43.0, 1024×1024, seed 7, 16 steps, BF16. Each row is a separate smoke process. Peak allocation is the run record's `peak_memory_bytes` (PyTorch's allocation peak), not the device memory usage observed separately:
 
 | `CHRIEK_OFFLOAD` | Workload | Load (s) | Wall (s) | Peak PyTorch allocation (bytes) |
 |---|---|---:|---:|---:|
 | `sequential` | Text-to-image | 1.495 | 33.768 | 11,728,788,480 |
 | `sequential` | Three-reference composition (prompt above) | 0.883 | 77.731 | 13,815,259,136 |
 | `none` | Text-to-image | 3.425 | 15.367 | 22,767,763,456 |
-| `none` | Three-reference edit (different, shorter prompt) | 3.087 | 64.660 | 22,914,622,464 |
+| `none` | Three-reference edit (`none-edit.json` in owner comment; neither prompt above) | 3.087 | 64.660 | 22,914,622,464 |
 
 Observed device usage peaked at about 16 GB with `sequential` and at 23,122 MiB with `none`, 1,454 MiB below the card's capacity. Both three-reference outputs show a teal bicycle in the garden, with visible compositing or occlusion artifacts. The two edit prompts differ, so their wall times are not a speed comparison. Not measured: four references, a warm long-lived server, concurrent load and hosted ≥48 GB GPUs.
 
