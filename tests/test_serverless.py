@@ -137,9 +137,10 @@ def config_api_env(tmp_path: Path, **changes: str) -> dict[str, str]:
             (
                 {"CHRIEK_DISPATCH_TIMEOUT_SECONDS": raw},
                 None,
-                "CHRIEK_DISPATCH_TIMEOUT_SECONDS must be a finite positive number",
+                "CHRIEK_DISPATCH_TIMEOUT_SECONDS must be a number of seconds above 0 and at most "
+                "604800 (7 days)",
             )
-            for raw in ("0", "-1", "nan", "inf", "30s", "")
+            for raw in ("0", "-1", "nan", "inf", "30s", "", "604800.5", "1e300")
         ),
     ],
 )
@@ -176,6 +177,8 @@ def test_api_role_settings_carry_dispatch_headers(tmp_path):
     assert settings.dispatch.timeout_seconds == 2.5
     assert PROVIDER_TOKEN not in repr(settings) and WORKER_TOKEN not in repr(settings)
     assert Settings.from_env(config_api_env(tmp_path), Role.API).dispatch.timeout_seconds == 30
+    maximum = config_api_env(tmp_path, CHRIEK_DISPATCH_TIMEOUT_SECONDS="604800")
+    assert Settings.from_env(maximum, Role.API).dispatch.timeout_seconds == 604800
 
 
 class RecordingStore:

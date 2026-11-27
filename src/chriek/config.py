@@ -358,8 +358,12 @@ def _dispatch(env: Mapping[str, str], other_secrets: set[str]) -> Dispatch:
         timeout = float(raw_timeout)
     except ValueError:
         timeout = 0.0
-    if not 0 < timeout < float("inf"):  # also false for NaN
-        raise ConfigError("CHRIEK_DISPATCH_TIMEOUT_SECONDS must be a finite positive number")
+    # socket.settimeout overflows on huge finite values; a week bounds any real cold start
+    if not 0 < timeout <= 604800:  # also false for NaN and inf
+        raise ConfigError(
+            "CHRIEK_DISPATCH_TIMEOUT_SECONDS must be a number of seconds above 0 and at most "
+            "604800 (7 days)"
+        )
     return Dispatch(url=url, worker_token=worker_token, headers=headers, timeout_seconds=timeout)
 
 
