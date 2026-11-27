@@ -79,3 +79,45 @@ jobs:
       - run: |
           : "${CHRIEK_TEST_S3_URL:?must name the S3 test service}"
           uv run pytest
+
+  # The serverless roles need both shared services; the jobs above each provide only one.
+  serverless:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: chriek-ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+      s3:
+        image: rustfs/rustfs:1.0.6
+        env:
+          RUSTFS_ACCESS_KEY: chriek-ci
+          RUSTFS_SECRET_KEY: chriek-ci-secret-0123456789
+        ports:
+          - 9000:9000
+        options: >-
+          --health-cmd "curl -fsS http://127.0.0.1:9000/health"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 15
+    env:
+      CHRIEK_TEST_POSTGRES_URL: postgresql://postgres:chriek-ci@127.0.0.1:5432/postgres
+      CHRIEK_TEST_S3_URL: http://chriek-ci:chriek-ci-secret-0123456789@127.0.0.1:9000/chriek-test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      # Fails instead of skipping the walkthroughs when either service URL is missing.
+      - run: |
+          : "${CHRIEK_TEST_POSTGRES_URL:?must name the Postgres test service}"
+          : "${CHRIEK_TEST_S3_URL:?must name the S3 test service}"
+          uv run pytest tests/test_serverless.py

@@ -1,6 +1,7 @@
 """Environment-variable configuration. Every name and default is documented in README.md."""
 
 import ipaddress
+import json
 import os
 import re
 import ssl
@@ -45,6 +46,9 @@ SETTING_NAMES = frozenset(
         "CHRIEK_BACKEND",
         "CHRIEK_DATABASE_URL",
         "CHRIEK_DB_PATH",
+        "CHRIEK_DISPATCH_HEADERS",
+        "CHRIEK_DISPATCH_TOKEN",
+        "CHRIEK_DISPATCH_URL",
         "CHRIEK_HOST",
         "CHRIEK_JOB_TIMEOUT_SECONDS",
         "CHRIEK_MAX_DIMENSION",
@@ -69,7 +73,43 @@ SETTING_NAMES = frozenset(
         "CHRIEK_TLS_CERTFILE",
         "CHRIEK_TLS_KEYFILE",
         "CHRIEK_URL_TTL_SECONDS",
+        "CHRIEK_WORKER_TOKEN",
     }
+)
+DISPATCH_NAMES = frozenset(
+    {"CHRIEK_DISPATCH_HEADERS", "CHRIEK_DISPATCH_TOKEN", "CHRIEK_DISPATCH_URL"}
+)
+# What `chriek worker` reads; it refuses every other setting, so no client API key, signing
+# secret or dispatch credential has to reach the GPU container.
+WORKER_SETTING_NAMES = frozenset(
+    {
+        "CHRIEK_BACKEND",
+        "CHRIEK_DATABASE_URL",
+        "CHRIEK_HOST",
+        "CHRIEK_JOB_TIMEOUT_SECONDS",
+        "CHRIEK_OFFLOAD",
+        "CHRIEK_PORT",
+        "CHRIEK_S3_ACCESS_KEY_ID",
+        "CHRIEK_S3_BUCKET",
+        "CHRIEK_S3_ENDPOINT_URL",
+        "CHRIEK_S3_PREFIX",
+        "CHRIEK_S3_REGION",
+        "CHRIEK_S3_SECRET_ACCESS_KEY",
+        "CHRIEK_STORAGE",
+        "CHRIEK_TLS_CERTFILE",
+        "CHRIEK_TLS_KEYFILE",
+        "CHRIEK_WORKER_TOKEN",
+    }
+)
+# The worker invocation credential travels in its own header, so a provider gateway may consume
+# `Authorization` (CHRIEK_DISPATCH_TOKEN) without chriek's worker losing its check.
+WORKER_TOKEN_HEADER = "X-Chriek-Worker-Token"  # noqa: S105 - a header name, not a secret
+HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")  # RFC 9110 token
+RESERVED_DISPATCH_HEADERS = (
+    "Authorization",
+    "Content-Type",
+    "Idempotency-Key",
+    WORKER_TOKEN_HEADER,
 )
 DEFAULT_ALLOWED_HOSTS = "localhost,127.0.0.1,[::1]"
 _LABEL = r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?"
@@ -84,6 +124,22 @@ class ConfigError(ValueError):
 class AuthMode(StrEnum):
     API_KEY = "api-key"  # chriek checks named static keys; each key owns its jobs
     PROXY = "proxy"  # a trusted reverse proxy authenticates; all clients share one owner
+
+
+class Role(StrEnum):
+    """The `chriek` command a configuration is for; values appear in error messages."""
+
+    HOME = "serve"  # API and in-process worker, one process
+    API = "api"  # serverless API: queues jobs, dispatches each to the worker endpoint
+    WORKER = "worker"  # serverless worker: runs one dispatched job per invocation
+
+
+# Refused, not ignored: a setting that does nothing in a role must not look active there.
+_REFUSED_SETTINGS = {
+    Role.HOME: DISPATCH_NAMES | {"CHRIEK_WORKER_TOKEN"},
+    Role.API: frozenset({"CHRIEK_BACKEND", "CHRIEK_OFFLOAD"}),  # the API never loads a model
+    Role.WORKER: SETTING_NAMES - WORKER_SETTING_NAMES,
+}
 
 
 @dataclass(frozen=True)
@@ -133,6 +189,15 @@ class S3Settings:
 
 
 @dataclass(frozen=True)
+class Dispatch:
+    """Where `chriek api` sends each job ID, and with which headers."""
+
+    url: str
+    worker_token: str = field(repr=False)
+    headers: Mapping[str, str] = field(repr=False)  # extra headers, incl. a provider credential
+
+
+@dataclass(frozen=True)
 class Settings:
     database: Path | URL  # SQLite file (or ":memory:") or a Postgres URL
     public_url: str  # scheme://authority[/prefix], no trailing slash
@@ -148,9 +213,12 @@ class Settings:
     tls: Tls | None  # None serves plain HTTP
     allowed_hosts: tuple[str, ...]  # proxy mode's accepted Host names; empty in api-key mode
     backend: BackendSettings = BackendSettings()
+    dispatch: Dispatch | None = None  # set only for `chriek api`
 
     @classmethod
-    def from_env(cls, env: Mapping[str, str]) -> Settings:
+    def from_env(cls, env: Mapping[str, str], role: Role = Role.HOME) -> Settings:
+        """Home (`chriek serve`) or serverless API (`chriek api`) settings."""
+        _refuse(env, role)
         backend = BackendSettings.from_env(env)
         limits = Limits(
             max_images=_int(env, "CHRIEK_MAX_IMAGES", Limits.max_images, 1, 64),
@@ -179,10 +247,14 @@ class Settings:
             raise ConfigError(
                 "CHRIEK_SIGNING_SECRET must differ from every CHRIEK_API_KEYS name and key"
             )
+        database, storage, dispatch = _database(env), _storage(env), None
+        if role is Role.API:
+            database, storage = _shared_storage(role, database, storage)
+            dispatch = _dispatch(env, {signing_secret, *api_keys, *api_keys.values()})
         return cls(
             public_url=_public_url(env.get("CHRIEK_PUBLIC_URL", "")),
-            database=_database(env),
-            storage=_storage(env),
+            database=database,
+            storage=storage,
             auth_mode=auth_mode,
             api_keys=api_keys,
             signing_secret=signing_secret,
@@ -198,7 +270,118 @@ class Settings:
                 else ()
             ),
             backend=backend,
+            dispatch=dispatch,
         )
+
+
+@dataclass(frozen=True)
+class WorkerSettings:
+    """`chriek worker`: shared Postgres and bucket, the model backend and the invocation token."""
+
+    database: URL
+    storage: S3Settings
+    worker_token: str = field(repr=False)
+    job_timeout_seconds: int
+    host: str
+    port: int
+    tls: Tls | None
+    backend: BackendSettings
+
+    @classmethod
+    def from_env(cls, env: Mapping[str, str]) -> WorkerSettings:
+        _refuse(env, Role.WORKER)
+        backend = BackendSettings.from_env(env)
+        database, storage = _shared_storage(Role.WORKER, _database(env), _storage(env))
+        return cls(
+            database=database,
+            storage=storage,
+            worker_token=_worker_token(env),
+            job_timeout_seconds=_int(env, "CHRIEK_JOB_TIMEOUT_SECONDS", 3600, 1, 7 * 24 * 3600),
+            host=env.get("CHRIEK_HOST", "127.0.0.1"),
+            port=_int(env, "CHRIEK_PORT", 8000, 1, 65535),
+            tls=_tls(env),
+            backend=backend,
+        )
+
+
+def _refuse(env: Mapping[str, str], role: Role) -> None:
+    refused = sorted(name for name in env if name in _REFUSED_SETTINGS[role])
+    if refused:
+        raise ConfigError(f"{', '.join(refused)} does not apply to chriek {role}; unset it")
+
+
+def _shared_storage(
+    role: Role, database: Path | URL, storage: Path | S3Settings
+) -> tuple[URL, S3Settings]:
+    """API and worker run in different places: both need the one Postgres and bucket."""
+    if not isinstance(database, URL):
+        raise ConfigError(
+            f"chriek {role} requires CHRIEK_DATABASE_URL (Postgres shared by api and worker)"
+        )
+    if not isinstance(storage, S3Settings):
+        raise ConfigError(
+            f"chriek {role} requires CHRIEK_STORAGE=s3 (a bucket shared by api and worker)"
+        )
+    return database, storage
+
+
+def _dispatch(env: Mapping[str, str], other_secrets: set[str]) -> Dispatch:
+    url = env.get("CHRIEK_DISPATCH_URL", "")
+    if not url:
+        raise ConfigError(
+            "CHRIEK_DISPATCH_URL is required for chriek api: the worker invocation URL"
+        )
+    _http_url(url, "CHRIEK_DISPATCH_URL")  # validated, kept verbatim: a trailing / may matter
+    worker_token = _worker_token(env)
+    if worker_token in other_secrets:
+        raise ConfigError(
+            "CHRIEK_WORKER_TOKEN must differ from CHRIEK_SIGNING_SECRET and every "
+            "CHRIEK_API_KEYS name and key"
+        )
+    headers = _dispatch_headers(env.get("CHRIEK_DISPATCH_HEADERS", "{}"))
+    token = env.get("CHRIEK_DISPATCH_TOKEN")
+    if token is not None:
+        if not token or not all("!" <= c <= "~" for c in token):
+            raise ConfigError(
+                "CHRIEK_DISPATCH_TOKEN must be printable ASCII characters without whitespace"
+            )
+        headers["Authorization"] = f"Bearer {token}"
+    return Dispatch(url=url, worker_token=worker_token, headers=headers)
+
+
+def _dispatch_headers(raw: str) -> dict[str, str]:
+    """A JSON object of extra header names to values. Errors never echo either: a value may be a
+    credential, and a name may be one pasted in the wrong place."""
+    form = "CHRIEK_DISPATCH_HEADERS must be a JSON object of header names to string values"
+    try:
+        headers = json.loads(raw)
+    except ValueError:
+        raise ConfigError(form) from None
+    if not isinstance(headers, dict) or not all(isinstance(v, str) for v in headers.values()):
+        raise ConfigError(form)
+    reserved = {name.lower() for name in RESERVED_DISPATCH_HEADERS}
+    for name, value in headers.items():
+        if not HEADER_NAME_PATTERN.fullmatch(name) or not all(" " <= c <= "~" for c in value):
+            raise ConfigError(
+                "CHRIEK_DISPATCH_HEADERS names must be HTTP header tokens and values printable "
+                "ASCII characters"
+            )
+        if name.lower() in reserved:
+            raise ConfigError(
+                f"CHRIEK_DISPATCH_HEADERS must not set {', '.join(RESERVED_DISPATCH_HEADERS)}; "
+                "chriek sets them (CHRIEK_DISPATCH_TOKEN sends Authorization)"
+            )
+    return headers
+
+
+def _worker_token(env: Mapping[str, str]) -> str:
+    token = env.get("CHRIEK_WORKER_TOKEN", "")
+    if len(token) < MIN_SECRET_LENGTH or not all("!" <= c <= "~" for c in token):
+        raise ConfigError(
+            f"CHRIEK_WORKER_TOKEN must be at least {MIN_SECRET_LENGTH} printable ASCII "
+            "characters without whitespace"
+        )
+    return token
 
 
 def _storage(env: Mapping[str, str]) -> Path | S3Settings:

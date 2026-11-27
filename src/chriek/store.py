@@ -33,6 +33,8 @@ from chriek.storage import StorageError, private_database
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
 TIMED_OUT_ERROR = "timed out: the job ran longer than CHRIEK_JOB_TIMEOUT_SECONDS"
+# Advisory-lock name for schema creation; no owner name contains ':' except the proxy owner.
+SCHEMA_LOCK = "schema:jobs"
 MEMORY_DATABASE = ":memory:"  # SQLite's sentinel for an ephemeral database
 # Seeds reach 2**32 - 1, which overflows a Postgres INTEGER.
 Seed = Annotated[int, mapped_column(BigInteger)]
@@ -103,10 +105,14 @@ class JobStore:
     def __init__(self, database: Path | URL) -> None:
         self._engine = _create_engine(database)
         _rename_draft_reference_table(self._engine)
-        Base.metadata.create_all(self._engine)
-        # create_all skips existing tables and so their indexes: add indexes introduced
-        # after a database file was created. Idempotent; existing rows stay untouched.
         with self._engine.begin() as connection:
+            if connection.dialect.name == "postgresql":
+                # API and worker processes often start together on a fresh database; without
+                # this lock their concurrent CREATE TABLEs collide. Held until this commit.
+                connection.execute(select(func.pg_advisory_xact_lock(_owner_lock_key(SCHEMA_LOCK))))
+            Base.metadata.create_all(connection)
+            # create_all skips existing tables and so their indexes: add indexes introduced
+            # after a database file was created. Idempotent; existing rows stay untouched.
             for table in Base.metadata.sorted_tables:
                 for index in table.indexes:
                     connection.execute(CreateIndex(index, if_not_exists=True))
@@ -206,13 +212,26 @@ class JobStore:
                 select(Job).where(Job.id == job_id, Job.owner == owner)
             ).one_or_none()
 
+    def status(self, job_id: str) -> str | None:
+        """Any owner's job status; for the serverless worker, which acts on a job ID alone."""
+        with self._session() as session:
+            return session.scalar(select(Job.status).where(Job.id == job_id))
+
     def claim_next(self, now: float) -> Job | None:
         """Atomically move the oldest queued job to running."""
         oldest = select(Job.seq).where(Job.status == QUEUED).order_by(Job.seq).limit(1)
+        return self._claim(Job.seq == oldest.scalar_subquery(), now)
+
+    def claim(self, job_id: str, now: float) -> Job | None:
+        """Atomically move this job to running if it is still queued; None otherwise. Of
+        concurrent claims of one job, at most one gets it."""
+        return self._claim(Job.id == job_id, now)
+
+    def _claim(self, condition, now: float) -> Job | None:
         with self._session.begin() as session:
             return session.scalars(
                 update(Job)
-                .where(Job.seq == oldest.scalar_subquery(), Job.status == QUEUED)
+                .where(condition, Job.status == QUEUED)
                 .values(status=RUNNING, started_at=now)
                 .returning(Job)
             ).one_or_none()
@@ -230,6 +249,16 @@ class JobStore:
     def fail(self, job_id: str, error: str, run_record: dict[str, Any], now: float) -> bool:
         with self._session.begin() as session:
             return self._finish(session, job_id, FAILED, error, run_record, now) is not None
+
+    def fail_queued(self, job_id: str, error: str, now: float) -> bool:
+        """Fail the job only while it is still queued: a claimed or finished job keeps its state."""
+        with self._session.begin() as session:
+            result = session.execute(
+                update(Job)
+                .where(Job.id == job_id, Job.status == QUEUED)
+                .values(status=FAILED, error=error, finished_at=now)
+            )
+            return result.rowcount == 1
 
     def fail_interrupted(self, now: float) -> None:
         """Startup recovery: jobs left running by a previous process fail without retry."""

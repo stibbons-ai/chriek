@@ -1,4 +1,5 @@
-"""Home-mode worker: one thread, one job at a time, oldest queued job first."""
+"""Job execution. Home mode runs a thread, one job at a time, oldest queued job first; the
+serverless worker calls `Worker.run` for each job it claims on invocation, without the thread."""
 
 import io
 import logging
@@ -60,7 +61,7 @@ class Worker:
                 self._wake.wait(IDLE_RECHECK_SECONDS)
                 continue
             try:
-                self._run(job)
+                self.run(job)
             except Exception:
                 # Only the final state write can raise here. Fail closed: the job stays
                 # `running` until a restart or an overdue poll fails it, and no later job may run
@@ -69,7 +70,9 @@ class Worker:
                 self.stopped_on_error = True
                 return
 
-    def _run(self, job: Job) -> None:
+    def run(self, job: Job) -> None:
+        """Render a claimed (running) job and record its result. Raises only when that final
+        state write fails."""
         started = self._clock()
         references: list[Image.Image] = []
         for ref in job.references:

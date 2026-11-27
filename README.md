@@ -2,7 +2,7 @@
 
 Self-hostable image generation server for FLUX 3 Image Klein, with an asynchronous job API: submit a job, poll it, download the PNGs through signed, expiring URLs. Architecture: [ADR-0001](docs/adr/0001-mvp-architecture.md).
 
-> **Status: home mode.** The default fake backend draws deterministic placeholder PNGs (two coloured rectangles derived from prompt, size, seed and uploaded reference images) without a GPU or model weights; it does not run FLUX or any other model. On Apple Silicon, the optional MLX backend runs FLUX 3 Image Klein in BF16, including edits with reference images uploaded through the API or the local smoke command. CUDA is not available yet.
+> **Status: home mode and serverless roles.** The default fake backend draws deterministic placeholder PNGs (two coloured rectangles derived from prompt, size, seed and uploaded reference images) without a GPU or model weights; it does not run FLUX or any other model. On Apple Silicon, the optional MLX backend runs FLUX 3 Image Klein in BF16, including edits with reference images uploaded through the API or the local smoke command. CUDA is not available yet. Besides the single-process `chriek serve`, `chriek api` and `chriek worker` split API and worker for scale-to-zero GPU deployments; see [Serverless roles](#serverless-roles-chriek-api-and-chriek-worker).
 
 ## Install and run (uv)
 
@@ -65,6 +65,48 @@ export CHRIEK_ALLOWED_HOSTS="img.example.com"
 uv run chriek serve
 ```
 
+### Serverless roles (`chriek api` and `chriek worker`)
+
+`chriek serve` keeps API and worker in one process. For a GPU that scales to zero, run the two halves separately: `chriek api` is the always-on, CPU-only API, and `chriek worker` runs on the GPU provider and handles one job per HTTP invocation. chriek pushes each job to the worker; nothing polls a queue, so the provider can stop every worker while no job is pending ([ADR-0001](docs/adr/0001-mvp-architecture.md)). Deploying to a specific provider is up to you.
+
+```sh
+# Both roles: one shared Postgres database, one shared bucket, one worker token.
+export CHRIEK_DATABASE_URL="postgresql://chriek:<password>@db.internal:5432/chriek?sslmode=verify-full"
+export CHRIEK_STORAGE=s3 CHRIEK_S3_BUCKET=chriek-images   # plus CHRIEK_S3_* credentials
+export CHRIEK_WORKER_TOKEN="$(openssl rand -hex 32)"        # generate once, give both the same value
+
+# API (CPU host): the usual API settings plus where and how to dispatch.
+export CHRIEK_API_KEYS=… CHRIEK_SIGNING_SECRET=… CHRIEK_PUBLIC_URL=…
+export CHRIEK_DISPATCH_URL="https://inference.provider.example/chriek/invoke"
+export CHRIEK_DISPATCH_TOKEN="<provider API key>"
+export CHRIEK_DISPATCH_HEADERS='{"Prefer": "respond-async"}'
+uv run chriek api
+
+# Worker (GPU container, its own environment): only the shared settings, the backend and the
+# listen address; it refuses API-only settings such as CHRIEK_API_KEYS.
+export CHRIEK_BACKEND=mlx HF_HOME=/data/huggingface CHRIEK_HOST=0.0.0.0
+uv run chriek worker
+```
+
+**Shared storage.** Both roles require `CHRIEK_DATABASE_URL` ([Postgres](#postgres)) and `CHRIEK_STORAGE=s3` ([S3 storage](#s3-storage)), pointing at the same database and bucket: the worker reads jobs and reference images the API stored, and the API serves results the worker stored. SQLite or local image storage stops either role with exit code 2 before it opens anything. Each role connects to the database (creating the schema if needed) and checks the bucket before it listens. Processes starting at the same time on a fresh database take turns creating the schema (a Postgres advisory lock), so starting API and workers together is safe. Download links are presigned bucket URLs, as with `chriek serve` on S3.
+
+**Role settings.** Each role refuses settings that would do nothing there, with exit code 2 and a message naming the setting: `chriek serve` refuses `CHRIEK_DISPATCH_*` and `CHRIEK_WORKER_TOKEN`; `chriek api` refuses `CHRIEK_BACKEND` and `CHRIEK_OFFLOAD` (it never constructs a model); `chriek worker` accepts only `CHRIEK_DATABASE_URL`, `CHRIEK_STORAGE`, `CHRIEK_S3_*`, `CHRIEK_BACKEND`, `CHRIEK_OFFLOAD`, `CHRIEK_JOB_TIMEOUT_SECONDS`, `CHRIEK_WORKER_TOKEN`, `CHRIEK_HOST`, `CHRIEK_PORT` and `CHRIEK_TLS_*`, so client API keys, the signing secret and the provider credential never have to reach the GPU container. Give both roles the same `CHRIEK_JOB_TIMEOUT_SECONDS`.
+
+**Dispatch.** `chriek api` serves the same [API](#api) with the same authentication and limits. Once a job and its reference images are committed, and after the `202` response is sent, it sends one `POST` to `CHRIEK_DISPATCH_URL` with the body `{"job_id": "<job id>"}` and these headers: `Content-Type: application/json`, `Idempotency-Key: <job id>` (the job ID is the request's idempotency and inference ID), `X-Chriek-Worker-Token: <CHRIEK_WORKER_TOKEN>`, `Authorization: Bearer <CHRIEK_DISPATCH_TOKEN>` when that is set, and every header in `CHRIEK_DISPATCH_HEADERS`, such as `Prefer: respond-async` for providers that queue the request and answer at once. Any `2xx` answer counts as delivered. Redirects are not followed, because they would resend the credentials elsewhere.
+
+**Delivery failures.** A non-`2xx` answer (including a redirect), a connection error or no answer within 30 seconds fails the job, but only while it is still `queued`, with `dispatch failed: the worker endpoint answered HTTP <status>` or `dispatch failed: the worker endpoint could not be reached (<error class>)`. Errors never contain the URL, headers, tokens or the endpoint's response. A job a worker already claimed keeps its state, so a gateway that delivered the job and then reports an error, or a synchronous endpoint still rendering after 30 seconds, doesn't fail it. There is no retry or re-dispatch: a job whose dispatch failed stays failed; submit a new one. If `chriek api` stops between committing a job and dispatching it, the job stays `queued`.
+
+**No restart recovery.** Neither role fails `running` jobs at startup, unlike `chriek serve`: on a shared database they may belong to a live worker. A job whose worker died stays `running` until a poll after `CHRIEK_JOB_TIMEOUT_SECONDS` fails it as timed out (see [Job behaviour](#job-behaviour)). `chriek api` has no worker, so its `GET /health` always returns `200 {"status": "ok"}` and its submissions never return the worker-stopped `503`.
+
+**Worker invocation.** `chriek worker` serves two routes:
+
+- `POST /invoke` with the body `{"job_id": "<job id>"}` and the header `X-Chriek-Worker-Token`. A missing or wrong token returns `401` before the body is read (bodies are capped at 2 MiB). The worker atomically claims the job only if it is still `queued`, reads its references from the bucket, renders, stores the PNGs and the result, and returns `200 {"id": "<job id>", "status": "succeeded"}` or `"failed"`. A job that is not `queued` (a duplicate delivery, a job claimed by another worker, or one whose dispatch failed) is not rendered again: the answer is `200` with its current status, such as `running` or `succeeded`. An unknown or malformed job ID returns `404 {"detail": "job not found"}`. If the result can't be saved, the answer is `500 {"detail": "job result could not be saved"}` and the job stays `running` until the running-time limit fails it. Render and reference failures are job results like in home mode (`200`, status `failed`, public error `image N of M failed` or `reference N of M could not be loaded`). One worker process renders one job at a time; concurrent invocations wait their turn.
+- `GET /health` without authentication returns `200 {"status": "ok"}` once the database and bucket were reachable at startup. Use it as the provider's readiness or health probe.
+
+The worker token travels in its own header so that a provider gateway can consume `Authorization` for its own credential (`CHRIEK_DISPATCH_TOKEN`). Without TLS between gateway and worker ([native TLS](#native-tls) works for the worker too), the token is readable on that network path.
+
+**Model cache.** A worker that scales to zero downloads the model weights (about 20 GB) again on every cold start unless the Hugging Face cache survives: point `HF_HOME` at a persistent volume, supply `HF_TOKEN` from the provider's secret store, and consider `HF_HUB_OFFLINE=1` once the snapshot is cached; see [Apple Silicon](#apple-silicon). The first job after a cold start still pays the model load. A CUDA backend is not available yet; the worker runs the `fake` and `mlx` backends.
+
 ### Backend dependencies
 
 `uv sync --locked` installs the default fake backend, with no GPU runtime or model weights. `uv sync --locked --extra mlx` adds `flux3-mlx` and its inference dependencies on Apple Silicon. Installing the extra does not select the backend. There is no `cuda` extra yet.
@@ -120,6 +162,10 @@ All configuration comes from environment variables.
 | `CHRIEK_SIGNING_SECRET` | required | HMAC secret for local download URLs, at least 32 characters. Changing it invalidates previously issued local links (poll the job again for new ones), not S3 links. Anyone who knows it can sign local download URLs; startup rejects a signing secret equal to any key or name in `CHRIEK_API_KEYS`. |
 | `CHRIEK_PUBLIC_URL` | required | Public base URL for local download links, `http(s)://host[:port][/prefix]`, for example `https://images.example/chriek`. Final `/` characters are optional and ignored. The host is a DNS name, a dotted-decimal IPv4 address such as `192.0.2.10` or a bracketed IPv6 address; a port must be 1–65535. Hosts that browsers would read as a different IPv4 address (`017.0.0.1`, `2130706433`, `0x7f.1`) or as an invalid one (`1.2.3.4.5`) are rejected. The prefix must not contain `\`, `.` or `..` segments (also percent-encoded as `%2e`), which clients rewrite. Only printable ASCII is accepted (no whitespace or control characters; write internationalized host names in punycode), with no user name or password, query (`?`) or fragment (`#`). See [Public URL and reverse proxies](#public-url-and-reverse-proxies). |
 | `CHRIEK_URL_TTL_SECONDS` | `900` | Lifetime of a download URL, 1–604800 seconds. |
+| `CHRIEK_DISPATCH_URL` | required for `chriek api` | Worker invocation URL the API `POST`s each job ID to, `http(s)://host[:port][/path]`, validated like `CHRIEK_PUBLIC_URL` but kept verbatim (a final `/` stays); no user name, password, query or fragment. See [Serverless roles](#serverless-roles-chriek-api-and-chriek-worker). Refused by `chriek serve` and `chriek worker`. |
+| `CHRIEK_DISPATCH_TOKEN` | unset | `chriek api` only: provider credential, sent as `Authorization: Bearer <token>` with every dispatch. Printable ASCII without whitespace; set but empty stops startup. |
+| `CHRIEK_DISPATCH_HEADERS` | `{}` | `chriek api` only: extra dispatch headers as a JSON object of names to string values, for example `{"Prefer": "respond-async"}`. Names must be HTTP header tokens, values printable ASCII; `Authorization`, `Content-Type`, `Idempotency-Key` and `X-Chriek-Worker-Token` are set by chriek and refused here. Errors never echo names or values. |
+| `CHRIEK_WORKER_TOKEN` | required for `chriek api` and `chriek worker` | Shared secret the API sends in `X-Chriek-Worker-Token` and the worker requires on `POST /invoke`; at least 32 printable ASCII characters without whitespace, the same value in both roles, and different from `CHRIEK_SIGNING_SECRET` and every `CHRIEK_API_KEYS` name and key. Refused by `chriek serve`. |
 | `CHRIEK_JOB_TIMEOUT_SECONDS` | `3600` | Longest a job may stay `running`, 1–604800 seconds, counted from `started_at` (time spent `queued` doesn't count). A job running longer fails as timed out; see [Job behaviour](#job-behaviour). |
 | `CHRIEK_DATABASE_URL` | unset | Postgres database, `postgresql://user:password@host:5432/dbname` (or `postgresql+psycopg://…`; chriek always uses the psycopg 3 driver). When set, it takes precedence and `CHRIEK_DB_PATH` is ignored. Set but empty, unparsable, with another scheme, with an unencoded `@` other than the one before the host (more than one, or one after the first `/` or `?` following `://`; write every other `@` as `%40`, and a `/` or `?` in the user name or password as `%2F` or `%3F`), or containing a NUL character (also as `%00`) or raw invalid UTF-8 is a configuration error. A parsable URL with parts left out, such as bare `postgresql://`, is accepted: libpq fills them from its defaults and `PG*` variables, and a connection that then fails is a database error. See [Postgres](#postgres). |
 | `CHRIEK_DB_PATH` | `chriek-data/chriek.db` | SQLite database file, used when `CHRIEK_DATABASE_URL` is unset. Used literally (`?` and `%20` are ordinary filename characters); missing parent directories are created private. Its parent must be a dedicated directory; see [Storage permissions](#storage-permissions). Put it on a volume to keep jobs across restarts. The exact value `:memory:` (or `./:memory:`) selects an ephemeral in-memory database instead; see [In-memory database](#in-memory-database). |
@@ -420,6 +466,14 @@ docker run --rm -d --name chriek-test-s3 -e RUSTFS_ACCESS_KEY=chriek -e RUSTFS_S
 until curl -fsS http://127.0.0.1:59000/health; do sleep 1; done
 CHRIEK_TEST_S3_URL=http://chriek:chriek-secret-0123456789@127.0.0.1:59000/chriek-test uv run pytest
 docker stop chriek-test-s3
+```
+
+The serverless walkthroughs in `tests/test_serverless.py` (submit, dispatch over HTTP to a worker on a loopback port, poll, download; references, render and delivery failures, duplicate and concurrent deliveries) need both services and are skipped unless `CHRIEK_TEST_POSTGRES_URL` and `CHRIEK_TEST_S3_URL` are both set; their configuration cases always run. CI runs them in a separate job with both services:
+
+```sh
+CHRIEK_TEST_POSTGRES_URL=postgresql://postgres:chriek@127.0.0.1:55432/postgres \
+CHRIEK_TEST_S3_URL=http://chriek:chriek-secret-0123456789@127.0.0.1:59000/chriek-test \
+uv run pytest tests/test_serverless.py
 ```
 
 ### Dependency audit

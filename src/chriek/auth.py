@@ -11,11 +11,12 @@ from collections.abc import Callable, Mapping
 
 from fastapi import HTTPException, Request, status
 
-from chriek.config import AuthMode
+from chriek.config import WORKER_TOKEN_HEADER, AuthMode
 
 # The ':' can't occur in an API key name, so proxy-mode jobs never share an owner with
 # api-key-mode jobs in the same database.
 PROXY_OWNER = "proxy:shared"
+WORKER_OWNER = "worker:invocation"  # never stored: the worker creates no jobs
 
 Authenticate = Callable[[Request], str]
 
@@ -54,3 +55,16 @@ class ApiKeyAuth:
                 headers={"WWW-Authenticate": "Bearer"},
             )
         return owner
+
+
+def worker_authenticator(token: str) -> Authenticate:
+    """`chriek worker` invocations must carry the shared worker token; 401 otherwise."""
+    expected = _digest(token)
+
+    def authenticate(request: Request) -> str:
+        presented = request.headers.get(WORKER_TOKEN_HEADER, "")
+        if not hmac.compare_digest(_digest(presented), expected):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing or invalid worker token")
+        return WORKER_OWNER
+
+    return authenticate
