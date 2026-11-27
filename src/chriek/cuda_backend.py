@@ -10,8 +10,9 @@ from PIL import Image
 from chriek.backend import FLUX_MODEL, FLUX_REVISION, FLUX_STEPS, fit_references
 from chriek.config import ConfigError
 
-# The components the pipeline needs once the prompt upsampler step is removed; load_components
-# only logs a warning for a component it cannot load.
+# The components loaded from files in the pinned snapshot once the prompt upsampler step is removed;
+# the scheduler and image processor are built from config. load_components only logs a warning
+# for a component it cannot load.
 _COMPONENTS = ("text_encoder", "tokenizer", "transformer", "vae")
 # The diffusers layout the README tells operators to download; the cache lookup checks only these,
 # not the repo's other files (original-format weights, variants, assets).

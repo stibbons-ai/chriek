@@ -208,10 +208,21 @@ def test_text_and_ordered_edit_share_one_cached_bf16_pipeline(inference, offload
         assert sorted(manager.components) == sorted(COMPONENTS)
         strategy = options.pop("offload_strategy")
         assert options == {"device": "cuda"}
-        encoder, vae = object(), object()
-        resident = [encoder, vae]
-        hooks = strategy(hooks=resident, model_id="transformer", model=None, execution_device=0)
-        assert hooks == [encoder, vae]
+        # diffusers passes the hooks still on the GPU as each component arrives, in the pipeline's
+        # real order, and offloads exactly the hooks the strategy returns.
+        hooks = {
+            name: SimpleNamespace(model_id=name) for name in ("text_encoder", "vae", "transformer")
+        }
+        resident = []
+        for arriving in ("text_encoder", "vae", "transformer", "vae"):
+            others = [hook for hook in resident if hook.model_id != arriving]
+            kwargs = {"model_id": arriving, "model": None, "execution_device": 0}
+            assert strategy(hooks=others, **kwargs) == others, arriving
+            resident = [hooks[arriving]]
+        # Even if the encoder were still resident when the transformer arrives, it leaves first.
+        both = [hooks["text_encoder"], hooks["vae"]]
+        kwargs = {"model_id": "transformer", "model": None, "execution_device": 0}
+        assert strategy(hooks=both, **kwargs) == both
 
 
 def test_missing_weights_fail_without_downloading(inference):
@@ -274,6 +285,8 @@ def test_edit_fits_tiny_and_tall_references_without_touching_them(inference):
         assert fitted[0] is not tiny and fitted[1] is not tall and fitted[2] is regular
         assert fitted[0].getpixel((8, 8)) == (255, 0, 0)
         assert (tiny.size, tall.size) == ((4, 4), (12, 131072))
+        for image, color in ((tiny, (255, 0, 0)), (tall, (255, 0, 0)), (regular, (0, 0, 255))):
+            assert image.getextrema() == tuple((value, value) for value in color)
 
 
 def test_single_reference_is_passed_as_is(inference):
@@ -308,6 +321,7 @@ def test_edit_upright_rgb_fits_small_references_and_borrows_large_ones(inference
         assert fitted.getpixel((7, 10)) == (0, 0, 255)
         assert fitted.getpixel((0, 0)) == (0, 0, 0)
         assert (small.size, small.mode) == ((8, 4), "RGBA")
+        assert small.tobytes() == sideways.tobytes()
 
 
 @pytest.mark.parametrize("offload", ["Sequential", "model", ""])

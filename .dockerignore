@@ -1,7 +1,7 @@
-# Allowlist: the build sees only what the image installs; never .git, .venv, weights or .env files.
+# Allowlist: the build sees only what the image installs; never .git, .venv, weights, .env files
+# or untracked data under src/, which the wheel would otherwise package.
 *
 !pyproject.toml
 !uv.lock
 !README.md
-!src/
-**/__pycache__
+!src/**/*.py

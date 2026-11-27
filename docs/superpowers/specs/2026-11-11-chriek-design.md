@@ -61,7 +61,8 @@ Spec: #1. Decisions: ADR-0001.
   - Deploying to a specific provider is the consuming project's job, not chriek's. Worker exposes `GET /health`; weights cached on a persistent volume via `HF_HOME`.
   - A job killed mid-run (e.g. scale-down SIGTERM) ends up `failed` via the running-timeout.
   - Reference consumer setup (guidance only): Verda Serverless Containers, continuous deployment, min replicas 0, async requests (`Prefer: respond-async`), not Batch jobs (a fresh replica per job = cold load + 10-minute billing chunk per panel). Docs checked 2026-11-11. Open with Verda: max request TTL, result retention, FIN-only pinning, cold-start time.
-- Cold start (loading ~20 GB weights) adds latency to the first job after idle; accepted. The CUDA image does not contain weights; mount an operator-populated cache. The backend does not download weights at startup or on a cache miss.
+
+Cold start (loading ~20 GB weights) adds latency to the first job after idle in either mode; accepted. The CUDA image does not contain weights; mount an operator-populated cache. The backend does not download weights at startup or on a cache miss.
 
 ### API
 

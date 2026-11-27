@@ -9,7 +9,7 @@ from PIL import Image, ImageDraw, ImageOps
 
 from chriek.config import BackendSettings
 
-# Model identity shared by the real backends: the same pinned BF16 checkpoint on every platform.
+# Model identity shared by the real backends: the same pinned BF16 revision on every platform.
 FLUX_MODEL = "black-forest-labs/flux-3-image-klein"
 FLUX_REVISION = "09561231f44e41381c461caf53d5452005a60ac9"
 FLUX_STEPS = 16
