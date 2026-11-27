@@ -15,10 +15,6 @@ from chriek.config import WORKER_TOKEN_HEADER, Dispatch
 from chriek.store import JobStore
 
 log = logging.getLogger(__name__)
-# Covers connect plus response; with `Prefer: respond-async` providers answer right away. A
-# synchronous endpoint that holds the request longer already claimed the job, which a late
-# failure then can't touch.
-DISPATCH_TIMEOUT_SECONDS = 30.0
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -46,19 +42,32 @@ def dispatch(settings: Dispatch, store: JobStore, job_id: str, clock: Callable[[
     try:
         # Built per call, not at import: the HTTPS handler reads SSLKEYLOGFILE when created.
         opener = urllib.request.build_opener(_NoRedirect)
-        with opener.open(request, timeout=DISPATCH_TIMEOUT_SECONDS):
+        with opener.open(request, timeout=settings.timeout_seconds):
             pass  # any 2xx is a delivery; the body carries nothing chriek uses
         return
     except urllib.error.HTTPError as error:
         reason = f"the worker endpoint answered HTTP {error.code}"
         error.close()
     except (OSError, ValueError, http.client.HTTPException) as error:  # timeouts, refusals
-        reason = f"the worker endpoint could not be reached ({type(error).__name__})"
-    log.error("dispatching job %s failed: %s", job_id, reason)
+        # urllib wraps a connect timeout in URLError; a read timeout arrives bare.
+        if isinstance(error, TimeoutError) or isinstance(
+            getattr(error, "reason", None), TimeoutError
+        ):
+            reason = (
+                f"the worker endpoint gave no answer within {settings.timeout_seconds:g} seconds"
+            )
+        else:
+            reason = f"the worker endpoint could not be reached ({type(error).__name__})"
     try:
         failed = store.fail_queued(job_id, f"dispatch failed: {reason}", clock())
     except Exception:
-        log.exception("could not record the dispatch failure of job %s", job_id)
+        log.exception("dispatching job %s failed (%s); recording that failed too", job_id, reason)
         return
-    if not failed:
-        log.info("job %s already left the queue; its dispatch failure changes nothing", job_id)
+    if failed:
+        log.error("dispatching job %s failed: %s; the job failed", job_id, reason)
+    else:  # a worker claimed it meanwhile, e.g. a synchronous endpoint answering after rendering
+        log.info(
+            "dispatching job %s got no 2xx answer (%s) after a worker claimed it; its state stands",
+            job_id,
+            reason,
+        )

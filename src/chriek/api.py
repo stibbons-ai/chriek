@@ -366,7 +366,8 @@ def create_app(
         job = await run_in_threadpool(decode_and_persist)
         if settings.dispatch is not None:
             # Only now, with the job and its references committed, may a worker hear of it.
-            # After the response: delivery never delays or changes the 202.
+            # After the response: delivery never delays or changes the 202, but it holds a
+            # shared threadpool thread until the endpoint answers or the dispatch timeout.
             background.add_task(dispatch, settings.dispatch, store, job.id, clock)
         response.headers["Location"] = f"/jobs/{job.id}"
         return job_body(job)

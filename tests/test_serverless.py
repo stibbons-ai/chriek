@@ -7,6 +7,7 @@ CHRIEK_TEST_S3_URL (see conftest.py); the worker serves real HTTP on a loopback 
 
 import io
 import json
+import logging
 import os
 import socket
 import threading
@@ -42,11 +43,13 @@ from sqlalchemy import make_url
 from test_references import submit_multipart
 
 from chriek import api as api_module
+from chriek import dispatch as dispatch_module
 from chriek.api import create_app, create_worker_app
 from chriek.cli import main
 from chriek.config import (
     WORKER_SETTING_NAMES,
     ConfigError,
+    Dispatch,
     Role,
     Settings,
     WorkerSettings,
@@ -130,6 +133,14 @@ def config_api_env(tmp_path: Path, **changes: str) -> dict[str, str]:
             "values printable ASCII",
         ),
         ({"CHRIEK_DISPATCH_TOKEN": f"{PROVIDER_TOKEN} x"}, None, "CHRIEK_DISPATCH_TOKEN must"),
+        *(
+            (
+                {"CHRIEK_DISPATCH_TIMEOUT_SECONDS": raw},
+                None,
+                "CHRIEK_DISPATCH_TIMEOUT_SECONDS must be a finite positive number",
+            )
+            for raw in ("0", "-1", "nan", "inf", "30s", "")
+        ),
     ],
 )
 def test_api_role_rejects_configuration_without_leaking_secrets(
@@ -154,6 +165,7 @@ def test_api_role_settings_carry_dispatch_headers(tmp_path):
             tmp_path,
             CHRIEK_DISPATCH_TOKEN=PROVIDER_TOKEN,
             CHRIEK_DISPATCH_HEADERS=json.dumps({"Prefer": "respond-async"}),
+            CHRIEK_DISPATCH_TIMEOUT_SECONDS="2.5",
         ),
         Role.API,
     )
@@ -161,11 +173,61 @@ def test_api_role_settings_carry_dispatch_headers(tmp_path):
         "Prefer": "respond-async",
         "Authorization": f"Bearer {PROVIDER_TOKEN}",
     }
+    assert settings.dispatch.timeout_seconds == 2.5
     assert PROVIDER_TOKEN not in repr(settings) and WORKER_TOKEN not in repr(settings)
+    assert Settings.from_env(config_api_env(tmp_path), Role.API).dispatch.timeout_seconds == 30
+
+
+class RecordingStore:
+    """Answers `fail_queued` as if the job were still queued (`queued`) or already claimed."""
+
+    def __init__(self, queued: bool) -> None:
+        self.queued = queued
+        self.errors: list[str] = []
+
+    def fail_queued(self, _job_id: str, error: str, _now: float) -> bool:
+        self.errors.append(error)
+        return self.queued
+
+
+def dispatch_raising(monkeypatch, error: Exception, store: RecordingStore) -> None:
+    class Opener:
+        def open(self, *_args, **_kwargs):
+            raise error
+
+    monkeypatch.setattr(dispatch_module.urllib.request, "build_opener", lambda *_: Opener())
+    settings = Dispatch("https://worker.example/invoke", WORKER_TOKEN, {}, timeout_seconds=2.5)
+    dispatch_module.dispatch(settings, store, "job-1", lambda: 0.0)
 
 
 @pytest.mark.parametrize(
-    "name", ["CHRIEK_DISPATCH_URL", "CHRIEK_DISPATCH_TOKEN", "CHRIEK_WORKER_TOKEN"]
+    "error",
+    [TimeoutError("timed out"), urllib.error.URLError(TimeoutError("timed out"))],
+    ids=["read", "connect-wrapped-by-urllib"],
+)
+def test_dispatch_timeout_is_named_as_such(monkeypatch, error):
+    store = RecordingStore(queued=True)
+    dispatch_raising(monkeypatch, error, store)
+    assert store.errors == [
+        "dispatch failed: the worker endpoint gave no answer within 2.5 seconds"
+    ]
+
+
+@pytest.mark.parametrize("queued", [True, False])
+def test_dispatch_logs_an_error_only_for_a_recorded_failure(monkeypatch, caplog, queued):
+    dispatch_raising(monkeypatch, TimeoutError("timed out"), RecordingStore(queued))
+    errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == (1 if queued else 0)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "CHRIEK_DISPATCH_URL",
+        "CHRIEK_DISPATCH_TOKEN",
+        "CHRIEK_DISPATCH_TIMEOUT_SECONDS",
+        "CHRIEK_WORKER_TOKEN",
+    ],
 )
 def test_home_role_refuses_serverless_settings(tmp_path, name):
     with pytest.raises(ConfigError, match=f"{name} does not apply to chriek serve"):
@@ -178,6 +240,7 @@ def test_home_role_refuses_serverless_settings(tmp_path, name):
         ({"CHRIEK_API_KEYS": f"alice:{ALICE_KEY}"}, "CHRIEK_API_KEYS does not apply"),
         ({"CHRIEK_SIGNING_SECRET": SIGNING_SECRET}, "CHRIEK_SIGNING_SECRET does not apply"),
         ({"CHRIEK_DISPATCH_URL": "https://x.example"}, "CHRIEK_DISPATCH_URL does not apply"),
+        ({"CHRIEK_DISPATCH_TIMEOUT_SECONDS": "30"}, "CHRIEK_DISPATCH_TIMEOUT_SECONDS does not"),
         ({"CHRIEK_DB_PATH": "chriek.db"}, "CHRIEK_DB_PATH does not apply"),
         ({"CHRIEK_WORKER_TOKEN": "short"}, "CHRIEK_WORKER_TOKEN must be at least 32"),
         ({"CHRIEK_DATABASE_URL": None}, "chriek worker requires CHRIEK_DATABASE_URL"),
@@ -242,18 +305,22 @@ def serving(app) -> Iterator[str]:
 
 class Provider:
     """A stand-in provider gateway: records each delivery, then optionally forwards it to the
-    worker, and answers with `status`."""
+    worker (recording its answer), and answers with `status`."""
 
-    def __init__(self, status: int = 202, forward_to: str | None = None) -> None:
+    def __init__(
+        self, status: int = 202, forward_to: str | None = None, delay: float = 0.0
+    ) -> None:
         self.deliveries: list[tuple[dict[str, str], dict]] = []
+        self.worker_answers: list[tuple[int, dict]] = []
         self.app = FastAPI()
 
         @self.app.post("/{path:path}")
         def deliver(request_headers: Request, body: dict) -> Response:
             headers = dict(request_headers.headers)
             self.deliveries.append((headers, body))
+            time.sleep(delay)  # a cold start before the worker sees the job
             if forward_to:
-                invoke(forward_to, body["job_id"])
+                self.worker_answers.append(invoke(forward_to, body["job_id"]))
             return Response(status_code=status)
 
 
@@ -371,6 +438,9 @@ def test_concurrent_deliveries_to_two_workers_claim_once(tmp_path):
         # A restarted API recovers nothing: the running job is a worker's, not its own.
         with api(tmp_path, provider_url) as restarted:
             assert restarted.get(f"/jobs/{job_id}", headers=ALICE).json()["status"] == "running"
+        # Nor does a worker cold-starting during the render.
+        with worker(tmp_path, CountingBackend()):
+            assert client.get(f"/jobs/{job_id}", headers=ALICE).json()["status"] == "running"
         backend.release()
         thread.join(20)
         assert wait_for(client, job_id)["status"] == "succeeded"
@@ -424,6 +494,41 @@ def test_delivery_failure_after_the_worker_ran_keeps_its_result(tmp_path):
     assert job["status"] == "succeeded"
     assert job["error"] is None
     assert backend.renders == 1
+
+
+@needs_services
+@pytest.mark.parametrize(
+    ("timeout", "status", "error", "renders"),
+    [
+        (
+            "0.3",
+            "failed",
+            "dispatch failed: the worker endpoint gave no answer within 0.3 seconds",
+            0,
+        ),
+        ("15", "succeeded", None, 1),
+    ],
+    ids=["deadline-before-claim", "deadline-covers-cold-start-and-render"],
+)
+def test_synchronous_endpoint_with_a_slow_cold_start(tmp_path, timeout, status, error, renders):
+    """A synchronous provider holds the request through a 1 s cold start, then the render."""
+    backend = CountingBackend()
+    with worker(tmp_path, backend) as base:
+        provider = Provider(status=200, forward_to=base, delay=1.0)
+        with (
+            serving(provider.app) as provider_url,
+            api(tmp_path, provider_url, CHRIEK_DISPATCH_TIMEOUT_SECONDS=timeout) as client,
+        ):
+            job_id = submit(client, **SMALL)["id"]
+            job = wait_for(client, job_id)
+            assert (job["status"], job["error"]) == (status, error)
+        # Serving stops only once the delivery reached the worker, also the one that outlived
+        # its deadline: the worker found that job failed and rendered nothing.
+        assert provider.worker_answers == [(200, {"id": job_id, "status": status})]
+        with api(tmp_path, provider_url) as client:
+            job = wait_for(client, job_id)
+    assert (job["status"], job["error"], len(job["images"])) == (status, error, renders)
+    assert backend.renders == renders
 
 
 @needs_services

@@ -47,6 +47,7 @@ SETTING_NAMES = frozenset(
         "CHRIEK_DATABASE_URL",
         "CHRIEK_DB_PATH",
         "CHRIEK_DISPATCH_HEADERS",
+        "CHRIEK_DISPATCH_TIMEOUT_SECONDS",
         "CHRIEK_DISPATCH_TOKEN",
         "CHRIEK_DISPATCH_URL",
         "CHRIEK_HOST",
@@ -77,7 +78,12 @@ SETTING_NAMES = frozenset(
     }
 )
 DISPATCH_NAMES = frozenset(
-    {"CHRIEK_DISPATCH_HEADERS", "CHRIEK_DISPATCH_TOKEN", "CHRIEK_DISPATCH_URL"}
+    {
+        "CHRIEK_DISPATCH_HEADERS",
+        "CHRIEK_DISPATCH_TIMEOUT_SECONDS",
+        "CHRIEK_DISPATCH_TOKEN",
+        "CHRIEK_DISPATCH_URL",
+    }
 )
 # What `chriek worker` reads; it refuses every other setting, so no client API key, signing
 # secret or dispatch credential has to reach the GPU container.
@@ -195,6 +201,7 @@ class Dispatch:
     url: str
     worker_token: str = field(repr=False)
     headers: Mapping[str, str] = field(repr=False)  # extra headers, incl. a provider credential
+    timeout_seconds: float  # connect plus answer; a synchronous endpoint answers after rendering
 
 
 @dataclass(frozen=True)
@@ -346,7 +353,14 @@ def _dispatch(env: Mapping[str, str], other_secrets: set[str]) -> Dispatch:
                 "CHRIEK_DISPATCH_TOKEN must be printable ASCII characters without whitespace"
             )
         headers["Authorization"] = f"Bearer {token}"
-    return Dispatch(url=url, worker_token=worker_token, headers=headers)
+    raw_timeout = env.get("CHRIEK_DISPATCH_TIMEOUT_SECONDS", "30")
+    try:
+        timeout = float(raw_timeout)
+    except ValueError:
+        timeout = 0.0
+    if not 0 < timeout < float("inf"):  # also false for NaN
+        raise ConfigError("CHRIEK_DISPATCH_TIMEOUT_SECONDS must be a finite positive number")
+    return Dispatch(url=url, worker_token=worker_token, headers=headers, timeout_seconds=timeout)
 
 
 def _dispatch_headers(raw: str) -> dict[str, str]:
