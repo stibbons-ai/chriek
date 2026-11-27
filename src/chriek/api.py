@@ -313,7 +313,7 @@ def create_app(
         }
 
     @app.get("/health")
-    def health(response: Response) -> dict[str, str]:
+    async def health(response: Response) -> dict[str, str]:  # no I/O: never waits for a thread
         if worker_stopped():
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
             return {"status": "error", "detail": WORKER_STOPPED}

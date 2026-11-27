@@ -15,6 +15,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,6 +66,9 @@ PROVIDER_TOKEN = "provider-token-SENTINEL-0123456789"
 needs_services = pytest.mark.skipif(
     POSTGRES_URL is None or S3_URL is None,
     reason="serverless roles need CHRIEK_TEST_POSTGRES_URL and CHRIEK_TEST_S3_URL",
+)
+needs_postgres = pytest.mark.skipif(
+    POSTGRES_URL is None, reason="concurrent claims need CHRIEK_TEST_POSTGRES_URL"
 )
 SHARED = {  # configuration-only stand-ins for the shared database and bucket
     "CHRIEK_DATABASE_URL": "postgresql://chriek@db.invalid/chriek",
@@ -122,15 +126,34 @@ def config_api_env(tmp_path: Path, **changes: str) -> dict[str, str]:
         ({}, "CHRIEK_WORKER_TOKEN", "CHRIEK_WORKER_TOKEN must be at least 32"),
         ({"CHRIEK_WORKER_TOKEN": ALICE_KEY}, None, "CHRIEK_WORKER_TOKEN must differ"),
         ({"CHRIEK_WORKER_TOKEN": SIGNING_SECRET}, None, "CHRIEK_WORKER_TOKEN must differ"),
+        ({"CHRIEK_DISPATCH_TOKEN": WORKER_TOKEN}, None, "CHRIEK_WORKER_TOKEN must differ"),
+        *(
+            (
+                {"CHRIEK_DISPATCH_HEADERS": json.dumps({"X-Api-Key": value})},
+                None,
+                "CHRIEK_WORKER_TOKEN must differ",
+            )
+            for value in (WORKER_TOKEN, f"Key {WORKER_TOKEN}")
+        ),
         ({"CHRIEK_BACKEND": "fake"}, None, "CHRIEK_BACKEND does not apply to chriek api"),
         ({"CHRIEK_OFFLOAD": "none"}, None, "CHRIEK_OFFLOAD does not apply to chriek api"),
         ({"CHRIEK_DISPATCH_URL": "ftp://worker.example"}, None, "CHRIEK_DISPATCH_URL must be"),
-        ({"CHRIEK_DISPATCH_HEADERS": "Prefer: respond-async"}, None, "must be a JSON object"),
-        ({"CHRIEK_DISPATCH_HEADERS": '{"Prefer": 1}'}, None, "must be a JSON object"),
-        (
-            {"CHRIEK_DISPATCH_HEADERS": json.dumps({"authorization": PROVIDER_TOKEN})},
-            None,
-            "must not set Authorization",
+        *(
+            ({"CHRIEK_DISPATCH_HEADERS": raw}, None, "must be a JSON object")
+            for raw in ("Prefer: respond-async", '{"Prefer": 1}', "[]", '"x"')
+        ),
+        *(
+            (
+                {"CHRIEK_DISPATCH_HEADERS": json.dumps({name: PROVIDER_TOKEN})},
+                None,
+                "must not set Authorization",
+            )
+            for name in (
+                "authorization",
+                "CONTENT-TYPE",
+                "idempotency-KEY",
+                "x-Chriek-Worker-Token",
+            )
         ),
         (
             {"CHRIEK_DISPATCH_HEADERS": json.dumps({"X-Key": f"{PROVIDER_TOKEN}\r\nX: y"})},
@@ -330,6 +353,7 @@ class Provider:
         gate: threading.Event | None = None,
     ) -> None:
         self.deliveries: list[tuple[dict[str, str], dict]] = []
+        self.arrived = threading.Semaphore(0)  # released once per delivery, before any gate
         self.answered = threading.Event()  # set once a delivery got its answer
         self.worker_answers: list[tuple[int, dict]] = []
         self.app = FastAPI()
@@ -338,6 +362,7 @@ class Provider:
         def deliver(request_headers: Request, body: dict) -> Response:
             headers = dict(request_headers.headers)
             self.deliveries.append((headers, body))
+            self.arrived.release()
             if gate is not None:
                 assert gate.wait(10), "gated delivery never released"
             time.sleep(delay)  # a cold start before the worker sees the job
@@ -474,6 +499,63 @@ def test_concurrent_deliveries_to_two_workers_claim_once(tmp_path):
     assert backend.prompts == ["a lighthouse"]
 
 
+def queued_jobs(store: JobStore, count: int) -> list[str]:
+    return [
+        store.create(
+            owner="alice",
+            prompt="a lighthouse",
+            image_count=1,
+            seed=0,
+            now=1.0,
+            max_queued=count,
+            **SMALL,
+        ).id
+        for _ in range(count)
+    ]
+
+
+@needs_postgres
+def test_simultaneous_claims_of_one_job_on_separate_connections_claim_it_once(tmp_path):
+    """Duplicate deliveries reaching warm workers at once: each claimant is its own store and
+    connection, all released together by a barrier, per job."""
+    url = make_url(base_env(tmp_path)["CHRIEK_DATABASE_URL"])
+    claimants = 4
+    stores = [JobStore(url) for _ in range(claimants)]
+    start = threading.Barrier(claimants, timeout=10)  # a stuck claimant breaks it, not the test
+
+    def claim(store: JobStore, job_id: str) -> bool:
+        start.wait()
+        return store.claim(job_id, 2.0) is not None
+
+    try:
+        job_ids = queued_jobs(stores[0], 50)
+        for store in stores:  # connect before the first race, not during it
+            store.status(job_ids[0])
+        with ThreadPoolExecutor(claimants) as pool:
+            for job_id in job_ids:
+                wins = list(pool.map(claim, stores, [job_id] * claimants))
+                assert wins.count(True) == 1, job_id
+                assert stores[0].status(job_id) == "running"
+    finally:
+        start.abort()
+        for store in stores:
+            store.close()
+
+
+@needs_postgres
+def test_fail_queued_fails_only_a_still_queued_job(tmp_path):
+    store = JobStore(make_url(base_env(tmp_path)["CHRIEK_DATABASE_URL"]))
+    try:
+        queued, claimed = queued_jobs(store, 2)
+        assert store.claim(claimed, 2.0) is not None
+        assert store.fail_queued(queued, "dispatch failed: x", 3.0) is True
+        assert store.fail_queued(queued, "dispatch failed: y", 4.0) is False  # already failed
+        assert store.fail_queued(claimed, "dispatch failed: x", 3.0) is False
+        assert (store.status(queued), store.status(claimed)) == ("failed", "running")
+    finally:
+        store.close()
+
+
 @needs_services
 def test_render_failure_is_recorded_and_returned(tmp_path):
     with worker(tmp_path, FailingBackend(0)) as base:
@@ -489,7 +571,8 @@ def test_render_failure_is_recorded_and_returned(tmp_path):
 
 @needs_services
 @pytest.mark.parametrize("answer", [503, None])
-def test_delivery_failure_fails_the_queued_job_without_secrets(tmp_path, answer):
+def test_delivery_failure_fails_the_queued_job_without_secrets(tmp_path, caplog, answer):
+    caplog.set_level(logging.INFO)
     secret_path = "/hooks/path-token-SENTINEL/invoke"
     if answer is None:  # nothing listens on a port just released
         with socket.socket() as sock:
@@ -507,8 +590,12 @@ def test_delivery_failure_fails_the_queued_job_without_secrets(tmp_path, answer)
         else "dispatch failed: the worker endpoint could not be reached (URLError)"
     )
     assert job["error"] == expected
+    assert job["finished_at"] is not None
+    assert (job["started_at"], job["run"]) == (None, None)  # no worker ever ran it
+    assert f"dispatching job {job['id']} failed" in caplog.text
     for secret in ("SENTINEL", PROVIDER_TOKEN, WORKER_TOKEN):
         assert secret not in json.dumps(job)
+        assert secret not in caplog.text
 
 
 @needs_services
@@ -657,6 +744,32 @@ def test_worker_health_answers_while_invocations_hold_every_thread(tmp_path, mon
             backend.release()
             for thread in threads:
                 thread.join(20)
+
+
+@needs_services
+def test_api_health_answers_while_dispatches_hold_every_thread(tmp_path):
+    gate = threading.Event()
+    provider = Provider(status=202, gate=gate)
+    with serving(provider.app) as provider_url:
+        app = create_app(Settings.from_env(api_env(tmp_path, provider_url), Role.API))
+        with serving(with_thread_tokens(app, 2)) as base:
+            try:
+                for _ in range(2):  # each accepted job's dispatch then holds one of the 2 tokens
+                    request = urllib.request.Request(  # noqa: S310 - loopback test server
+                        f"{base}/jobs",
+                        data=json.dumps({"prompt": "a lighthouse"} | SMALL).encode(),
+                        headers=ALICE | {"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=5) as response:  # noqa: S310
+                        assert response.status == 202
+                for _ in range(2):
+                    assert provider.arrived.acquire(timeout=10), "dispatch never arrived"
+                with urllib.request.urlopen(f"{base}/health", timeout=3) as response:  # noqa: S310
+                    assert (response.status, response.read()) == (200, b'{"status":"ok"}')
+                assert not provider.answered.is_set()  # both dispatches still held their tokens
+            finally:
+                gate.set()
 
 
 def _connection_lost(*_args) -> None:

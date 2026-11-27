@@ -342,18 +342,23 @@ def _dispatch(env: Mapping[str, str], other_secrets: set[str]) -> Dispatch:
         )
     _http_url(url, "CHRIEK_DISPATCH_URL")  # validated, kept verbatim: a trailing / may matter
     worker_token = _worker_token(env)
-    if worker_token in other_secrets:
-        raise ConfigError(
-            "CHRIEK_WORKER_TOKEN must differ from CHRIEK_SIGNING_SECRET and every "
-            "CHRIEK_API_KEYS name and key"
-        )
     headers = _dispatch_headers(env.get("CHRIEK_DISPATCH_HEADERS", "{}"))
     token = env.get("CHRIEK_DISPATCH_TOKEN")
+    if token is not None and (not token or not all("!" <= c <= "~" for c in token)):
+        raise ConfigError(
+            "CHRIEK_DISPATCH_TOKEN must be printable ASCII characters without whitespace"
+        )
+    # Raw values, before "Bearer " is added: the provider credential must never reach the worker.
+    if (
+        worker_token in other_secrets
+        or worker_token == token
+        or any(worker_token in value for value in headers.values())
+    ):
+        raise ConfigError(
+            "CHRIEK_WORKER_TOKEN must differ from CHRIEK_SIGNING_SECRET, every CHRIEK_API_KEYS "
+            "name and key and CHRIEK_DISPATCH_TOKEN, and appear in no CHRIEK_DISPATCH_HEADERS value"
+        )
     if token is not None:
-        if not token or not all("!" <= c <= "~" for c in token):
-            raise ConfigError(
-                "CHRIEK_DISPATCH_TOKEN must be printable ASCII characters without whitespace"
-            )
         headers["Authorization"] = f"Bearer {token}"
     raw_timeout = env.get("CHRIEK_DISPATCH_TIMEOUT_SECONDS", "30")
     try:
