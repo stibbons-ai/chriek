@@ -92,7 +92,9 @@ CUDA and MLX use the same pinned model revision, with different weight layouts. 
 Presets:
 
 - **24 GB card (RTX 3090 class):** `CHRIEK_OFFLOAD=sequential`. Components wait in host RAM (about 20 GB of BF16 weights) and only the running one is on the GPU: the text encoder encodes, leaves the GPU, then the transformer runs. Moving components adds transfer time to every job. This is the preset with VRAM headroom; see the [RTX 3090 results](#rtx-3090-results).
-- **Hosted GPU with at least 48 GB:** `CHRIEK_OFFLOAD=none`. Text encoder, transformer and VAE all stay on the GPU. On a 24 GB card, `none` is not the preset: it ran on a warm RTX 3090 server with one worker, serial jobs, one 1024×1024 output and up to four 1024×1024 references, with little headroom (see the [warm-server results](#rtx-3090-results)). On a dedicated 24 GB server, cap requests with `CHRIEK_MAX_IMAGES=1`, `CHRIEK_MAX_DIMENSION=1024`, `CHRIEK_MAX_PIXELS=1048576` and `CHRIEK_MAX_REFERENCES=4`. These are upper bounds, not validation of the tested 1024×1024 shape.
+- **Hosted GPU with at least 48 GB:** `CHRIEK_OFFLOAD=none`. Text encoder, transformer and VAE all stay on the GPU.
+
+The [owner's dedicated RTX 3090 setup](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7218700646) is an exception, not a 24 GB preset. It uses `none` with one worker running serial jobs, one 1024×1024 output and up to four 1024×1024 references, with little VRAM headroom (see the [warm-server results](#rtx-3090-results)). To cap requests for this setup, set `CHRIEK_MAX_IMAGES=1`, `CHRIEK_MAX_DIMENSION=1024`, `CHRIEK_MAX_PIXELS=1048576` and `CHRIEK_MAX_REFERENCES=4`. These are upper bounds, not validation of the tested 1024×1024 shape.
 
 Host prerequisites: Linux with an NVIDIA driver 580 or newer (the locked PyTorch wheels use CUDA 13), Docker and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) for `--gpus all`. With an older driver or without the toolkit, PyTorch sees no GPU and the CUDA backend stops with `requires an NVIDIA GPU visible to PyTorch`.
 
@@ -106,7 +108,7 @@ uvx --from 'huggingface-hub==2.4.0' hf download black-forest-labs/flux-3-image-k
   --include 'text_encoder/*' --include LICENSE.md --include NOTICE.md
 ```
 
-Build the image from a checkout; the build installs the `cuda` extra from `uv.lock` and the runtime image contains only the Python environment, no source checkout, `uv`, weights or tokens. The image runs offline (`HF_HUB_OFFLINE=1`) and reads the model cache from a read-only `/hf/hub` mount. Mount only `$HF_HOME/hub`, never all of `$HF_HOME`: that also holds your Hugging Face token (`hf auth login` writes `$HF_HOME/token`). The commands run as your own user (`--user`), which can read the cache and write the mounted output directory. They assume your user can reach the Docker socket; membership in the `docker` group is root-equivalent on that host, so grant it only to users you would give root:
+Build the image from a clean checkout. Untracked Python files under `src/` are build inputs. The build installs the `cuda` extra from `uv.lock` and the runtime image contains only the Python environment, no source checkout, `uv`, weights or tokens. The image runs offline (`HF_HUB_OFFLINE=1`) and reads the model cache from a read-only `/hf/hub` mount. Mount only `$HF_HOME/hub`, never all of `$HF_HOME`: that also holds your Hugging Face token (`hf auth login` writes `$HF_HOME/token`). The commands run as your own user (`--user`), which can read the cache and write the mounted output directory. They assume your user can reach the Docker socket; membership in the `docker` group is root-equivalent on that host, so grant it only to users you would give root:
 
 ```sh
 docker build -t chriek:cuda .
