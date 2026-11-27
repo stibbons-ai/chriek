@@ -5,7 +5,6 @@ import json
 import logging
 import re
 import secrets
-import shutil
 import struct
 import time
 import uuid
@@ -34,8 +33,9 @@ from starlette.types import Message
 from chriek.auth import Authenticate, authenticator
 from chriek.backend import ImageBackend, create_backend
 from chriek.config import AuthMode, Limits, Settings
+from chriek.images import LocalImages, S3Images, image_path, open_images
 from chriek.signing import UrlSigner
-from chriek.storage import check_database, private_image_root
+from chriek.storage import check_database
 from chriek.store import (
     MEMORY_DATABASE,
     RUNNING,
@@ -44,7 +44,7 @@ from chriek.store import (
     Job,
     JobStore,
 )
-from chriek.worker import Worker, image_path, write_references
+from chriek.worker import Worker
 
 log = logging.getLogger(__name__)
 MAX_SEED = 2**32 - 1
@@ -198,15 +198,15 @@ def create_app(
     if backend is None:
         backend = create_backend(settings.backend)
     # Both storage sides are checked before either is created: the database side here without
-    # creating anything, then the image side by private_image_root. JobStore and Worker check
-    # their own side again, so they stay safe when used without the app. A Postgres URL has no
-    # local database side.
+    # creating anything, then the image side by open_images (a local directory is checked and
+    # created, a bucket must exist). JobStore checks its own side again, so it stays safe when
+    # used without the app. A Postgres URL has no local database side.
     if isinstance(settings.database, Path) and str(settings.database) != MEMORY_DATABASE:
         check_database(settings.database)
-    storage_dir = private_image_root(settings.storage_dir)
+    images = open_images(settings.storage, settings.url_ttl_seconds)
     store = JobStore(settings.database)
     try:
-        worker = Worker(store, backend, storage_dir, clock, settings.job_timeout_seconds)
+        worker = Worker(store, backend, images, clock, settings.job_timeout_seconds)
     except BaseException:
         store.close()
         raise
@@ -250,18 +250,24 @@ def create_app(
             media_type="application/json",
         )
 
+    def image_link(job_id: str, index: int) -> tuple[str, int]:
+        if isinstance(images, S3Images):
+            return images.presigned_url(job_id, index)  # direct from the bucket, never via chriek
+        expires = int(clock()) + settings.url_ttl_seconds
+        signature = signer.sign(uuid.UUID(job_id), index, expires)
+        url = f"{settings.public_url}/images/{job_id}/{index}.png?expires={expires}&sig={signature}"
+        return url, expires
+
     def job_body(job: Job) -> dict[str, Any]:
-        images = []
+        links = []
         if job.status == SUCCEEDED:
-            expires = int(clock()) + settings.url_ttl_seconds
             for image in job.images:
-                signature = signer.sign(uuid.UUID(job.id), image.index, expires)
-                images.append(
+                url, expires = image_link(job.id, image.index)
+                links.append(
                     {
                         "index": image.index,
                         "seed": image.seed,
-                        "url": f"{settings.public_url}/images/{job.id}/{image.index}.png"
-                        f"?expires={expires}&sig={signature}",
+                        "url": url,
                         "expires_at": _iso(expires),
                     }
                 )
@@ -281,7 +287,7 @@ def create_app(
             "finished_at": _iso(job.finished_at),
             "error": job.error,
             "run": job.run_record,
-            "images": images,
+            "images": links,
         }
 
     @app.get("/health")
@@ -305,7 +311,7 @@ def create_app(
                 seed = secrets.randbelow(MAX_SEED - body.image_count + 2)
             job_id = str(uuid.uuid7())
             try:
-                write_references(storage_dir, job_id, references)
+                images.put_references(job_id, references)
                 job = store.create(
                     job_id=job_id,
                     owner=owner,
@@ -328,7 +334,7 @@ def create_app(
                 # The job may be committed: keep its references, at worst as an orphan.
                 raise
             except BaseException:
-                shutil.rmtree(storage_dir / job_id, onexc=_log_cleanup_error)
+                images.remove_submission(job_id, len(references))
                 raise
             worker.notify()
             return job
@@ -357,23 +363,29 @@ def create_app(
                 job = store.get(owner, job.id)
         return job_body(job)
 
-    @app.get("/images/{job_id}/{index}.png")
-    def download_image(job_id: str, index: str, expires: str = "", sig: str = "") -> FileResponse:
-        job_uuid = _parse_uuid(job_id)
-        if job_uuid is None or not INDEX_PATTERN.fullmatch(index):
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "image not found")
-        image_index = int(index)
-        valid = EXPIRES_PATTERN.fullmatch(expires) and signer.verify(
-            job_uuid, image_index, int(expires), sig
-        )
-        if not valid:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid signature")
-        if clock() >= int(expires):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "link expired; poll the job again")
-        path = image_path(storage_dir, job_uuid, image_index)
-        if not store.is_published(str(job_uuid), image_index) or not path.is_file():
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "image not found")
-        return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
+    # S3 links point at the bucket: chriek serves image bytes only from local storage.
+    if isinstance(images, LocalImages):
+        root = images.root
+
+        @app.get("/images/{job_id}/{index}.png")
+        def download_image(
+            job_id: str, index: str, expires: str = "", sig: str = ""
+        ) -> FileResponse:
+            job_uuid = _parse_uuid(job_id)
+            if job_uuid is None or not INDEX_PATTERN.fullmatch(index):
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "image not found")
+            image_index = int(index)
+            valid = EXPIRES_PATTERN.fullmatch(expires) and signer.verify(
+                job_uuid, image_index, int(expires), sig
+            )
+            if not valid:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid signature")
+            if clock() >= int(expires):
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "link expired; poll the job again")
+            path = image_path(root, str(job_uuid), image_index)
+            if not store.is_published(str(job_uuid), image_index) or not path.is_file():
+                raise HTTPException(status.HTTP_404_NOT_FOUND, "image not found")
+            return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     app.include_router(jobs)
     return app
@@ -1034,11 +1046,6 @@ def _check_webp_structure(data: bytes) -> None:
             if exif > MAX_EXIF_BYTES:
                 raise _ExifTooLarge
         pos += 8 + size + (size & 1)  # chunks are padded to even sizes
-
-
-def _log_cleanup_error(_function: Callable[..., Any], path: str, exc: BaseException) -> None:
-    if not isinstance(exc, FileNotFoundError):
-        log.error("could not remove %s after a failed submission", path, exc_info=exc)
 
 
 def _validation_error(

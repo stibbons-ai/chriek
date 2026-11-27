@@ -44,6 +44,7 @@ CLIENT_HEADERS = [
 ]
 
 
+@pytest.mark.local_storage
 def test_every_client_shares_one_owner_and_signed_downloads_still_apply(tmp_path):
     with running(tmp_path, env_base=proxy_env) as client:
         jobs = [submit(client, headers=headers, **SMALL) for headers in CLIENT_HEADERS]
@@ -76,6 +77,7 @@ def test_every_client_shares_one_owner_and_signed_downloads_still_apply(tmp_path
         ("localhost, [::1]", "[::1]"),
     ],
 )
+@pytest.mark.local_storage
 def test_proxy_mode_accepts_allowed_hosts(tmp_path, allowed, host):
     with running(tmp_path, env_base=proxy_env, CHRIEK_ALLOWED_HOSTS=allowed) as client:
         job = submit(client, headers={"Host": host}, **SMALL)
