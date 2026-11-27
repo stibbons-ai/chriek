@@ -5,18 +5,30 @@ set -eu
 image=${1:-chriek-image-check}
 cd "$(dirname "$0")/.."
 
+# Top-level staging paths; the decoys are written only inside paths this run created.
+staging="chriek-decoy.env chriek-decoy-hf chriek-decoy-weights src/chriek/chriek-decoy.env src/chriek/chriek_decoy"
 decoys="chriek-decoy.env chriek-decoy-hf/token chriek-decoy-weights/model.safetensors
 src/chriek/chriek-decoy.env src/chriek/chriek_decoy/model.safetensors"
-for decoy in $decoys; do
-    if [ -e "$decoy" ]; then
-        echo "refusing to overwrite existing $decoy" >&2
-        exit 1
+collision=0
+for path in $staging; do
+    # -L also catches symlinks, including dangling ones that -e misses.
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        echo "refusing to overwrite existing $path" >&2
+        collision=1
     fi
 done
-trap 'for decoy in $decoys; do rm -f "$decoy"; done; rmdir chriek-decoy-hf chriek-decoy-weights src/chriek/chriek_decoy 2>/dev/null || true' EXIT
+[ "$collision" = 0 ] || exit 1
+created=""
+trap 'for path in $created; do rm -rf "$path"; done' EXIT
+# noclobber: never write through a path that appeared after the check above.
+set -C
+for dir in chriek-decoy-hf chriek-decoy-weights src/chriek/chriek_decoy; do
+    mkdir "$dir"
+    created="$created $dir"
+done
 for decoy in $decoys; do
-    mkdir -p "$(dirname "$decoy")"
     echo "chriek decoy, not a secret" >"$decoy"
+    created="$created $decoy"
 done
 
 docker build -t "$image" .
