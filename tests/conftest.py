@@ -4,6 +4,11 @@ storage privacy must hold without the CLI (see README.md).
 
 Every test runs on SQLite unless CHRIEK_TEST_POSTGRES_URL names a disposable Postgres server;
 then each test not marked `sqlite` gets its own fresh database there, dropped afterwards.
+
+Images go to a local directory unless CHRIEK_TEST_S3_URL
+(`http://ACCESS_KEY:SECRET@host:port/bucket`) names an existing S3-compatible service; then each
+test not marked `local_storage` stores below its own key prefix in that bucket (created if
+missing), and only that prefix is emptied afterwards.
 """
 
 import io
@@ -11,13 +16,19 @@ import os
 import stat
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from functools import cache
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit
 
+import boto3
 import pytest
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 from PIL import Image
 from sqlalchemy import URL, Connection, Engine, create_engine, make_url, text
@@ -27,6 +38,8 @@ from chriek.backend import FakeBackend
 from chriek.config import Settings
 
 POSTGRES_URL = os.environ.get("CHRIEK_TEST_POSTGRES_URL")
+S3_URL = os.environ.get("CHRIEK_TEST_S3_URL")
+S3_BUCKET = urlsplit(S3_URL).path.strip("/") if S3_URL else None
 
 ALICE_KEY = "alice-key-0123456789abcdefghijklmnopqrstuvwxyz"
 BOB_KEY = "bob-key-0123456789abcdefghijklmnopqrstuvwxyz"
@@ -43,6 +56,7 @@ SMALL = {"width": 16, "height": 16}  # cheapest valid image size
 
 
 _postgres_database_url: str | None = None  # the running test's own Postgres database
+_s3_prefix: str | None = None  # the running test's own key prefix in the S3 test bucket
 
 
 def base_env(tmp_path: Path) -> dict[str, str]:
@@ -57,11 +71,116 @@ def base_env(tmp_path: Path) -> dict[str, str]:
     if _postgres_database_url:
         # CHRIEK_DB_PATH stays set: the URL must take precedence over it.
         env["CHRIEK_DATABASE_URL"] = _postgres_database_url
+    if _s3_prefix:
+        del env["CHRIEK_STORAGE_DIR"]
+        env |= s3_env(_s3_prefix)
     return env
 
 
-def pytest_report_header() -> str:
-    return f"chriek test database: {'SQLite' if POSTGRES_URL is None else 'Postgres'}"
+def s3_env(prefix: str) -> dict[str, str]:
+    """CHRIEK_* settings for the S3 test service, storing below `prefix`."""
+    parts = urlsplit(S3_URL)
+    return {
+        "CHRIEK_STORAGE": "s3",
+        "CHRIEK_S3_ENDPOINT_URL": f"{parts.scheme}://{parts.hostname}:{parts.port}",
+        "CHRIEK_S3_BUCKET": S3_BUCKET,
+        "CHRIEK_S3_PREFIX": prefix,
+        "CHRIEK_S3_ACCESS_KEY_ID": parts.username,
+        "CHRIEK_S3_SECRET_ACCESS_KEY": parts.password,
+    }
+
+
+def pytest_report_header() -> list[str]:
+    return [
+        f"chriek test database: {'SQLite' if POSTGRES_URL is None else 'Postgres'}",
+        f"chriek test image storage: {'local' if S3_URL is None else 'S3'}",
+    ]
+
+
+@cache
+def _s3():
+    env = s3_env("")
+    client = boto3.client(
+        "s3",
+        endpoint_url=env["CHRIEK_S3_ENDPOINT_URL"],
+        region_name="us-east-1",
+        aws_access_key_id=env["CHRIEK_S3_ACCESS_KEY_ID"],
+        aws_secret_access_key=env["CHRIEK_S3_SECRET_ACCESS_KEY"],
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
+    )
+    ensure_bucket(client, S3_BUCKET)
+    return client
+
+
+def ensure_bucket(client, bucket: str) -> None:
+    """Create `bucket` only when it is missing; any other error (403, outage) propagates."""
+    try:
+        client.head_bucket(Bucket=bucket)
+    except ClientError as error:
+        if error.response["Error"]["Code"] not in ("404", "NoSuchBucket"):
+            raise
+        client.create_bucket(Bucket=bucket)
+
+
+@pytest.fixture
+def s3_client():
+    return _s3()
+
+
+def s3_keys(client, prefix: str) -> list[str]:
+    """Every key below `prefix/`, relative to it, sorted."""
+    pages = client.get_paginator("list_objects_v2").paginate(Bucket=S3_BUCKET, Prefix=f"{prefix}/")
+    items = (item for page in pages for item in page.get("Contents", []))
+    return sorted(item["Key"].removeprefix(f"{prefix}/") for item in items)
+
+
+def stored_images(tmp_path: Path) -> list[str]:
+    """What this test stored in image storage, relative to its root: local files and
+    directories below `tmp_path/images`, or the objects below this test's S3 prefix."""
+    if _s3_prefix:
+        return s3_keys(_s3(), _s3_prefix)
+    root = tmp_path / "images"
+    return sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+
+
+def read_stored(tmp_path: Path, name: str) -> bytes:
+    """One stored image by its name relative to the storage root, such as `<id>/0.png`."""
+    if _s3_prefix:
+        return _s3().get_object(Bucket=S3_BUCKET, Key=f"{_s3_prefix}/{name}")["Body"].read()
+    return (tmp_path / "images" / name).read_bytes()
+
+
+def fetch(url: str) -> tuple[int, bytes]:
+    """A real HTTP GET: status and body, also for error statuses."""
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 - test URLs
+            return response.status, response.read()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read()
+
+
+def download(client: TestClient, url: str) -> tuple[int, bytes]:
+    """GET a download URL: chriek's own route through the test client, an S3 link directly."""
+    if url.startswith(f"{client.base_url}/"):
+        response = client.get(url)
+        return response.status_code, response.content
+    return fetch(url)
+
+
+@pytest.fixture(autouse=True)
+def storage(request: pytest.FixtureRequest) -> Iterator[str | None]:
+    """This test's own S3 key prefix, or None with local image storage."""
+    global _s3_prefix
+    if S3_URL is None or request.node.get_closest_marker("local_storage"):
+        yield None
+        return
+    prefix = f"chriek-test/{uuid.uuid4().hex}"  # only this prefix's objects get deleted
+    _s3()  # creates the test bucket before the first app checks it
+    _s3_prefix = prefix
+    yield prefix
+    _s3_prefix = None
+    for key in s3_keys(_s3(), prefix):
+        _s3().delete_object(Bucket=S3_BUCKET, Key=f"{prefix}/{key}")
 
 
 @pytest.fixture(scope="session")

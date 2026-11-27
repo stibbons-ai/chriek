@@ -265,6 +265,7 @@ def test_smoke_prints_mlx_job_metrics(
 
 
 @pytest.mark.parametrize("counter_failure", ["reset", "read"])
+@pytest.mark.local_storage
 def test_peak_counter_failure_does_not_discard_images(inference, tmp_path, caplog, counter_failure):
     backend = mlx_backend.MlxBackend()
     with running(tmp_path, backend=backend) as client:

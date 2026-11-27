@@ -323,6 +323,7 @@ def _assert_no_backend_details(text: str) -> None:
         assert leak not in text
 
 
+@pytest.mark.local_storage
 def test_any_image_failure_fails_the_whole_job_without_images_or_details(tmp_path, caplog):
     backend = FailingBackend(fail_index=1)  # image 1 renders, image 2 raises
     with running(tmp_path, backend=backend) as client:
