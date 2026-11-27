@@ -6,6 +6,7 @@ import logging
 import re
 import secrets
 import struct
+import threading
 import time
 import uuid
 import zlib
@@ -15,7 +16,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    Response,
+    status,
+)
 from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
@@ -30,14 +40,16 @@ from sqlalchemy.exc import OperationalError
 from starlette.requests import ClientDisconnect
 from starlette.types import Message
 
-from chriek.auth import Authenticate, authenticator
+from chriek.auth import Authenticate, authenticator, worker_authenticator
 from chriek.backend import ImageBackend, create_backend
-from chriek.config import AuthMode, Limits, Settings
+from chriek.config import AuthMode, Dispatch, Limits, Settings, WorkerSettings
+from chriek.dispatch import dispatch
 from chriek.images import LocalImages, S3Images, image_path, open_images
 from chriek.signing import UrlSigner
 from chriek.storage import check_database
 from chriek.store import (
     MEMORY_DATABASE,
+    QUEUED,
     RUNNING,
     SUCCEEDED,
     CommitOutcomeUnknown,
@@ -194,8 +206,11 @@ def create_app(
     backend: ImageBackend | None = None,
     clock: Callable[[], float] = time.time,
 ) -> FastAPI:
-    """Build the home-mode app. `backend` and `clock` are test seams; `chriek serve` omits them."""
-    if backend is None:
+    """Build the home-mode app (`chriek serve`), or the serverless API (`chriek api`) when
+    `settings.dispatch` is set. The serverless API constructs no model, runs no worker and
+    recovers no running jobs: on the shared database those belong to workers elsewhere.
+    `backend` and `clock` are test seams; the commands omit them."""
+    if backend is None and settings.dispatch is None:
         backend = create_backend(settings.backend)
     # Both storage sides are checked before either is created: the database side here without
     # creating anything, then the image side by open_images (a local directory is checked and
@@ -205,23 +220,30 @@ def create_app(
         check_database(settings.database)
     images = open_images(settings.storage, settings.url_ttl_seconds)
     store = JobStore(settings.database)
-    try:
-        worker = Worker(store, backend, images, clock, settings.job_timeout_seconds)
-    except BaseException:
-        store.close()
-        raise
+    worker = None
+    if settings.dispatch is None:
+        try:
+            worker = Worker(store, backend, images, clock, settings.job_timeout_seconds)
+        except BaseException:
+            store.close()
+            raise
     signer = UrlSigner(settings.signing_secret)
     jobs = APIRouter(
         route_class=_authenticated_route(authenticator(settings.auth_mode, settings.api_keys))
     )
     Owner = Annotated[str, Depends(_owner)]
 
+    def worker_stopped() -> bool:
+        return worker is not None and worker.stopped_on_error
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        store.fail_interrupted(clock())
-        worker.start()
+        if worker is not None:
+            store.fail_interrupted(clock())
+            worker.start()
         yield
-        worker.stop(WORKER_STOP_TIMEOUT_SECONDS)
+        if worker is not None:
+            worker.stop(WORKER_STOP_TIMEOUT_SECONDS)
         store.close()
 
     app = FastAPI(title="chriek", lifespan=lifespan)
@@ -242,13 +264,7 @@ def create_app(
 
     app.openapi = custom_openapi  # type: ignore[method-assign]
 
-    @app.exception_handler(RequestValidationError)
-    async def validation_error(_request: Request, exc: RequestValidationError) -> Response:
-        return Response(
-            _error_detail(exc.errors()),
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            media_type="application/json",
-        )
+    app.exception_handler(RequestValidationError)(_unprocessable)
 
     def image_link(job_id: str, index: int) -> tuple[str, int]:
         if isinstance(images, S3Images):
@@ -291,20 +307,22 @@ def create_app(
         }
 
     @app.get("/health")
-    def health(response: Response) -> dict[str, str]:
-        if worker.stopped_on_error:
+    async def health(response: Response) -> dict[str, str]:  # no I/O: never waits for a thread
+        if worker_stopped():
             response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
             return {"status": "error", "detail": WORKER_STOPPED}
         return {"status": "ok"}
 
     @jobs.post("/jobs", status_code=status.HTTP_202_ACCEPTED, openapi_extra=_JOBS_POST_OPENAPI)
-    async def submit_job(owner: Owner, request: Request, response: Response) -> dict[str, Any]:
+    async def submit_job(
+        owner: Owner, request: Request, response: Response, background: BackgroundTasks
+    ) -> dict[str, Any]:
         complete_submission = await _stream_submission(request, settings.limits)
 
         def decode_and_persist() -> Job:
             body, references = complete_submission()
             # Observed-state check only: a result write failing after this point still admits.
-            if worker.stopped_on_error:
+            if worker_stopped():
                 raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, WORKER_STOPPED)
             seed = body.seed
             if seed is None:
@@ -332,14 +350,23 @@ def create_app(
                     )
             except CommitOutcomeUnknown:
                 # The job may be committed: keep its references, at worst as an orphan.
+                if settings.dispatch is not None:
+                    # No later step would deliver a committed job; the error still stands.
+                    _dispatch_if_queued(settings.dispatch, store, job_id, clock)
                 raise
             except BaseException:
                 images.remove_submission(job_id, len(references))
                 raise
-            worker.notify()
+            if worker is not None:
+                worker.notify()
             return job
 
         job = await run_in_threadpool(decode_and_persist)
+        if settings.dispatch is not None:
+            # Only now, with the job and its references committed, may a worker hear of it.
+            # After the response: delivery never delays or changes the 202, but it holds a
+            # shared threadpool thread until the endpoint answers or the dispatch timeout.
+            background.add_task(dispatch, settings.dispatch, store, job.id, clock)
         response.headers["Location"] = f"/jobs/{job.id}"
         return job_body(job)
 
@@ -388,6 +415,85 @@ def create_app(
             return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
 
     app.include_router(jobs)
+    return app
+
+
+def _dispatch_if_queued(
+    settings: Dispatch, store: JobStore, job_id: str, clock: Callable[[], float]
+) -> None:
+    """Deliver a job whose COMMIT outcome is unknown, if a fresh read finds it queued.
+    Best effort: the caller re-raises the original submission error whatever happens here."""
+    try:
+        if store.status(job_id) == QUEUED:
+            dispatch(settings, store, job_id, clock)
+    except Exception:
+        log.exception("could not verify or dispatch job %s after an unknown commit", job_id)
+
+
+class Invocation(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    job_id: str
+
+
+def create_worker_app(
+    settings: WorkerSettings,
+    *,
+    backend: ImageBackend | None = None,
+    clock: Callable[[], float] = time.time,
+) -> FastAPI:
+    """Build `chriek worker`: each `POST /invoke` runs the one queued job it names, from the
+    shared database and bucket, and answers with the job's status. `backend` and `clock` are
+    test seams; the command omits them."""
+    if backend is None:
+        backend = create_backend(settings.backend)
+    images = open_images(settings.storage, 1)  # the worker presigns no download links
+    store = JobStore(settings.database)
+    worker = Worker(store, backend, images, clock, settings.job_timeout_seconds)
+    # One render at a time per process: a second invocation waits, then reports the state its
+    # job reached, so a duplicate delivery returns the first delivery's outcome.
+    rendering = threading.Lock()
+    invocations = APIRouter(
+        route_class=_authenticated_route(worker_authenticator(settings.worker_token))
+    )
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        # No startup recovery: other workers' running jobs share this database.
+        yield
+        store.close()
+
+    app = FastAPI(title="chriek worker", lifespan=lifespan)
+    app.exception_handler(RequestValidationError)(_unprocessable)
+
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        # async: waiting invocations can hold every threadpool token; a sync probe would starve.
+        return {"status": "ok"}
+
+    @invocations.post("/invoke")
+    def invoke(invocation: Invocation) -> dict[str, str]:
+        job_uuid = _parse_uuid(invocation.job_id)
+        if job_uuid is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+        job_id = str(job_uuid)
+        with rendering:
+            # Only a queued job is claimed: duplicates and failed dispatches render nothing.
+            job = store.claim(job_id, clock())
+            if job is not None:
+                try:
+                    worker.run(job)
+                except Exception:
+                    log.exception("could not record the result of job %s", job_id)
+                    raise HTTPException(
+                        status.HTTP_500_INTERNAL_SERVER_ERROR, "job result could not be saved"
+                    ) from None
+            job_status = store.status(job_id)
+        if job_status is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+        return {"id": job_id, "status": job_status}
+
+    app.include_router(invocations)
     return app
 
 
@@ -1069,6 +1175,14 @@ def _is_utf8(text: str) -> bool:
     except UnicodeEncodeError:
         return False
     return True
+
+
+async def _unprocessable(_request: Request, exc: RequestValidationError) -> Response:
+    return Response(
+        _error_detail(exc.errors()),
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        media_type="application/json",
+    )
 
 
 def _error_detail(errors: Sequence[Any]) -> bytes:

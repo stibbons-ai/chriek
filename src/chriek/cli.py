@@ -15,9 +15,18 @@ from PIL import Image
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import SQLAlchemyError
 
-from chriek.api import create_app
+from chriek.api import create_app, create_worker_app
 from chriek.backend import JobMetrics, create_backend, run_record
-from chriek.config import AuthMode, BackendSettings, ConfigError, Limits, Settings
+from chriek.config import (
+    WORKER_TOKEN_HEADER,
+    AuthMode,
+    BackendSettings,
+    ConfigError,
+    Limits,
+    Role,
+    Settings,
+    WorkerSettings,
+)
 from chriek.png import encode_png
 from chriek.storage import StorageError
 
@@ -27,6 +36,13 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser(
         "serve", help="Run the API and the in-process worker (home mode). Configured via CHRIEK_*."
+    )
+    commands.add_parser(
+        "api",
+        help="Run the serverless API: queue jobs and dispatch each to the worker endpoint.",
+    )
+    commands.add_parser(
+        "worker", help="Run the serverless worker: one dispatched job per HTTP invocation."
     )
     smoke = commands.add_parser("smoke", help="Render one PNG locally, without starting a server.")
     smoke.add_argument("--out", required=True, type=Path)
@@ -50,16 +66,22 @@ def main(argv: list[str] | None = None) -> int:
             if not 0 <= args.seed < 2**32:
                 smoke.error("--seed must be between 0 and 4294967295")
             return _smoke(args)
-        return _serve(Settings.from_env(os.environ))
+        if args.command == "worker":
+            return _serve(WorkerSettings.from_env(os.environ))
+        role = Role.API if args.command == "api" else Role.HOME
+        return _serve(Settings.from_env(os.environ, role))
     except ConfigError as error:
         print(f"chriek: configuration error: {error}", file=sys.stderr)
         return 2
 
 
-def _serve(settings: Settings) -> int:
+def _serve(settings: Settings | WorkerSettings) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     try:
-        app = create_app(settings)
+        if isinstance(settings, WorkerSettings):
+            app = create_worker_app(settings)
+        else:
+            app = create_app(settings)
     except StorageError as error:
         print(f"chriek: storage error: {error}", file=sys.stderr)
         return 2
@@ -69,7 +91,9 @@ def _serve(settings: Settings) -> int:
         )
         return 1
     log = logging.getLogger("chriek")
-    if settings.auth_mode is AuthMode.PROXY:
+    if isinstance(settings, WorkerSettings):
+        log.info("worker: POST /invoke requires the %s header", WORKER_TOKEN_HEADER)
+    elif settings.auth_mode is AuthMode.PROXY:
         log.warning(
             "auth mode proxy: no application authentication; every client that reaches this "
             "port shares one owner (allowed Host names: %s)",
