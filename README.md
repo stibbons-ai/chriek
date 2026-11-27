@@ -87,16 +87,16 @@ To serve MLX jobs, also set the server settings from [Install and run](#install-
 
 ### NVIDIA GPUs (CUDA, Docker)
 
-The CUDA backend runs the same pinned BF16 checkpoint with diffusers' FLUX 3 Image Klein modular pipeline (`Flux3DistilledAutoBlocks`, 16 steps, no guidance), without its prompt-upsampler step: prompts are used as given, as on MLX. It never downloads: it loads only the pinned revision from the Hugging Face cache, and fails the render with `… is not in the Hugging Face cache` if the snapshot is missing. The model stays loaded between jobs.
+CUDA and MLX use the same pinned model revision, with different weight layouts. CUDA loads the diffusers-format BF16 weights through the FLUX 3 Image Klein modular pipeline (`Flux3DistilledAutoBlocks`, 16 steps, no guidance), without its prompt-upsampler step. It loads only from the Hugging Face cache and never downloads. If the snapshot or a required component is missing, the render fails. The pipeline stays loaded between jobs.
 
 Presets:
 
 - **24 GB card (RTX 3090 class):** `CHRIEK_OFFLOAD=sequential`. Components wait in host RAM (about 20 GB of BF16 weights) and only the running one is on the GPU: the text encoder encodes, leaves the GPU, then the transformer runs. Moving components adds transfer time to every job. This is the preset with VRAM headroom; see the [RTX 3090 results](#rtx-3090-results).
-- **Hosted GPU with at least 48 GB:** `CHRIEK_OFFLOAD=none`. Text encoder, transformer and VAE all stay on the GPU. On a 24 GB card, `none` is not the preset: it ran on a warm RTX 3090 server with one worker, serial jobs and up to four 1024×1024 references, with little headroom (see the [warm-server results](#rtx-3090-results)). Stay within that tested envelope if you run it there.
+- **Hosted GPU with at least 48 GB:** `CHRIEK_OFFLOAD=none`. Text encoder, transformer and VAE all stay on the GPU. On a 24 GB card, `none` is not the preset: it ran on a warm RTX 3090 server with one worker, serial jobs, one 1024×1024 output and up to four 1024×1024 references, with little headroom (see the [warm-server results](#rtx-3090-results)). On a dedicated 24 GB server, cap requests with `CHRIEK_MAX_IMAGES=1`, `CHRIEK_MAX_DIMENSION=1024`, `CHRIEK_MAX_PIXELS=1048576` and `CHRIEK_MAX_REFERENCES=4`. These are upper bounds, not validation of the tested 1024×1024 shape.
 
 Host prerequisites: Linux with an NVIDIA driver 580 or newer (the locked PyTorch wheels use CUDA 13), Docker and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) for `--gpus all`. With an older driver or without the toolkit, PyTorch sees no GPU and the CUDA backend stops with `requires an NVIDIA GPU visible to PyTorch`.
 
-Download the weights once on the host, with your own Hugging Face account after accepting the [model license](https://huggingface.co/black-forest-labs/flux-3-image-klein); export your `HF_TOKEN` from your secret store or run `hf auth login` first. About 20 GB, diffusers layout only; the backend loads only these files and, using the file list `hf download` caches, rejects a snapshot missing any of them, so download them all (`--include` takes one pattern each):
+Download the weights once on the host, with your own Hugging Face account after accepting the [model license](https://huggingface.co/black-forest-labs/flux-3-image-klein); export your `HF_TOKEN` from your secret store or run `hf auth login` first. This downloads the diffusers layout (about 20 GB) and the license files, not the entire repository. `--include` takes one pattern each:
 
 ```sh
 export HF_HOME="$HOME/.cache/huggingface"
@@ -129,7 +129,7 @@ docker run -d --gpus all --user "$(id -u):$(id -g)" -p 127.0.0.1:8000:8000 \
   -e CHRIEK_PUBLIC_URL=http://127.0.0.1:8000 chriek:cuda
 ```
 
-Without socket access, prefix only the `docker` commands with `sudo`. Run `mkdir` as yourself, without `sudo`: the container runs as your user and can't write to directories owned by root. Your shell expands `$(id -u)`, `$HF_HOME` and `$PWD` before `sudo` runs, so they still name your user and paths. For serving, `sudo` drops exported variables by default, so the container would get neither secret and `chriek serve` would stop at startup; preserve them by name. With `CHRIEK_STORAGE=s3`, also add `CHRIEK_S3_ACCESS_KEY_ID` and `CHRIEK_S3_SECRET_ACCESS_KEY` to `--preserve-env` and as name-only `-e` options:
+Without socket access, prefix only the `docker` commands with `sudo`. Run `mkdir` as yourself, without `sudo`: the container runs as your user and can't write to directories owned by root. Your shell expands `$(id -u)`, `$HF_HOME` and `$PWD` before `sudo` runs, so they still name your user and paths. For serving, `sudo` drops exported variables by default, so the container would get neither secret and `chriek serve` would stop at startup; preserve them by name:
 
 ```sh
 sudo --preserve-env=CHRIEK_API_KEYS,CHRIEK_SIGNING_SECRET docker run -d --gpus all \
@@ -139,6 +139,8 @@ sudo --preserve-env=CHRIEK_API_KEYS,CHRIEK_SIGNING_SECRET docker run -d --gpus a
   -e CHRIEK_OFFLOAD=sequential -e CHRIEK_API_KEYS -e CHRIEK_SIGNING_SECRET \
   -e CHRIEK_PUBLIC_URL=http://127.0.0.1:8000 chriek:cuda
 ```
+
+For [S3 storage](#s3-storage) with either Docker command, replace `-e CHRIEK_STORAGE_DIR=/data/images` with `-e CHRIEK_STORAGE=s3` and pass `CHRIEK_S3_BUCKET` and any other non-secret S3 settings as `-e` options. Export the S3 credentials and forward them by name with `-e CHRIEK_S3_ACCESS_KEY_ID -e CHRIEK_S3_SECRET_ACCESS_KEY`. With `sudo`, also add both names to `--preserve-env`.
 
 ### Smoke test
 
@@ -197,7 +199,7 @@ Observed device usage peaked at about 16 GB with `sequential` and at 23,122 MiB 
 | 3 | 13,175.3 | 21,863.4 | 73.779 | 63.289 |
 | 4 | 13,810.6 | 22,498.4 | 96.041 | 86.252 |
 
-A separate three-reference cold/warm pair also passed in both modes (first load 0.891 s `sequential`, 4.651 s `none`; warm load 0.0 s). Right after those warm jobs, `nvidia-smi` showed 4,802 MiB (`sequential`) and 23,256 MiB (`none`): device readings after the job, not in-render peaks. The owner runs `none` on the dedicated 3090 with one worker within this envelope (one 1024×1024 output, up to four 1024×1024 references); `sequential` stays the 24 GB preset for VRAM headroom. Production use remains subject to the model license. Not measured: concurrent load, soak runs and hosted ≥48 GB GPUs.
+A separate three-reference cold/warm pair also passed in both modes (first load 0.891 s `sequential`, 4.651 s `none`; warm load 0.0 s). Right after those warm jobs, `nvidia-smi` showed 4,802 MiB (`sequential`) and 23,256 MiB (`none`): device readings after the job, not in-render peaks. The owner chose `none` for a dedicated 3090 with one worker within this envelope (one 1024×1024 output, up to four 1024×1024 references); `sequential` stays the 24 GB preset for VRAM headroom. Production use remains subject to the model license. Not measured: concurrent load, soak runs and hosted ≥48 GB GPUs.
 
 ## Configuration
 
@@ -550,5 +552,3 @@ uv run --locked python scripts/audit_dependencies.py --project tests/fixtures/de
 Recorded run, 2026-11-12, Python 3.14.6 on macOS 27.2.1 arm64, pip-audit 2.10.1, PyPI service, with PyPI response validation: this lock, 61 third-party packages, no known vulnerabilities (exit 0). Same day: clean fixture exit 0; vulnerable fixture exit 1 with 11 advisories for `urllib3==1.26.4` (PYSEC-2021-108, PYSEC-2023-192, PYSEC-2023-212, PYSEC-2026-141, PYSEC-2026-1994, PYSEC-2026-1995, PYSEC-2026-1996, PYSEC-2026-1998, PYSEC-2026-1999, PYSEC-2026-4175, PYSEC-2026-4177); unreachable service (`HTTPS_PROXY=http://127.0.0.1:9`) exit 2; stale lock exit 2. Malformed PyPI responses are demonstrated offline only (`tests/test_dependency_audit.py`); real PyPI was not observed serving one.
 
 The MLX lock was audited on 2026-11-18 on macOS 27.2.1 arm64 with Python 3.14.6: 73 locked third-party packages, no known vulnerabilities (exit 0).
-
-With the `cuda` extra, the lock was audited on 2026-11-25 on macOS 27.2.1 arm64 with Python 3.14.6: 111 locked third-party packages, no known vulnerabilities (exit 0).
