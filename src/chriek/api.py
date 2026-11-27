@@ -472,7 +472,8 @@ def create_worker_app(
     app = FastAPI(title="chriek worker", lifespan=lifespan)
 
     @app.get("/health")
-    def health() -> dict[str, str]:
+    async def health() -> dict[str, str]:
+        # async: waiting invocations can hold every threadpool token; a sync probe would starve.
         return {"status": "ok"}
 
     @invocations.post("/invoke")

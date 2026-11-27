@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import anyio
 import pytest
 import uvicorn
 from conftest import (
@@ -475,9 +476,12 @@ def test_concurrent_deliveries_to_two_workers_claim_once(tmp_path):
 
 @needs_services
 def test_render_failure_is_recorded_and_returned(tmp_path):
-    with worker(tmp_path, FailingBackend(0)) as base, api(tmp_path, f"{base}/invoke") as client:
-        job_id = submit(client, **SMALL)["id"]
-        job = wait_for(client, job_id)
+    with worker(tmp_path, FailingBackend(0)) as base:
+        provider = Provider(status=200, forward_to=base)
+        with serving(provider.app) as provider_url, api(tmp_path, provider_url) as client:
+            job_id = submit(client, **SMALL)["id"]
+            job = wait_for(client, job_id)
+    assert provider.worker_answers == [(200, {"id": job_id, "status": "failed"})]
     assert job["status"] == "failed"
     assert job["error"] == "image 1 of 1 failed"
     assert job["images"] == []
@@ -615,6 +619,44 @@ def test_one_worker_process_renders_one_job_at_a_time(tmp_path, monkeypatch):
     }
     assert backend.max_active == 1
     assert backend.prompts == ["job a", "job b"]
+
+
+def with_thread_tokens(app, tokens: int):
+    """Wrap `app` so its event loop's default threadpool has `tokens` tokens (AnyIO: 40)."""
+
+    async def wrapped(scope, receive, send):
+        anyio.to_thread.current_default_thread_limiter().total_tokens = tokens
+        await app(scope, receive, send)
+
+    return wrapped
+
+
+@needs_services
+def test_worker_health_answers_while_invocations_hold_every_thread(tmp_path, monkeypatch):
+    lock = RecordingLock()
+    monkeypatch.setattr(api_module, "threading", SimpleNamespace(Lock=lambda: lock))
+    backend = GatedBackend()
+    threads: list[threading.Thread] = []
+    app = create_worker_app(WorkerSettings.from_env(worker_env(tmp_path)), backend=backend)
+    with (
+        serving(Provider(status=202).app) as provider_url,
+        api(tmp_path, provider_url) as client,
+        serving(with_thread_tokens(app, 2)) as base,
+    ):
+        try:
+            job_id = submit(client, **SMALL)["id"]
+            # One invocation renders, a duplicate waits for the lock: both tokens are held.
+            threads = [threading.Thread(target=invoke, args=(base, job_id)) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            assert backend.rendering.wait(10)
+            assert lock.wait_for_attempts(2)
+            with urllib.request.urlopen(f"{base}/health", timeout=5) as response:  # noqa: S310
+                assert (response.status, response.read()) == (200, b'{"status":"ok"}')
+        finally:
+            backend.release()
+            for thread in threads:
+                thread.join(20)
 
 
 def _connection_lost(*_args) -> None:
