@@ -8,8 +8,8 @@ presigned for succeeded jobs. References are never downloadable.
 
 import logging
 import shutil
-from collections.abc import Callable, Sequence
-from contextlib import suppress
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -101,29 +101,30 @@ class S3Images:
         # over https by default; AWS (None: botocore's defaults) supports them.
         checksums = "when_required" if compatible else None
         try:
-            self._client = boto3.client(
-                "s3",
-                endpoint_url=settings.endpoint_url,
-                region_name=settings.region,
-                aws_access_key_id=settings.access_key_id,
-                aws_secret_access_key=settings.secret_access_key,
-                config=Config(
-                    signature_version="s3v4",
-                    # S3-compatible services rarely route bucket subdomains; AWS prefers them.
-                    s3={"addressing_style": "path" if compatible else "auto"},
-                    connect_timeout=10,
-                    retries={"mode": "standard"},
-                    # Only CHRIEK_S3_ENDPOINT_URL picks the host, never AWS_ENDPOINT_URL* or
-                    # a profile's endpoint_url.
-                    ignore_configured_endpoint_urls=True,
-                    request_checksum_calculation=checksums,
-                    response_checksum_validation=checksums,
-                ),
-            )
-            response = self._client.head_bucket(Bucket=self._bucket)
-        except (BotoCoreError, ClientError) as error:
+            with _s3_errors("HeadBucket", self._bucket):
+                self._client = boto3.client(
+                    "s3",
+                    endpoint_url=settings.endpoint_url,
+                    region_name=settings.region,
+                    aws_access_key_id=settings.access_key_id,
+                    aws_secret_access_key=settings.secret_access_key,
+                    config=Config(
+                        signature_version="s3v4",
+                        # S3-compatible services rarely route bucket subdomains; AWS prefers them.
+                        s3={"addressing_style": "path" if compatible else "auto"},
+                        connect_timeout=10,
+                        retries={"mode": "standard"},
+                        # Only CHRIEK_S3_ENDPOINT_URL picks the host, never AWS_ENDPOINT_URL* or
+                        # a profile's endpoint_url.
+                        ignore_configured_endpoint_urls=True,
+                        request_checksum_calculation=checksums,
+                        response_checksum_validation=checksums,
+                    ),
+                )
+                response = self._client.head_bucket(Bucket=self._bucket)
+        except _S3Error as error:
             raise StorageError(
-                f"CHRIEK_S3_BUCKET {self._bucket} cannot be used ({_describe(error)}); it must "
+                f"CHRIEK_S3_BUCKET {self._bucket} cannot be used ({error.detail}); it must "
                 "already exist and be reachable with the configured endpoint and credentials"
             ) from None
         # botocore follows AWS's region redirect for requests but presigns with the configured
@@ -145,7 +146,8 @@ class S3Images:
 
     def read_reference(self, job_id: str, index: int) -> bytes:
         key = self._key(job_id, "references", f"{index}.png")
-        return self._client.get_object(Bucket=self._bucket, Key=key)["Body"].read()
+        with _s3_errors("GetObject", key):
+            return self._client.get_object(Bucket=self._bucket, Key=key)["Body"].read()
 
     def begin_outputs(self, job_id: str) -> None:
         pass
@@ -162,11 +164,11 @@ class S3Images:
 
     def presigned_url(self, job_id: str, index: int) -> tuple[str, int]:
         """A direct GET link to the object and its expiry, from the signature's own timestamp."""
-        url = self._client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": self._bucket, "Key": self._key(job_id, f"{index}.png")},
-            ExpiresIn=self._ttl,
-        )
+        key = self._key(job_id, f"{index}.png")
+        with _s3_errors("presign GetObject", key):
+            url = self._client.generate_presigned_url(
+                "get_object", Params={"Bucket": self._bucket, "Key": key}, ExpiresIn=self._ttl
+            )
         (signed_at,) = parse_qs(urlsplit(url).query)["X-Amz-Date"]
         signed = datetime.strptime(signed_at, "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
         return url, int(signed.timestamp()) + self._ttl
@@ -175,13 +177,17 @@ class S3Images:
         return "/".join((self._prefix, *parts) if self._prefix else parts)
 
     def _put(self, key: str, data: bytes) -> None:
-        self._client.put_object(Bucket=self._bucket, Key=key, Body=data, ContentType="image/png")
+        with _s3_errors("PutObject", key):
+            self._client.put_object(
+                Bucket=self._bucket, Key=key, Body=data, ContentType="image/png"
+            )
 
     def _delete(self, key: str, job_id: str) -> None:
         try:
-            self._client.delete_object(Bucket=self._bucket, Key=key)
-        except (BotoCoreError, ClientError) as error:
-            log.error("could not remove %s for job %s (%s)", key, job_id, _describe(error))
+            with _s3_errors("DeleteObject", key):
+                self._client.delete_object(Bucket=self._bucket, Key=key)
+        except _S3Error as error:
+            log.error("could not remove %s for job %s (%s)", key, job_id, error.detail)
 
 
 def open_images(storage: Path | S3Settings, url_ttl_seconds: int) -> LocalImages | S3Images:
@@ -190,11 +196,52 @@ def open_images(storage: Path | S3Settings, url_ttl_seconds: int) -> LocalImages
     return S3Images(storage, url_ttl_seconds)
 
 
-def _describe(error: BotoCoreError | ClientError) -> str:
-    """The S3 error code, or botocore's message (endpoint URL, no credentials)."""
-    if isinstance(error, ClientError):
-        return f"S3 error {error.response.get('Error', {}).get('Code', 'unknown')}"
-    return str(error)
+# Only these service error codes are repeated; anything else in an S3 or botocore error, such as
+# a service message or a gateway's echo of the request, may carry credentials.
+_SAFE_S3_CODES = frozenset(
+    {
+        "AccessDenied",
+        "AuthorizationHeaderMalformed",
+        "ExpiredToken",
+        "InternalError",
+        "InvalidAccessKeyId",
+        "InvalidBucketName",
+        "InvalidToken",
+        "NoSuchBucket",
+        "NoSuchKey",
+        "PermanentRedirect",
+        "RequestTimeTooSkewed",
+        "RequestTimeout",
+        "ServiceUnavailable",
+        "SignatureDoesNotMatch",
+        "SlowDown",
+        *(str(status) for status in range(300, 600)),
+    }
+)
+
+
+class _S3Error(StorageError):
+    def __init__(self, operation: str, target: str, detail: str) -> None:
+        super().__init__(f"S3 {operation} {target} failed ({detail})")
+        self.detail = detail
+
+
+@contextmanager
+def _s3_errors(operation: str, target: str) -> Iterator[None]:
+    """Turn an SDK failure into an error carrying only the fixed operation, the bucket or key
+    chriek chose and a safe classification; the SDK exception is not chained."""
+    try:
+        yield
+    except ClientError as error:
+        code = error.response.get("Error", {}).get("Code")
+        safe = isinstance(code, str) and code in _SAFE_S3_CODES
+        detail = f"S3 error {code if safe else 'unrecognized'}"
+    except BotoCoreError as error:
+        detail = type(error).__name__  # a botocore class name; its message may hold the endpoint
+    else:
+        return
+    # The SDK error is still the implicit context here (contextmanager exit): suppress it.
+    raise _S3Error(operation, target, detail) from None
 
 
 def _log_cleanup_error(_function: Callable[..., Any], path: str, exc: BaseException) -> None:

@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import time
+import traceback
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -17,7 +18,7 @@ from urllib.parse import parse_qs, urlsplit
 import boto3
 import pytest
 from botocore.awsrequest import AWSResponse
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EndpointConnectionError
 from botocore.stub import Stubber
 from conftest import (
     ALICE,
@@ -246,6 +247,9 @@ def wire(monkeypatch, tmp_path):
     return sent, responses
 
 
+ENDPOINT = "https://s3.example.test"
+
+
 def _settings(endpoint_url: str | None = None, region: str = "us-east-1") -> S3Settings:
     return S3Settings("chriek-images", endpoint_url, region, "", "AKIDSENTINEL", SECRET)
 
@@ -291,13 +295,100 @@ def test_bucket_region_is_checked_only_when_aws_reports_it(wire, endpoint_url, b
 def test_compatible_endpoint_uploads_over_https_without_checksum_trailers(wire):
     sent, _ = wire
     png = make_image_bytes()
-    S3Images(_settings("https://s3.example.test"), 60).stage_output("job", 0, png)
+    S3Images(_settings(ENDPOINT), 60).stage_output("job", 0, png)
     put = sent[-1]
     assert (put.method, put.url) == ("PUT", "https://s3.example.test/chriek-images/job/0.png")
     assert put.headers["Content-Type"] == b"image/png"
     assert "Content-Encoding" not in put.headers
     assert "X-Amz-Trailer" not in put.headers
     assert put.headers["X-Amz-Content-SHA256"] == hashlib.sha256(png).hexdigest().encode()
+
+
+# SDK failures whose text a service, gateway or botocore filled in: the code, message or
+# endpoint can echo request details, so only the fixed classification may appear.
+_SDK_ERRORS = {
+    "service message": (
+        ClientError({"Error": {"Code": "SlowDown", "Message": SECRET}}, "Op"),
+        "S3 error SlowDown",
+    ),
+    "arbitrary code": (
+        ClientError({"Error": {"Code": SECRET, "Message": SECRET}}, "Op"),
+        "S3 error unrecognized",
+    ),
+    "sdk text": (
+        EndpointConnectionError(endpoint_url=f"https://{SECRET}.example"),
+        "EndpointConnectionError",
+    ),
+}
+
+
+def _formatted(error: BaseException) -> str:
+    return "".join(traceback.format_exception(error))
+
+
+class _BrokenBody:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def read(self) -> bytes:
+        raise self.error
+
+
+@pytest.mark.parametrize(("sdk_error", "detail"), _SDK_ERRORS.values(), ids=_SDK_ERRORS)
+@pytest.mark.parametrize(
+    ("event", "operation", "call"),
+    [
+        ("PutObject", "PutObject job/references/0.png", lambda i: i.put_references("job", [b""])),
+        ("PutObject", "PutObject job/0.png", lambda i: i.stage_output("job", 0, b"")),
+        ("GetObject", "GetObject job/references/0.png", lambda i: i.read_reference("job", 0)),
+        ("body", "GetObject job/references/0.png", lambda i: i.read_reference("job", 0)),
+        ("GetObject", "presign GetObject job/0.png", lambda i: i.presigned_url("job", 0)),
+    ],
+    ids=["reference write", "output write", "reference read", "body read", "presign"],
+)
+def test_s3_operation_errors_carry_only_operation_and_classification(
+    wire, event, operation, call, sdk_error, detail
+):
+    images = S3Images(_settings(ENDPOINT), 60)
+
+    def refuse(**_kwargs):
+        raise sdk_error
+
+    def break_body(parsed, **_kwargs):
+        parsed["Body"] = _BrokenBody(sdk_error)
+
+    if event == "body":
+        images._client.meta.events.register("after-call.s3.GetObject", break_body)
+    else:
+        images._client.meta.events.register(f"before-parameter-build.s3.{event}", refuse)
+    with pytest.raises(StorageError) as raised:
+        call(images)
+    formatted = _formatted(raised.value)
+    assert f"{operation} failed ({detail})" in formatted
+    assert SECRET not in formatted and "s3.example.test" not in formatted
+
+
+@pytest.mark.parametrize(("sdk_error", "detail"), _SDK_ERRORS.values(), ids=_SDK_ERRORS)
+def test_s3_startup_and_delete_errors_carry_only_the_classification(
+    wire, caplog, sdk_error, detail
+):
+    def refuse(**_kwargs):
+        raise sdk_error
+
+    events = boto3.DEFAULT_SESSION.events
+    events.register("before-parameter-build.s3.HeadBucket", refuse)
+    with pytest.raises(StorageError) as raised:
+        S3Images(_settings(ENDPOINT), 60)
+    formatted = _formatted(raised.value)
+    assert f"CHRIEK_S3_BUCKET chriek-images cannot be used ({detail})" in formatted
+    assert SECRET not in formatted and "s3.example.test" not in formatted
+
+    events.unregister("before-parameter-build.s3.HeadBucket", refuse)
+    events.register("before-parameter-build.s3.DeleteObject", refuse)
+    caplog.set_level(logging.ERROR, "chriek.images")
+    S3Images(_settings(ENDPOINT), 60).remove_outputs("job", 2)
+    assert caplog.text.count("could not remove job/") == 2
+    assert f"({detail})" in caplog.text and SECRET not in caplog.text
 
 
 # Against the real service
@@ -414,13 +505,23 @@ def test_s3_failed_and_partial_outputs_are_removed_and_never_linked(tmp_path, st
     assert s3_keys(s3_client, storage) == []
 
 
+def _refuse_app_s3(monkeypatch, event: str, handler) -> None:
+    """`handler` sees each `event` of the app's S3 client; the fixtures' own client is spared."""
+    original_init = S3Images.__init__
+
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self._client.meta.events.register(event, handler)
+
+    monkeypatch.setattr(S3Images, "__init__", init)
+
+
 @needs_s3
 def test_s3_output_write_failure_fails_the_job_and_keeps_no_outputs(
-    tmp_path, storage, s3_client, monkeypatch
+    tmp_path, storage, s3_client, monkeypatch, caplog
 ):
     puts: list[str] = []
     persisted: list[int] = []
-    original_init = S3Images.__init__
 
     def refuse_second(params, **_kwargs):
         puts.append(params["Key"])
@@ -429,17 +530,44 @@ def test_s3_output_write_failure_fails_the_job_and_keeps_no_outputs(
             persisted.append(s3_client.head_object(Bucket=S3_BUCKET, Key=puts[0])["ContentLength"])
             raise ClientError({"Error": {"Code": "SlowDown", "Message": SECRET}}, "PutObject")
 
-    def init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        self._client.meta.events.register("before-parameter-build.s3.PutObject", refuse_second)
-
-    monkeypatch.setattr(S3Images, "__init__", init)
+    _refuse_app_s3(monkeypatch, "before-parameter-build.s3.PutObject", refuse_second)
+    caplog.set_level(logging.ERROR, "chriek.worker")
     with running(tmp_path) as client:
         job = wait_for(client, submit(client, image_count=3, **SMALL)["id"])
+        later = wait_for(client, submit(client, **SMALL)["id"])
     assert (job["status"], job["error"], job["images"]) == ("failed", "image 2 of 3 failed", [])
-    assert puts == [f"{storage}/{job['id']}/{i}.png" for i in range(2)]
+    assert puts[:2] == [f"{storage}/{job['id']}/{i}.png" for i in range(2)]
     assert len(persisted) == 1 and persisted[0] > 0
-    assert s3_keys(s3_client, storage) == []
+    assert s3_keys(s3_client, storage) == [f"{later['id']}/0.png"]
+    # The server log keeps the operation and classification, never the service's text.
+    assert f"S3 PutObject {storage}/{job['id']}/1.png failed (S3 error SlowDown)" in caplog.text
+    assert SECRET not in caplog.text
+
+
+@needs_s3
+def test_s3_reference_read_failure_logs_no_service_text(
+    tmp_path, storage, s3_client, monkeypatch, caplog
+):
+    def refuse_references(params, **_kwargs):
+        if "/references/" in params["Key"]:
+            raise ClientError({"Error": {"Code": SECRET, "Message": SECRET}}, "GetObject")
+
+    _refuse_app_s3(monkeypatch, "before-parameter-build.s3.GetObject", refuse_references)
+    caplog.set_level(logging.ERROR, "chriek.worker")
+    with running(tmp_path) as client:
+        response = client.post(
+            "/jobs",
+            headers=ALICE,
+            data={"prompt": "edit", "width": "16", "height": "16"},
+            files=[("references", ("ref.png", make_image_bytes(), "image/png"))],
+        )
+        failed = wait_for(client, response.json()["id"])
+        later = wait_for(client, submit(client, **SMALL)["id"])
+    assert (failed["status"], failed["error"]) == ("failed", "reference 1 of 1 could not be loaded")
+    assert (later["status"], len(later["images"])) == ("succeeded", 1)
+    reference = f"{storage}/{failed['id']}/references/0.png"
+    assert f"S3 GetObject {reference} failed (S3 error unrecognized)" in caplog.text
+    assert SECRET not in caplog.text
 
 
 @needs_s3
@@ -507,24 +635,18 @@ def failing_deletes(monkeypatch, caplog):
     """Every DeleteObject of an app's S3 client fails; returns the keys it tried. The test
     fixtures' own client still deletes."""
     tried: list[str] = []
-    original_init = S3Images.__init__
 
     def refuse(params, **_kwargs):
         tried.append(params["Key"])
         raise ClientError({"Error": {"Code": "AccessDenied", "Message": SECRET}}, "DeleteObject")
 
-    def init(self, *args, **kwargs):
-        original_init(self, *args, **kwargs)
-        self._client.meta.events.register("before-parameter-build.s3.DeleteObject", refuse)
-
-    monkeypatch.setattr(S3Images, "__init__", init)
+    _refuse_app_s3(monkeypatch, "before-parameter-build.s3.DeleteObject", refuse)
     caplog.set_level(logging.ERROR, "chriek.images")
     return tried
 
 
 def _cleanup_failures_logged(caplog) -> bool:
-    messages = [r.getMessage() for r in caplog.records if r.name == "chriek.images"]
-    return any("could not remove" in m for m in messages) and not any(SECRET in m for m in messages)
+    return "could not remove" in caplog.text and SECRET not in caplog.text
 
 
 @needs_s3
@@ -595,17 +717,14 @@ def test_s3_store_failure_after_references_removes_them(tmp_path, storage, s3_cl
 def test_s3_write_failure_fails_submission_without_leaking(
     tmp_path, storage, s3_client, monkeypatch
 ):
-    original_put = S3Images._put
+    def fail_second_reference(params, **_kwargs):
+        if params["Key"].endswith("references/1.png"):
+            raise ClientError({"Error": {"Code": SECRET, "Message": SECRET}}, "PutObject")
 
-    def fail_second_reference(self, key, data):
-        if key.endswith("references/1.png"):
-            raise ClientError({"Error": {"Code": "SlowDown", "Message": SECRET}}, "PutObject")
-        original_put(self, key, data)
-
-    monkeypatch.setattr(S3Images, "_put", fail_second_reference)
-    app = create_app(Settings.from_env(base_env(tmp_path)))
-    with TestClient(app, raise_server_exceptions=False) as client:
-        response = client.post(
+    _refuse_app_s3(monkeypatch, "before-parameter-build.s3.PutObject", fail_second_reference)
+    # What reaches the ASGI server, which logs it and answers 500.
+    with running(tmp_path) as client, pytest.raises(StorageError) as raised:
+        client.post(
             "/jobs",
             headers=ALICE,
             data={"prompt": "lost", "width": "16", "height": "16"},
@@ -614,8 +733,9 @@ def test_s3_write_failure_fails_submission_without_leaking(
                 ("references", ("b.png", make_image_bytes((3, 2, 1)), "image/png")),
             ],
         )
-    assert response.status_code == 500
-    assert SECRET not in response.text
+    formatted = _formatted(raised.value)
+    assert "S3 PutObject" in formatted and "(S3 error unrecognized)" in formatted
+    assert SECRET not in formatted
     assert s3_keys(s3_client, storage) == []
     assert stored_owners(tmp_path) == []
 
