@@ -91,8 +91,8 @@ The CUDA backend runs the same pinned BF16 checkpoint with diffusers' FLUX 3 Ima
 
 Presets:
 
-- **24 GB card (RTX 3090 class):** `CHRIEK_OFFLOAD=sequential`. Components wait in host RAM (about 20 GB of BF16 weights) and only the running one is on the GPU: the text encoder encodes, leaves the GPU, then the transformer runs. Moving components adds transfer time to every job.
-- **Hosted GPU with at least 48 GB:** `CHRIEK_OFFLOAD=none`. Text encoder, transformer and VAE all stay on the GPU.
+- **24 GB card (RTX 3090 class):** `CHRIEK_OFFLOAD=sequential`. Components wait in host RAM (about 20 GB of BF16 weights) and only the running one is on the GPU: the text encoder encodes, leaves the GPU, then the transformer runs. Moving components adds transfer time to every job. Use this for staging; see the [RTX 3090 results](#rtx-3090-results).
+- **Hosted GPU with at least 48 GB:** `CHRIEK_OFFLOAD=none`. Text encoder, transformer and VAE all stay on the GPU. On a 24 GB card, `none` fit isolated smoke runs with little headroom, but it is not the 24 GB preset.
 
 Host prerequisites: Linux with an NVIDIA driver 580 or newer (the locked PyTorch wheels use CUDA 13), Docker and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) for `--gpus all`. With an older driver or without the toolkit, PyTorch sees no GPU and the CUDA backend stops with `requires an NVIDIA GPU visible to PyTorch`.
 
@@ -150,12 +150,16 @@ uv run --locked --extra mlx chriek smoke --prompt "Move the bicycle into a sunny
   --reference bicycle.png --out garden.png
 ```
 
-An edit with three references in the CUDA image, after three text-to-image renders as above (`bicycle.png`, then `palette.png` with `--prompt "A flat palette of teal, orange and cream paint swatches"`, `garden.png` with `--prompt "A sunny cottage garden path"`):
+An edit with three references in the CUDA image, after three text-to-image renders as above (`bicycle.png`, then `palette.png` with `--prompt "A flat palette of teal, orange and cream paint swatches"`, `garden.png` with `--prompt "A sunny cottage garden path"`). This is the composition prompt tested on the RTX 3090; the shorter prompt "The bicycle from the first image, painted in the colors of the second image, parked on the path from the third image" dropped the bicycle there:
 
 ```sh
 docker run --rm --gpus all --user "$(id -u):$(id -g)" \
   -v "$HF_HOME/hub:/hf/hub:ro" -v "$PWD/out:/out" -e CHRIEK_OFFLOAD=sequential \
-  chriek:cuda smoke --prompt "The bicycle from the first image, painted in the colors of the second image, parked on the path from the third image" \
+  chriek:cuda smoke --prompt "Create a new photograph using all three reference images. Take the bicycle from the first image,
+keeping its black wheels and saddle. Repaint its frame and fork using the teal swatch on the left of the
+second image. Place the entire bicycle side-on across the foreground stone path from the third image, with
+both wheels visible and a short shadow on the dry stones. Keep the third image's cottage and flower beds
+behind the bicycle. Use bright sunlight, with no rain or wet pavement." \
   --reference /out/bicycle.png --reference /out/palette.png --reference /out/garden.png --out /out/edit.png
 ```
 
@@ -170,6 +174,19 @@ Measured offline on an Apple M4 Max (40 GPU cores, 128 GB, macOS 27.2.1), with `
 | Edit | 2 | 0.640 | 197.514 | 22,621,003,960 |
 
 Two offline 512×512 jobs in one server process recorded 3.662 s and 0.0 s of load time, respectively.
+
+#### RTX 3090 results
+
+[Owner acceptance](https://github.com/stibbons-ai/chriek/pull/41#issuecomment-7217734284): offline Docker smoke runs on one 24,576 MiB RTX 3090, CUDA 13.2, torch 2.15.0, diffusers 0.43.0, 1024×1024, seed 7, 16 steps, BF16. Each row is a separate smoke process. Peak allocation is the run record's `peak_memory_bytes` (PyTorch's allocation peak), not the device memory usage observed separately:
+
+| `CHRIEK_OFFLOAD` | Workload | Load (s) | Wall (s) | Peak PyTorch allocation (bytes) |
+|---|---|---:|---:|---:|
+| `sequential` | Text-to-image | 1.495 | 33.768 | 11,728,788,480 |
+| `sequential` | Three-reference composition (prompt above) | 0.883 | 77.731 | 13,815,259,136 |
+| `none` | Text-to-image | 3.425 | 15.367 | 22,767,763,456 |
+| `none` | Three-reference edit (different, shorter prompt) | 3.087 | 64.660 | 22,914,622,464 |
+
+Observed device usage peaked at about 16 GB with `sequential` and at 23,122 MiB with `none`, 1,454 MiB below the card's capacity. Both three-reference outputs show a teal bicycle in the garden, with visible compositing or occlusion artifacts. The two edit prompts differ, so their wall times are not a speed comparison. Not measured: four references, a warm long-lived server, concurrent load and hosted ≥48 GB GPUs.
 
 ## Configuration
 
