@@ -12,7 +12,8 @@ COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --extra cuda --no-editable
 
-# Same Python as the build stage: the venv's interpreter links to /usr/local/bin/python3.
+# Same Python minor version as the build stage (both tags float within 3.14): the venv's
+# interpreter links to /usr/local/bin/python3.
 FROM python:3.14-slim-trixie
 RUN useradd --system --uid 10001 --create-home chriek
 COPY --from=build /app/.venv /app/.venv

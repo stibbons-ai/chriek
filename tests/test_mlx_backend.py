@@ -136,6 +136,16 @@ def test_text_and_edit_pass_exact_inference_parameters_and_share_one_load(infere
     assert set(options["allow_patterns"]) >= {"model.safetensors", "ae.safetensors"}
 
 
+def test_single_reference_is_passed_as_is(inference):
+    backend = mlx_backend.MlxBackend()
+    with Image.new("RGBA", (4, 4), (255, 0, 0, 128)) as tiny:
+        backend.render("edit", 32, 16, 7, (tiny,))
+        [(_, [passed], _)] = inference.renders
+        assert passed is tiny
+        assert (tiny.size, tiny.mode) == ((4, 4), "RGBA")
+        assert tiny.tobytes() == Image.new("RGBA", (4, 4), (255, 0, 0, 128)).tobytes()
+
+
 def test_edit_pads_small_multi_reference_images(inference, tmp_path):
     small_path = tmp_path / "small.png"
     regular_path = tmp_path / "regular.png"

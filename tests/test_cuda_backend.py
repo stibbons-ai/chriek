@@ -276,6 +276,49 @@ def test_edit_fits_tiny_and_tall_references_without_touching_them(inference):
         assert (tiny.size, tall.size) == ((4, 4), (12, 131072))
 
 
+def test_single_reference_is_passed_as_is(inference):
+    # diffusers fits one reference itself (fill, up to 4 MP); padding it here would add black.
+    backend = create_backend(BackendSettings("cuda", "none"))
+    with Image.new("RGBA", (4, 4), (255, 0, 0, 128)) as tiny:
+        backend.render("edit", 32, 16, 7, [tiny])
+        [call] = inference.calls
+        assert call["image"] == [tiny] and call["image"][0] is tiny
+        assert (tiny.size, tiny.mode) == ((4, 4), "RGBA")
+        assert tiny.tobytes() == Image.new("RGBA", (4, 4), (255, 0, 0, 128)).tobytes()
+
+
+def test_edit_upright_rgb_fits_small_references_and_borrows_large_ones(inference, tmp_path):
+    # Left half red, right half blue; EXIF orientation 6 displays it rotated 90° clockwise.
+    sideways = Image.new("RGBA", (8, 4), (255, 0, 0, 128))
+    sideways.paste((0, 0, 255, 128), (4, 0, 8, 4))
+    exif = Image.Exif()
+    exif[0x0112] = 6
+    sideways.save(tmp_path / "sideways.png", exif=exif)
+    backend = create_backend(BackendSettings("cuda", "none"))
+    with (
+        Image.open(tmp_path / "sideways.png") as small,
+        Image.new("RGB", (2048, 2048), "green") as large,
+    ):
+        backend.render("edit", 32, 16, 7, (small, large))
+        [(fitted, unchanged)] = [call["image"] for call in inference.calls]
+        assert unchanged is large
+        # Upright 4×8 (red over blue), padded to 16×16 at offset (6, 4).
+        assert (fitted.size, fitted.mode) == ((16, 16), "RGB")
+        assert fitted.getpixel((7, 5)) == (255, 0, 0)
+        assert fitted.getpixel((7, 10)) == (0, 0, 255)
+        assert fitted.getpixel((0, 0)) == (0, 0, 0)
+        assert (small.size, small.mode) == ((8, 4), "RGBA")
+
+
+@pytest.mark.parametrize("offload", ["Sequential", "model", ""])
+def test_cuda_rejects_unknown_offload(offload):
+    with pytest.raises(ConfigError, match="CHRIEK_OFFLOAD must be"):
+        BackendSettings.from_env({"CHRIEK_BACKEND": "cuda", "CHRIEK_OFFLOAD": offload})
+    assert BackendSettings.from_env({"CHRIEK_BACKEND": "cuda", "CHRIEK_OFFLOAD": "none"}) == (
+        BackendSettings("cuda", "none")
+    )
+
+
 def test_measurements_are_per_job_not_per_image_or_process(inference, monkeypatch):
     monkeypatch.setattr(cuda_backend, "perf_counter", iter([2.0, 3.25]).__next__)
     backend = create_backend(BackendSettings("cuda", "none"))

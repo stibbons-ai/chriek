@@ -47,7 +47,7 @@ Spec: #1. Decisions: ADR-0001.
 
 - Python, FastAPI, SQLAlchemy (SQLite + Postgres), boto3 for S3.
 - uv for dependency management; `uv.lock` committed.
-- Mac: runs natively via `uv run`. NVIDIA: Docker image (CUDA); uv used in the build stage (`uv sync --frozen`), runtime image ships only the venv.
+- Mac: runs natively via `uv run`. NVIDIA: Docker image (CUDA); uv used in the build stage (`uv sync --locked`), runtime image ships only the venv.
 - One codebase, two roles, two deployment modes (see Deployment modes).
 
 ### Deployment modes
@@ -104,7 +104,7 @@ Spec: #1. Decisions: ADR-0001.
 - N images per job: seeds `seed + i`; any image failure fails the whole job (generation errors are systemic, not per-image). Images already produced are discarded.
 - AI disclosure: PNG text chunk plus XMP with IPTC `DigitalSourceType = trainedAlgorithmicMedia`, written via Pillow (no extra dependency). No C2PA in MVP.
 - Test hardware: RTX 3090 (24 GB, `offload=sequential`) and M4 Max 128 GB. 24 GB fit of multi-reference BF16 edits is unproven; the plan builds and checks the NVIDIA backend on the 3090 early, before the rest depends on it.
-  - Acceptance update: [Daniel confirmed](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7217734284) that separate offline BF16 Docker smokes for text-to-image and a three-reference edit passed on the RTX 3090 with `sequential`. This does not establish fit for four references, a warm server, or concurrent jobs.
+  - Acceptance update: [Daniel confirmed](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7217734284) that separate offline BF16 Docker smokes for text-to-image and a three-reference edit passed on the RTX 3090 with `sequential`. A [warm-server follow-up](https://github.com/stibbons-ai/chriek/issues/3#issuecomment-7218700646) ran serial jobs with one to four 1024×1024 references in one `chriek serve` process per offload mode, one worker; both `sequential` and `none` passed. Concurrent jobs, soak runs and hosted ≥48 GB GPUs remain unmeasured.
 
 ### Docs
 
@@ -117,7 +117,7 @@ Spec: #1. Decisions: ADR-0001.
 ## Left to the builder
 
 - Python version (3.14 if MLX/torch/flux3-mlx support it, for stdlib `uuid.uuid7`; otherwise a small UUIDv7 library).
-- Exact NVIDIA inference library (BFL reference code, diffusers, …): verify against current docs; the HF repo ships diffusers-format copies.
+- NVIDIA inference library: settled in issue 3 as diffusers 0.43.0's modular `Flux3DistilledAutoBlocks` pipeline on the HF repo's diffusers-format copies.
 - Upload format for reference images (multipart proposed; no server-side fetching of URLs, to avoid SSRF).
 - Config mechanism and names (env vars recommended), signed-URL TTL, request limits (max images per job, max references, max upload size).
 - Migrations approach, health endpoint, logging, per-job run record (PoC fields: timings, peak memory, hardware) in the job response.
