@@ -32,6 +32,8 @@ def dispatch(settings: Dispatch, store: JobStore, job_id: str, clock: Callable[[
         method="POST",
         headers={
             **settings.headers,
+            # Validated distinct from every other header name, case-insensitively.
+            **({settings.id_header: job_id} if settings.id_header else {}),
             "Content-Type": "application/json",
             # The job ID doubles as the request's idempotency key: a provider retry or a
             # duplicate delivery claims the same job, which the worker runs at most once.

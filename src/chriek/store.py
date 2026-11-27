@@ -33,7 +33,8 @@ from chriek.storage import StorageError, private_database
 QUEUED, RUNNING, SUCCEEDED, FAILED = "queued", "running", "succeeded", "failed"
 INTERRUPTED_ERROR = "interrupted: the server stopped while this job was running"
 TIMED_OUT_ERROR = "timed out: the job ran longer than CHRIEK_JOB_TIMEOUT_SECONDS"
-# Advisory-lock name for schema creation; no owner name contains ':' except the proxy owner.
+# Advisory-lock name for schema creation, hashed like owner names; a key collision only
+# serialises the two, never breaks either.
 SCHEMA_LOCK = "schema:jobs"
 MEMORY_DATABASE = ":memory:"  # SQLite's sentinel for an ephemeral database
 # Seeds reach 2**32 - 1, which overflows a Postgres INTEGER.

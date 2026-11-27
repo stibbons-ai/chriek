@@ -52,6 +52,7 @@ from chriek import dispatch as dispatch_module
 from chriek.api import create_app, create_worker_app
 from chriek.cli import main
 from chriek.config import (
+    SETTING_NAMES,
     WORKER_SETTING_NAMES,
     ConfigError,
     Dispatch,
@@ -170,12 +171,39 @@ def config_api_env(tmp_path: Path, **changes: str) -> dict[str, str]:
             )
             for raw in ("0", "-1", "nan", "inf", "30s", "", "604800.5", "1e300")
         ),
+        *(
+            ({"CHRIEK_DISPATCH_ID_HEADER": name}, None, "must be one HTTP header token")
+            for name in ("", f"{PROVIDER_TOKEN} x", "X-Id\r\nHost: evil.example", "X-Id:")
+        ),
+        *(
+            ({"CHRIEK_DISPATCH_ID_HEADER": name}, None, "must not name a header chriek sets")
+            for name in (
+                "idempotency-key",
+                "X-CHRIEK-WORKER-TOKEN",
+                "authorization",
+                "content-type",
+                "host",
+                "Content-Length",
+                "transfer-encoding",
+                "Connection",
+                "prefer",  # configured in CHRIEK_DISPATCH_HEADERS below
+            )
+        ),
+        (
+            {
+                "CHRIEK_DISPATCH_HEADERS": json.dumps({PROVIDER_TOKEN: "x", "Prefer": "x"}),
+                "CHRIEK_DISPATCH_ID_HEADER": PROVIDER_TOKEN.upper(),
+            },
+            None,
+            "one in CHRIEK_DISPATCH_HEADERS",
+        ),
     ],
 )
 def test_api_role_rejects_configuration_without_leaking_secrets(
     tmp_path, changes, removed, message
 ):
-    env = config_api_env(tmp_path, **changes)
+    prefer = {"CHRIEK_DISPATCH_HEADERS": json.dumps({"Prefer": "respond-async"})}
+    env = config_api_env(tmp_path, **(prefer | changes))
     if removed:
         env.pop(removed)
         if removed == "CHRIEK_S3_BUCKET":
@@ -196,6 +224,7 @@ def test_api_role_settings_carry_dispatch_headers(tmp_path):
             CHRIEK_DISPATCH_TOKEN=PROVIDER_TOKEN,
             CHRIEK_DISPATCH_HEADERS=json.dumps({"Prefer": "respond-async"}),
             CHRIEK_DISPATCH_TIMEOUT_SECONDS="2.5",
+            CHRIEK_DISPATCH_ID_HEADER="X-Inference-Id",
         ),
         Role.API,
     )
@@ -204,9 +233,11 @@ def test_api_role_settings_carry_dispatch_headers(tmp_path):
         "Authorization": f"Bearer {PROVIDER_TOKEN}",
     }
     assert settings.dispatch.timeout_seconds == 2.5
+    assert settings.dispatch.id_header == "X-Inference-Id"
     for secret in ("path-token-SENTINEL", PROVIDER_TOKEN, WORKER_TOKEN):
         assert secret not in repr(settings)
-    assert Settings.from_env(config_api_env(tmp_path), Role.API).dispatch.timeout_seconds == 30
+    default = Settings.from_env(config_api_env(tmp_path), Role.API).dispatch
+    assert (default.timeout_seconds, default.id_header) == (30, None)
     maximum = config_api_env(tmp_path, CHRIEK_DISPATCH_TIMEOUT_SECONDS="604800")
     assert Settings.from_env(maximum, Role.API).dispatch.timeout_seconds == 604800
 
@@ -253,12 +284,28 @@ def test_dispatch_logs_an_error_only_for_a_recorded_failure(monkeypatch, caplog,
     assert len(errors) == (1 if queued else 0)
 
 
+class BrokenStore(RecordingStore):
+    def fail_queued(self, job_id: str, error: str, now: float) -> bool:
+        super().fail_queued(job_id, error, now)
+        raise OperationalError("UPDATE", {}, ConnectionError("connection lost"))
+
+
+def test_dispatch_logs_but_contains_a_failure_to_record_the_delivery_failure(monkeypatch, caplog):
+    store = BrokenStore(queued=True)
+    dispatch_raising(monkeypatch, TimeoutError("timed out"), store)  # must not raise
+    assert len(store.errors) == 1
+    (record,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert record.exc_info is not None
+    assert "recording that failed too" in record.getMessage()
+
+
 @pytest.mark.parametrize(
     "name",
     [
         "CHRIEK_DISPATCH_URL",
         "CHRIEK_DISPATCH_TOKEN",
         "CHRIEK_DISPATCH_HEADERS",
+        "CHRIEK_DISPATCH_ID_HEADER",
         "CHRIEK_DISPATCH_TIMEOUT_SECONDS",
         "CHRIEK_WORKER_TOKEN",
     ],
@@ -271,10 +318,6 @@ def test_home_role_refuses_serverless_settings(tmp_path, name):
 @pytest.mark.parametrize(
     ("changes", "message"),
     [
-        ({"CHRIEK_API_KEYS": f"alice:{ALICE_KEY}"}, "CHRIEK_API_KEYS does not apply"),
-        ({"CHRIEK_SIGNING_SECRET": SIGNING_SECRET}, "CHRIEK_SIGNING_SECRET does not apply"),
-        ({"CHRIEK_DISPATCH_URL": "https://x.example"}, "CHRIEK_DISPATCH_URL does not apply"),
-        ({"CHRIEK_DISPATCH_TIMEOUT_SECONDS": "30"}, "CHRIEK_DISPATCH_TIMEOUT_SECONDS does not"),
         ({"CHRIEK_DB_PATH": "chriek.db"}, "CHRIEK_DB_PATH does not apply"),
         ({"CHRIEK_WORKER_TOKEN": "short"}, "CHRIEK_WORKER_TOKEN must be at least 32"),
         ({"CHRIEK_DATABASE_URL": None}, "chriek worker requires CHRIEK_DATABASE_URL"),
@@ -289,6 +332,15 @@ def test_worker_role_rejects_configuration(changes, message):
     with pytest.raises(ConfigError, match=message) as error:
         WorkerSettings.from_env(env)
     assert SIGNING_SECRET not in str(error.value) and ALICE_KEY not in str(error.value)
+
+
+@pytest.mark.parametrize("name", sorted(SETTING_NAMES - WORKER_SETTING_NAMES))
+def test_worker_role_refuses_every_api_and_dispatch_setting(name):
+    """Client API keys, the signing secret and the provider credential never reach the GPU."""
+    env = SHARED | {"CHRIEK_WORKER_TOKEN": WORKER_TOKEN, name: PROVIDER_TOKEN}
+    with pytest.raises(ConfigError, match=f"{name} does not apply to chriek worker") as error:
+        WorkerSettings.from_env(env)
+    assert PROVIDER_TOKEN not in str(error.value)
 
 
 @pytest.mark.parametrize("command", ["api", "worker"])
@@ -375,9 +427,13 @@ class Provider:
 
 
 def invoke(base: str, job_id: str, token: str = WORKER_TOKEN) -> tuple[int, dict]:
+    return post_invoke(base, {"job_id": job_id}, token)
+
+
+def post_invoke(base: str, payload: dict, token: str = WORKER_TOKEN) -> tuple[int, dict]:
     request = urllib.request.Request(  # noqa: S310 - loopback test server
         f"{base}/invoke",
-        data=json.dumps({"job_id": job_id}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json", "X-Chriek-Worker-Token": token},
         method="POST",
     )
@@ -447,6 +503,24 @@ def test_walkthrough_submit_dispatch_poll_download_with_reference(tmp_path, monk
     assert headers["idempotency-key"] == job["id"]
     assert headers["prefer"] == "respond-async"
     assert headers["authorization"] == f"Bearer {PROVIDER_TOKEN}"
+    assert headers["x-chriek-worker-token"] == WORKER_TOKEN
+    assert "x-inference-id" not in headers  # only with CHRIEK_DISPATCH_ID_HEADER
+
+
+@needs_services
+def test_configured_id_header_carries_the_submitted_job_id(tmp_path):
+    provider = Provider(status=202)
+    with (
+        serving(provider.app) as provider_url,
+        api(tmp_path, provider_url, CHRIEK_DISPATCH_ID_HEADER="X-Inference-Id") as client,
+    ):
+        job_id = submit(client, **SMALL)["id"]
+        assert provider.arrived.acquire(timeout=10), "dispatch never arrived"
+    ((headers, body),) = provider.deliveries
+    assert body == {"job_id": job_id}
+    assert headers["x-inference-id"] == job_id
+    assert headers["idempotency-key"] == job_id
+    assert headers["prefer"] == "respond-async"
     assert headers["x-chriek-worker-token"] == WORKER_TOKEN
 
 
@@ -574,11 +648,10 @@ def test_render_failure_is_recorded_and_returned(tmp_path):
 def test_delivery_failure_fails_the_queued_job_without_secrets(tmp_path, caplog, answer):
     caplog.set_level(logging.INFO)
     secret_path = "/hooks/path-token-SENTINEL/invoke"
-    if answer is None:  # nothing listens on a port just released
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            port = sock.getsockname()[1]
-        job = run_job(tmp_path, f"http://127.0.0.1:{port}{secret_path}")
+    if answer is None:
+        # Port 1 lies below the ephemeral range, so no test server bound to port 0 can take it
+        # meanwhile. A bound, non-listening socket would not do: macOS drops its SYNs (timeout).
+        job = run_job(tmp_path, f"http://127.0.0.1:1{secret_path}")
     else:
         with serving(Provider(status=answer).app) as provider_url:
             job = run_job(tmp_path, f"{provider_url}{secret_path}")
@@ -898,7 +971,18 @@ def test_worker_invocation_requires_its_token_and_health_does_not(tmp_path):
         assert invoke(base, "019a7c1e-4b2a-7c3d-9e8f-0123456789ab")[0] == 404
         assert fetch(f"{base}/health") == (200, b'{"status":"ok"}')
         assert client.get(f"/jobs/{job_id}", headers=ALICE).json()["status"] == "queued"
-    assert backend.renders == 0
+        assert backend.renders == 0
+
+        # Authenticated but invalid: a useful 422 that never echoes the submitted input.
+        status, body = post_invoke(base, {"job_id": job_id, "extra": "INPUT-SENTINEL"})
+        assert status == 422
+        assert body["detail"][0]["loc"] == ["body", "extra"]
+        assert "INPUT-SENTINEL" not in json.dumps(body)
+
+        # The ID is matched in its canonical form: an upper-case delivery runs the job.
+        assert invoke(base, job_id.upper()) == (200, {"id": job_id, "status": "succeeded"})
+        assert client.get(f"/jobs/{job_id}", headers=ALICE).json()["status"] == "succeeded"
+    assert backend.renders == 1
 
 
 @pytest.mark.skipif(POSTGRES_URL is None, reason="CHRIEK_TEST_POSTGRES_URL not set")

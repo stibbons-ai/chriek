@@ -47,6 +47,7 @@ SETTING_NAMES = frozenset(
         "CHRIEK_DATABASE_URL",
         "CHRIEK_DB_PATH",
         "CHRIEK_DISPATCH_HEADERS",
+        "CHRIEK_DISPATCH_ID_HEADER",
         "CHRIEK_DISPATCH_TIMEOUT_SECONDS",
         "CHRIEK_DISPATCH_TOKEN",
         "CHRIEK_DISPATCH_URL",
@@ -80,6 +81,7 @@ SETTING_NAMES = frozenset(
 DISPATCH_NAMES = frozenset(
     {
         "CHRIEK_DISPATCH_HEADERS",
+        "CHRIEK_DISPATCH_ID_HEADER",
         "CHRIEK_DISPATCH_TIMEOUT_SECONDS",
         "CHRIEK_DISPATCH_TOKEN",
         "CHRIEK_DISPATCH_URL",
@@ -116,6 +118,20 @@ RESERVED_DISPATCH_HEADERS = (
     "Content-Type",
     "Idempotency-Key",
     WORKER_TOKEN_HEADER,
+)
+# Never settable as CHRIEK_DISPATCH_ID_HEADER: a per-job value there would break the request's
+# framing, connection handling or routing.
+FRAMING_HEADERS = (
+    "Connection",
+    "Content-Length",
+    "Expect",
+    "Host",
+    "Keep-Alive",
+    "Proxy-Connection",
+    "TE",
+    "Trailer",
+    "Transfer-Encoding",
+    "Upgrade",
 )
 DEFAULT_ALLOWED_HOSTS = "localhost,127.0.0.1,[::1]"
 _LABEL = r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?"
@@ -204,6 +220,7 @@ class Dispatch:
     # Per connect and per read, not a total deadline; a synchronous endpoint answers after
     # rendering.
     timeout_seconds: float
+    id_header: str | None = None  # also carries the job ID, e.g. a provider's inference ID
 
 
 @dataclass(frozen=True)
@@ -343,6 +360,7 @@ def _dispatch(env: Mapping[str, str], other_secrets: set[str]) -> Dispatch:
     _http_url(url, "CHRIEK_DISPATCH_URL")  # validated, kept verbatim: a trailing / may matter
     worker_token = _worker_token(env)
     headers = _dispatch_headers(env.get("CHRIEK_DISPATCH_HEADERS", "{}"))
+    id_header = _dispatch_id_header(env.get("CHRIEK_DISPATCH_ID_HEADER"), headers)
     token = env.get("CHRIEK_DISPATCH_TOKEN")
     if token is not None and (not token or not all("!" <= c <= "~" for c in token)):
         raise ConfigError(
@@ -371,7 +389,13 @@ def _dispatch(env: Mapping[str, str], other_secrets: set[str]) -> Dispatch:
             "CHRIEK_DISPATCH_TIMEOUT_SECONDS must be a number of seconds above 0 and at most "
             "604800 (7 days)"
         )
-    return Dispatch(url=url, worker_token=worker_token, headers=headers, timeout_seconds=timeout)
+    return Dispatch(
+        url=url,
+        worker_token=worker_token,
+        headers=headers,
+        timeout_seconds=timeout,
+        id_header=id_header,
+    )
 
 
 def _dispatch_headers(raw: str) -> dict[str, str]:
@@ -397,6 +421,22 @@ def _dispatch_headers(raw: str) -> dict[str, str]:
                 "chriek sets them (CHRIEK_DISPATCH_TOKEN sends Authorization)"
             )
     return headers
+
+
+def _dispatch_id_header(name: str | None, headers: Mapping[str, str]) -> str | None:
+    """The optional extra header carrying the job ID. Errors never echo the name."""
+    if name is None:
+        return None
+    if not HEADER_NAME_PATTERN.fullmatch(name):
+        raise ConfigError("CHRIEK_DISPATCH_ID_HEADER must be one HTTP header token")
+    taken = {n.lower() for n in (*RESERVED_DISPATCH_HEADERS, *FRAMING_HEADERS, *headers)}
+    if name.lower() in taken:
+        raise ConfigError(
+            "CHRIEK_DISPATCH_ID_HEADER must not name a header chriek sets "
+            f"({', '.join(RESERVED_DISPATCH_HEADERS)}), one in CHRIEK_DISPATCH_HEADERS, or "
+            f"{', '.join(FRAMING_HEADERS)}; names are case-insensitive"
+        )
+    return name
 
 
 def _worker_token(env: Mapping[str, str]) -> str:

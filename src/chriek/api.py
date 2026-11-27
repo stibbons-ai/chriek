@@ -264,13 +264,7 @@ def create_app(
 
     app.openapi = custom_openapi  # type: ignore[method-assign]
 
-    @app.exception_handler(RequestValidationError)
-    async def validation_error(_request: Request, exc: RequestValidationError) -> Response:
-        return Response(
-            _error_detail(exc.errors()),
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            media_type="application/json",
-        )
+    app.exception_handler(RequestValidationError)(_unprocessable)
 
     def image_link(job_id: str, index: int) -> tuple[str, int]:
         if isinstance(images, S3Images):
@@ -470,6 +464,7 @@ def create_worker_app(
         store.close()
 
     app = FastAPI(title="chriek worker", lifespan=lifespan)
+    app.exception_handler(RequestValidationError)(_unprocessable)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -1180,6 +1175,14 @@ def _is_utf8(text: str) -> bool:
     except UnicodeEncodeError:
         return False
     return True
+
+
+async def _unprocessable(_request: Request, exc: RequestValidationError) -> Response:
+    return Response(
+        _error_detail(exc.errors()),
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        media_type="application/json",
+    )
 
 
 def _error_detail(errors: Sequence[Any]) -> bytes:
